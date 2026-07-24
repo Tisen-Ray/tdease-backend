@@ -1,9 +1,13 @@
+/**
+ * MS2 sequence composition helpers.
+ *
+ * FRONTEND-ZERO: pure functions for resolving selection context from table rows.
+ * The API-dependent loadMs2CompositionInput is removed — data loading now
+ * happens via file-based pipeline.
+ */
+
 import type { SelectionState, TableData } from '@/types/visualization'
 import type { Modification, SpectrumPeak } from '@/composables/ms2-sequence'
-import { getArtifactEntries } from '@/services/api/interactive-artifacts'
-import type { APIClientLike } from '@/services/api/client'
-import { resolveMsalignSource } from './artifactSource'
-import { parseProteoformAnnotation, buildProformaString } from '@/utils/proforma'
 
 export interface Ms2SelectionContext {
   selectedPrsmId: number | null
@@ -43,10 +47,7 @@ export function resolveMs2SelectionContext(
     }
   }
 
-  // Strategy 2: No direct 'Prsm ID' ref — search ALL refs by value against
-  // the rows' 'Prsm ID' column.  This bridges viewers (e.g. FeatureMap) that
-  // emit refs under a different field name (feature_id, id, …) but whose
-  // underlying data rows do carry a Prsm ID.
+  // Strategy 2: Search all refs by value against rows' 'Prsm ID' column.
   if (selectedPrsmId === null && selectedRefs.length > 0) {
     for (const ref of [...selectedRefs].reverse()) {
       const refValue = String(ref.value).trim()
@@ -96,69 +97,6 @@ export function resolveMs2SelectionContext(
   return {
     selectedPrsmId,
     selectedRow,
-  }
-}
-
-export async function loadMs2CompositionInput(
-  client: APIClientLike,
-  runId: string,
-  row: Record<string, unknown>,
-): Promise<Ms2CompositionInput> {
-  const rawProteoform = String(row['Proteoform'] || row.proteoform || '')
-  const parsed = parseProteoformAnnotation(rawProteoform)
-  const proteinAccession = String(row['Protein accession'] || row.protein_accession || '')
-  const activationMethod = String(row['Fragmentation'] || row.activation || row.Activation || '').trim()
-  const spectrumId = String(row['Spectrum ID'] || row.spectrum_id || '')
-  const msalignSource = resolveMsalignSource(row)
-
-  if (!spectrumId || !runId) {
-    throw new Error(spectrumId ? 'Run ID is not available.' : 'Spectrum ID not found in selected row.')
-  }
-  if (!msalignSource) {
-    throw new Error('MS2 source reference not found in selected row.')
-  }
-
-  let peaksResponse
-  try {
-    peaksResponse = await getArtifactEntries(client, {
-      run_id: runId,
-      artifact_id: msalignSource.artifactId,
-      file_path: msalignSource.filePath,
-      key: 'SPECTRUM_ID',
-      value: spectrumId,
-      mode: 'peaks',
-    })
-  } catch (error) {
-    if (!msalignSource.filePath || msalignSource.artifactId === '__by_path__') throw error
-    peaksResponse = await getArtifactEntries(client, {
-      run_id: runId,
-      artifact_id: '__by_path__',
-      file_path: msalignSource.filePath,
-      key: 'SPECTRUM_ID',
-      value: spectrumId,
-      mode: 'peaks',
-    })
-  }
-
-  const peaks: SpectrumPeak[] = []
-  for (const entry of peaksResponse.entries) {
-    for (const peak of entry.peaks) {
-      peaks.push({
-        index: peaks.length,
-        mz: peak.mass,
-        intensity: peak.intensity,
-        charge: peak.charge ?? 1,
-      })
-    }
-  }
-
-  return {
-    sequence: parsed.sequence,
-    proteinAccession,
-    activationMethod,
-    peaks,
-    modifications: parsed.modifications,
-    proforma: buildProformaString(parsed.sequence, parsed.modifications),
   }
 }
 

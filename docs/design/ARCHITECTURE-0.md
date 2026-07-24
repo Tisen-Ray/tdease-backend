@@ -111,13 +111,14 @@ AI Agent 在分析时，发现需要某个原始文件：
 
 ### 状态模型
 
-只有三个状态，无子状态、无转换图、无状态机：
+只有一个生命周期轴，无并行子状态机：
 
 ```
 QUEUED      (排队中, 等待 worker 拾取)
 RUNNING     (运行中, Snakemake 进程活跃)
-  ├─ DONE     (成功)
-  └─ FAILED   (失败)
+  ├─ SUCCEEDED (成功)
+  ├─ FAILED    (失败)
+  └─ CANCELLED (用户取消)
 ```
 
 ### 队列表
@@ -129,7 +130,7 @@ CREATE TABLE runs (
     workspace   TEXT NOT NULL,
     snakefile   TEXT NOT NULL,
     config      TEXT,          -- JSON
-    status      TEXT DEFAULT 'QUEUED',  -- QUEUED | RUNNING | DONE | FAILED
+    status      TEXT DEFAULT 'QUEUED',  -- QUEUED | RUNNING | SUCCEEDED | FAILED | CANCELLED
     created_at  TEXT,
     started_at  TEXT,
     finished_at TEXT,
@@ -152,18 +153,18 @@ while True:
     run.pid = proc.pid         # 存 PID
     proc.wait()
     
-    run.status = "DONE" if proc.returncode == 0 else "FAILED"
+    run.status = "SUCCEEDED" if proc.returncode == 0 else "FAILED"
     run.exit_code = proc.returncode
 ```
 
 ### 实时状态同步
 
 ```
-客户端 → WebSocket → 服务端
+客户端 ← SSE ← 服务端
 
 推消息格式:
   { "run_id": "...", "status": "RUNNING", "pid": 12345 }
-  { "run_id": "...", "status": "DONE", "exit_code": 0 }
+  { "run_id": "...", "status": "SUCCEEDED", "exit_code": 0 }
   { "run_id": "...", "log_tail": "...latest 50 lines..." }
 ```
 
@@ -211,7 +212,9 @@ workspaces/
         config.yaml
 ```
 
-快照只需保存 Snakefile + config.yaml。它们就是"版本"的全部。
+快照必须自包含执行身份：Snakefile、config、scripts、输入 tree/blob identities、
+package/environment locks。`run.json` 记录这些内容的 digest，充当不可变 Run
+commit；缺少任一项都不能声称可审计重放。
 
 ### 版本回滚 = 文件复制
 
@@ -259,7 +262,7 @@ AI:   diff workspace/runs/run_2025-07-25_01/config.yaml workspace/current/config
                    ▼
 ┌─ 3. 排队/执行 ────────────────────────┐
 │  (可选) 本地 tail 云端日志             │
-│  WS 推送: QUEUED → RUNNING → DONE     │
+│  SSE 推送: QUEUED → RUNNING → 终态    │
 │  进度 = Snakemake 自己产生的日志       │
 └──────────────────┬─────────────────────┘
                    ▼

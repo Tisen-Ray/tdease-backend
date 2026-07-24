@@ -459,3 +459,103 @@ export type ViewerInputSource = {
     resultRef: Record<string, unknown>
   }
 }
+
+// ── File-based visualization schema (FRONTEND-ZERO §三) ────────────────
+
+/** A single data input referenced by a view spec. */
+export interface ViewSpecInput {
+  /** Workspace-relative path. Supports glob patterns like results\/\*\/features.csv. */
+  path: string
+  /** Semantic kind — helps the loader pick the right parser. */
+  kind?: 'matrix' | 'feature_table' | 'peak_table' | 'annotation_table' | 'table' | 'auto'
+}
+
+/** Declarative view spec — the "block" track (FRONTEND-ZERO §三 轨道1). */
+export interface ViewSpec {
+  id: string
+  title?: string
+  description?: string
+  /** Viewer registry key: "heatmap" | "volcano" | "scatter" | "spectrum" | "table" | ... */
+  viewer: string
+  version?: number
+  /** Data sources — workspace-relative paths. */
+  inputs: ViewSpecInput[]
+  /** Column mapping: logical role → column name in the parsed data. */
+  mapping?: Record<string, string>
+  /** Rendering params — passed as the `config` prop to the viewer component. */
+  params?: Record<string, unknown>
+  /** User interaction state persisted back to this file. */
+  state?: {
+    pinned?: boolean
+    lastConfig?: Record<string, unknown>
+    /** Most recent selection for restoring cross-viewer linking. */
+    lastSelection?: Record<string, unknown>
+  }
+}
+
+/** Live asset — the "script" track (FRONTEND-ZERO §三 轨道2). */
+export interface LiveAsset {
+  id: string
+  title?: string
+  description?: string
+  /** Path to the rendered asset file (.plotly.json | .png | .svg | .html). */
+  asset: string
+  /** Optional generator — when present, [刷新] re-runs the script. */
+  generator?: {
+    /** Script to run (relative to workspace root). */
+    script: string
+    /** Input globs — any mtime change marks asset as stale. */
+    inputs: string[]
+    /** Output files produced by the script. */
+    outputs: string[]
+  }
+  /** Rendering params. */
+  params?: Record<string, unknown>
+  /** Asset staleness derived at runtime (not persisted). */
+  _stale?: boolean
+}
+
+/** A card on the dashboard canvas. */
+export interface DashboardCard {
+  /** Reference to a ViewSpec.id or LiveAsset.id. */
+  ref?: string
+  /** Or a direct asset path (bypass spec). */
+  asset?: string
+  /** Grid position. */
+  position: { x: number; y: number; w: number; h: number }
+  /** Override params for this card instance. */
+  params?: Record<string, unknown>
+}
+
+/** Dashboard layout — persisted as views/dashboard.yaml. */
+export interface DashboardLayout {
+  id: string
+  title?: string
+  cards: DashboardCard[]
+  /** Global params shared across all cards. */
+  params?: Record<string, unknown>
+}
+
+/** Resolved card ready for rendering. */
+export interface ResolvedCard {
+  /** Stable id for selection / watcher keying. */
+  id: string
+  title: string
+  /** Resolved viewer id for the registry. */
+  viewer: string
+  /** If set, path to a static asset (.png/.svg/.plotly.json). */
+  assetPath?: string
+  /** For brick-track viewers: resolved table data. */
+  data?: VisualizationTableData | null
+  /** Loading/error state during resolution. */
+  status: 'loading' | 'ready' | 'error' | 'stale'
+  error?: string
+  /** Grid position. */
+  position: { x: number; y: number; w: number; h: number }
+  /** Merged params (spec + card overrides). */
+  params: Record<string, unknown>
+  /** Source spec id for state write-back. */
+  specId?: string
+  /** LiveAsset staleness — runtime computed, not persisted. */
+  _stale?: boolean
+}

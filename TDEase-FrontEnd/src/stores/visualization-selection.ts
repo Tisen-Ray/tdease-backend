@@ -1,62 +1,46 @@
+/**
+ * Lightweight visualization selection store.
+ *
+ * No more state-bus — selection is just per-viewer state.
+ * emit events directly; caller handles cross-viewer linking if needed.
+ */
+
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import type { NodeSelectionEntry, SelectionState } from '@/types/visualization'
-import { useStateBusStore } from '@/stores/state-bus'
-import { useVisualizationSessionStore } from '@/stores/visualization-session'
+import type { SelectionState } from '@/types/visualization'
 
-function makeSelectionKey(sessionKey: string, nodeId: string): string {
-  return `${sessionKey}::${nodeId}`
+export interface ViewerSelection {
+  selection: SelectionState
+  timestamp: number
 }
 
 export const useVisualizationSelectionStore = defineStore('visualization-selection', () => {
-  const nodeSelections = ref<Map<string, NodeSelectionEntry>>(new Map())
-  const visualizationSessionStore = useVisualizationSessionStore()
+  const selections = ref<Map<string, ViewerSelection>>(new Map())
 
-  function normalizeSelection(selection: SelectionState): SelectionState {
-    return {
-      ...selection,
-      selectedRefs: selection.selectedRefs ?? [],
-    }
-  }
-
-  const getNodeSelection = computed(() => (nodeId: string) => {
-    return nodeSelections.value.get(makeSelectionKey(visualizationSessionStore.sessionKey, nodeId))?.selection || null
+  const getSelection = computed(() => (viewerId: string): SelectionState | null => {
+    return selections.value.get(viewerId)?.selection ?? null
   })
 
-  function updateSelection(
-    nodeId: string,
-    selection: SelectionState,
-    outputPortId: string = 'selection_out'
-  ) {
-    const normalizedSelection = normalizeSelection(selection)
-    nodeSelections.value.set(makeSelectionKey(visualizationSessionStore.sessionKey, nodeId), {
-      selection: normalizedSelection,
+  function updateSelection(viewerId: string, selection: SelectionState) {
+    selections.value.set(viewerId, {
+      selection: { ...selection },
       timestamp: Date.now(),
-    })
-
-    const stateBus = useStateBusStore()
-    stateBus.dispatch(nodeId, outputPortId, {
-      semanticType: 'state/selection_ids',
-      data: { selectedRefs: normalizedSelection.selectedRefs },
-      timestamp: Date.now(),
-      sourceNodeId: nodeId,
-      portId: outputPortId,
     })
   }
 
-  function clearSelection(nodeId: string) {
-    nodeSelections.value.delete(makeSelectionKey(visualizationSessionStore.sessionKey, nodeId))
+  function clearSelection(viewerId: string) {
+    selections.value.delete(viewerId)
   }
 
-  function clearAllSelections() {
-    nodeSelections.value.clear()
+  function clearAll() {
+    selections.value.clear()
   }
 
   return {
-    nodeSelections,
-    getNodeSelection,
+    selections,
+    getSelection,
     updateSelection,
     clearSelection,
-    clearAllSelections,
+    clearAll,
   }
 })

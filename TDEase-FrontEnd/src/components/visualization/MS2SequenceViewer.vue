@@ -252,10 +252,7 @@
 import { computed, ref, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Setting, Loading } from '@element-plus/icons-vue'
-import { getAPIClient } from '@/services/api/client'
-import { fragmentMatch } from '@/services/compute-proxy'
 import type { SelectionState, TableData } from '@/types/visualization'
-import { useWorkflowStore } from '@/stores/workflow'
 import { buildProformaString } from '@/utils/proforma'
 import {
   InteractionManager,
@@ -269,7 +266,6 @@ import {
   type InteractionState,
 } from '@/composables/ms2-sequence'
 import {
-  loadMs2CompositionInput,
   resolveMs2SelectionContext,
   tableRows,
 } from './ms2-sequence/composition'
@@ -277,7 +273,6 @@ import {
   buildMatchTableColumnDefs,
   buildMatchTableData,
   buildModificationSummary,
-  toMatchedFragment,
 } from './ms2-sequence/viewer-model'
 import AnnotatedSpectrumIPSA from './ms2-sequence/AnnotatedSpectrumIPSA.vue'
 import ConfigPanel from './ms2-sequence/ConfigPanel.vue'
@@ -290,10 +285,10 @@ interface Props {
   data: TableData | null
   config?: Record<string, unknown>
   selection?: SelectionState | null
+  runId?: string | null
 }
 
 const props = defineProps<Props>()
-const workflowStore = useWorkflowStore()
 
 defineEmits<{
   selectionChange: [selection: SelectionState]
@@ -358,7 +353,7 @@ const selectionContext = computed(() =>
 )
 const selectedPrsmId = computed<number | null>(() => selectionContext.value.selectedPrsmId)
 
-const runId = computed(() => workflowStore.currentRunId || '')
+const runId = computed(() => props.runId || '')
 
 const selectedRow = computed<Record<string, unknown> | null>(() => selectionContext.value.selectedRow)
 
@@ -426,7 +421,7 @@ const matchTableData = computed(() => buildMatchTableData(matchedFragments.value
 
 const matchTableColumnDefs = computed(() => buildMatchTableColumnDefs())
 
-// API loading
+// API loading — stubbed until file-based pipeline is wired (FRONTEND-ZERO §三)
 async function loadPrsmDetail() {
   if (selectedPrsmId.value === null || !selectedRow.value) {
     baseSequence.value = ''
@@ -439,47 +434,9 @@ async function loadPrsmDetail() {
     return
   }
 
-  const requestToken = ++currentRequestToken
-    loading.value = true
-    errorMessage.value = ''
-    annotationWarning.value = ''
-
-  try {
-    const row = selectedRow.value
-
-    // 1. Runtime composition resolves the primary row plus auxiliary MS2 peaks source.
-    const compositionInput = await loadMs2CompositionInput(getAPIClient(), runId.value, row)
-    if (requestToken !== currentRequestToken) return
-
-    baseSequence.value = compositionInput.sequence
-    baseModifications.value = compositionInput.modifications
-    basePeaks.value = compositionInput.peaks
-    proteinAccession.value = compositionInput.proteinAccession
-    activationMethod.value = compositionInput.activationMethod
-
-    // 2. Reset state and trigger fragment matching
-    matchedFragments.value = []
-    buffer.reset()
-    isEditing.value = false
-
-    // 3. Auto-set ion types based on activation method (mirrors domain _ACTIVATION_IONS)
-    if (activationMethod.value) {
-      config.value.ionTypes = activationToIonTypes(activationMethod.value)
-    }
-    await loadFragmentAnnotations()
-  } catch (error) {
-    if (requestToken !== currentRequestToken) return
-    baseSequence.value = ''
-    baseModifications.value = []
-    basePeaks.value = []
-    proteinAccession.value = ''
-    activationMethod.value = ''
-    errorMessage.value = error instanceof Error ? error.message : 'Failed to load PrSM data.'
-  } finally {
-    if (requestToken === currentRequestToken) {
-      loading.value = false
-    }
-  }
+  // TODO: FRONTEND-ZERO — load from local files instead of API
+  // const compositionInput = await loadMs2CompositionInput(getAPIClient(), runId.value, row)
+  loading.value = false
 }
 
 async function loadFragmentAnnotations() {
@@ -488,35 +445,8 @@ async function loadFragmentAnnotations() {
     return
   }
 
-  const requestToken = ++currentAnnotationRequestToken
-  const ionTypes = config.value.ionTypes.join('') || 'by'
-  const preferredProforma = buildProformaString(sequence.value, modifications.value)
-  const spectrumData = peaks.value.map(peak => ({ mz: peak.mz, intensity: peak.intensity }))
-  try {
-    const response = await fragmentMatch({
-      sequence: sequence.value,
-      proforma: preferredProforma || undefined,
-      spectrumData,
-      ppmTolerance: config.value.tolerancePpm,
-      ionTypes,
-      maxCharge: config.value.maxFragmentCharge,
-      includeNeutralLosses: config.value.showNeutralLosses,
-    })
-    if (requestToken !== currentAnnotationRequestToken) return
-
-    const annotations = (response.annotations || []) as Record<string, unknown>[]
-    const nextMatched = annotations
-      .map(annotation => toMatchedFragment(annotation, sequence.value.length, peaks.value))
-      .filter((item): item is MatchedFragment => item !== null)
-    matchedFragments.value = nextMatched
-
-    annotationWarning.value = ''
-  } catch (error) {
-    if (requestToken !== currentAnnotationRequestToken) return
-    matchedFragments.value = []
-    const message = error instanceof Error ? error.message : String(error)
-    annotationWarning.value = t('visualization.viewer.annotationError', { message })
-  }
+  // TODO: FRONTEND-ZERO — compute fragment annotations locally or via simple CLI
+  // const response = await fragmentMatch({...})
 }
 
 watch(

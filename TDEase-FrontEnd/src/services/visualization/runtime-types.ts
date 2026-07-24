@@ -1,7 +1,15 @@
 import type { ColumnDef, Dataset, ProjectionDataMapping, TableData } from '@/types/visualization'
-import type { ResultAddress } from '@/services/run-results'
-import type { DisplayHint, ResultRef, RowRef, RunRef } from '@/types/tool-call-card'
-import type { ColumnSchema } from '@/types/workspace-data'
+
+/** Replaces the old ResultAddress from deleted run-results. */
+export interface ResultAddress {
+  kind: 'single' | 'compare'
+  runId: string
+  nodeId: string
+  portId?: string | null
+  rowId?: string | null
+  rowRefs?: Array<{ rowId: string; role?: string | null }>
+  viewerPurpose?: string | null
+}
 
 export type VisualizationSourceKind = 'result' | 'artifact-query' | 'inline'
 
@@ -13,9 +21,9 @@ export interface VisualizationDisplayHint {
 export interface VisualizationSource {
   kind: VisualizationSourceKind
   resultRef?: VisualizationResultRef
-  runRefs?: RunRef[]
-  rowRefs?: RowRef[]
-  resultRefs?: ResultRef[]
+  runRefs?: Array<{ runId: string }>
+  rowRefs?: Array<{ rowId: string; role?: string | null }>
+  resultRefs?: Array<{ runId: string; rowId?: string }>
   dataRef?: VisualizationDataRef
   viewer?: string
   version?: number
@@ -53,7 +61,7 @@ export interface VisualizationDataRef {
 export interface VisualizationInlinePayload {
   kind: string
   data?: unknown
-  displayHint?: DisplayHint
+  displayHint?: { semanticType?: string; visualizationType?: string }
 }
 
 export interface SelectionPayload {
@@ -63,7 +71,7 @@ export interface SelectionPayload {
 export interface VisualizationSessionData {
   source: VisualizationSource
   data?: unknown
-  schema?: ColumnSchema[]
+  schema?: Array<{ name: string; type: string }>
   displayHint?: VisualizationDisplayHint | null
   selectionRefSpec?: SelectionRefSpec | null
 }
@@ -75,10 +83,7 @@ export interface ProjectionRawData {
   }>
 }
 
-/**
- * Final viewer-ready shape carried by AI cards. Workflow projection paths use
- * ProjectionRawData before ProjectionAdapter materializes datasets[].
- */
+/** Final viewer-ready shape carried by AI cards. */
 export interface UnifiedVisualizationData {
   datasets: Dataset[]
   viewSpec: Record<string, unknown>

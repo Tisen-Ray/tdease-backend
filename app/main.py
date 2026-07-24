@@ -1,10 +1,11 @@
 """
 TDEase-zero API Server — 极简 FastAPI 后端。
 
-只做三件事：
-1. 接收 push（上传 Snakefile + 文件 → 创建 run）
-2. 提供 pull（下载结果文件）
-3. WebSocket 实时推送 run 状态
+只做四件事：
+1. 接收 Run commit 并入库排队
+2. 提供 run.json + events.jsonl 状态查询
+3. SSE 事件流推送
+4. 文件路径校验与下载
 """
 
 from __future__ import annotations
@@ -50,19 +51,22 @@ logger = logging.getLogger(__name__)
 # 路由
 # ---------------------------------------------------------------------------
 from app.api.runs_v2 import router as runs_v2_router
+from app.api.files import router as files_router
+from app.api.workflow_templates import router as workflow_templates_router
+from app.api.uploads import router as uploads_router
 
 # ---------------------------------------------------------------------------
 # 生命周期
 # ---------------------------------------------------------------------------
-DATA_DIR = _project_root / "data"
+SERVER_DATA = _project_root / "server-data"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("TDEase-zero starting (env=%s)", os.getenv("TDEASE_ENV", "development"))
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SERVER_DATA.mkdir(parents=True, exist_ok=True)
 
-    db_path = str(DATA_DIR / "tdease.db")
+    db_path = str(SERVER_DATA / "db.sqlite3")
     try:
         migrate_database(db_path)
         check_database_health(db_path)
@@ -115,6 +119,9 @@ async def request_log(request: Request, call_next):
 
 # Routes
 app.include_router(runs_v2_router)
+app.include_router(files_router)
+app.include_router(workflow_templates_router)
+app.include_router(uploads_router)
 
 
 @app.get("/")
@@ -129,6 +136,22 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness reflects execution capability, not optional JSON references."""
+    import importlib.util
+    if importlib.util.find_spec("snakemake") is None:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "missing": "snakemake"})
+    storage = __import__("src.execution_runtime.storage", fromlist=["get_storage"]).get_storage()
+    storage.bootstrap()
+    return {"status": "ready", "engine": "snakemake"}
 
 
 @app.exception_handler(Exception)

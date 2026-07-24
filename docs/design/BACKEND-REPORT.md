@@ -20,7 +20,7 @@
 ```
 app/                    FastAPI — 用户/数据/队列
 ├── main.py             启动入口，170 行，7 routes
-├── api/runs_v2.py      REST API (CRUD + WebSocket)
+├── api/runs_v2.py      REST API (CRUD + SSE)
 ├── models/run.py       数据模型 (pydantic)
 ├── database/           SQLite 生命周期
 └── core/               配置常量
@@ -54,7 +54,7 @@ cli/                    ❗暂存 — 属于客户端，非后端
 | `src/ai/` (150+ files) | AI 在客户端 PI 侧 |
 | `src/workflow/` (39 files, 7265行) | Snakemake DAG |
 | `src/execution/` (7 files, 950行) | Snakemake 执行器 |
-| `src/services/runs/` 全部 | 三个状态 (QUEUED→RUNNING→DONE/FAILED) |
+| `src/services/runs/` 全部 | 单生命周期轴 (QUEUED→RUNNING→SUCCEEDED/FAILED/CANCELLED) |
 | `app/core/engine/` + `app/core/executor/` | Snakemake API |
 | `app/worker/` + `app/dispatcher/` | 40 行 worker 循环 |
 | `openai, anthropic, mcp` 依赖 | 客户端 |
@@ -122,6 +122,6 @@ GET    /health               健康检查
 
 - [ ] CLI 移到 `TDEase-FrontEnd/` 或独立 npm 包
 - [ ] File push/pull 协议 (multipart upload, streaming download)
-- [ ] WebSocket 细化 (per-run 订阅，log 流推送)
+- [ ] SSE 细化（per-run 订阅、Last-Event-ID 断点续传；日志详情 GET 拉取）
 - [ ] User 表 + 轻量认证 (Server/Cloud 模式)
 - [ ] _check_view_spec.py 清理（前端相关，残留）

@@ -2,7 +2,8 @@
 
 > **对前四份设计文档的终审。方法：对每个组件问两个问题——**
 > **1. 它引入了新的状态吗？ 2. 有没有已经生产打磨多年的轮子可以直接抄？**
-> 结论先行：自研清单砍掉约一半，全套系统只剩**一个四值状态字段**。
+> 结论先行：自研清单砍掉约一半；文件真相收敛为 Blob、Tree manifest、
+> Run commit 三层，运行只有一个生命周期轴。
 
 关联文档：`ARCHITECTURE-0.md`、`SERVER-OPERATIONS.md`、`SERVER-PRODUCTION.md`、`AGENT-UX-AND-PERMISSIONS.md`。
 本文档与上述文档冲突时，**以本文档为准**。
@@ -20,7 +21,7 @@ DB 索引只负责业务逻辑与加速？
 Git:        objects/ 是真相, index 是可重建的加速结构
 Snakemake:  输出文件 + .snakemake/metadata/ 是真相, 无数据库
 DVC:        数据文件 + content store 是真相, .dvc 元文件只是指针
-TDEase-zero: workspace 目录树是真相, SQLite 是业务索引
+TDEase-zero: Blob + Tree manifest + Run commit 是真相, SQLite 是协调索引
 ```
 
 ### DB 里允许放什么（白名单）
@@ -28,7 +29,7 @@ TDEase-zero: workspace 目录树是真相, SQLite 是业务索引
 ```
 ✅ 队列与归属:    runs 表 (谁、什么、排队顺序、worker 领取)
 ✅ 配额计数:      用量求和的物化（可从目录 du 重算）
-✅ 幂等键:        UNIQUE(user, idempotency_key)
+✅ 幂等键投影:    UNIQUE(user, idempotency_key)，原值必须写入 run.json
 ✅ 加速索引:      run 列表页查询
 
 ❌ 任何"结果状态"    —— 结果在文件里
@@ -38,7 +39,7 @@ TDEase-zero: workspace 目录树是真相, SQLite 是业务索引
 ### 重建测试（定期在 CI 里跑）
 
 ```
-删掉 SQLite → 扫 workspaces/*/runs/*/ 的 run.json + events.jsonl
+删掉 SQLite → 扫 runs/*/run.json + events.jsonl
 → 重建 runs 表 → 与删库前对比, 除加速字段外必须等价
 
 这个测试通过 = 原则没有被偷渡破坏
@@ -52,7 +53,7 @@ TDEase-zero: workspace 目录树是真相, SQLite 是业务索引
 
 | 实体 | 状态内容 | 判定 |
 |------|---------|------|
-| `runs.status` | QUEUED / RUNNING / DONE / FAILED | **保留。唯一的状态机。** 且它是进程存活的投影，可从 events.jsonl + PID 推导重建 |
+| `runs.status` | QUEUED / RUNNING / SUCCEEDED / FAILED / CANCELLED | **保留。唯一的生命周期轴。** 可从 events.jsonl 推导重建 |
 | 上传 session 状态 | 已收块清单 | **删除**（换成 S3 multipart，状态托管给 S3，见 §三） |
 | 软删除 | "已删除"标记 | 不是状态——是文件位置（`.trash/` 目录），`ls` 即可推导 |
 | 配额 | 用量数字 | 不是状态——是求和查询 |
@@ -61,7 +62,7 @@ TDEase-zero: workspace 目录树是真相, SQLite 是业务索引
 | push 乐观锁 | expected_revision | 一个整数版本号，不是状态机 |
 | workspace 身份 | workspace_id | 不可变 UUID，无转换，不是状态机 |
 
-**终审结论：整个系统有且仅有一个状态字段——`runs.status`，四个值，
+**终审结论：整个系统有且仅有一个生命周期字段——`runs.status`，
 无子状态、无状态转换图、转换由进程生命周期驱动而非业务代码驱动。**
 对照旧体系（status × freeze_state × epoch × 9 个终态写入点），
 这就是"只保留必要的状态机"的字面含义。
@@ -91,9 +92,10 @@ S3 multipart upload:
 ### 3.2 content store 与去重 → key = sha256 的 S3 bucket
 
 ```
-manifest 握手里的 hash → 直接作为 S3 object key
+tree manifest 里的 blob hash → 直接作为 S3 object key
 已存在 = HEAD 请求 200 → 秒传（天然去重）
-GC 的引用计数保留自研（这是业务逻辑），存储与传输机制全删
+tree manifest 是 path→blob 的不可丢失真相，不能从裸 bucket 反推。
+GC 的引用可达性扫描保留自研（这是业务逻辑），存储与传输机制全删
 ```
 
 ### 3.3 稀疏视图 / 懒加载 → rclone mount（砍掉自研 Finder 的大部分）
@@ -103,16 +105,18 @@ SERVER-OPERATIONS §九 的"本地是云端的稀疏视图"，
 生产打磨多年，Windows 经 WinFsp 支持：
 
 ```bash
-rclone mount tdease:workspace ~/ws --vfs-cache-mode full \
+rclone mount tdease:materialized-workspace ~/ws --vfs-cache-mode full \
        --vfs-cache-max-size 50G    # 本地缓存上限+LRU 也内置了
 ```
 
+- rclone 只能挂载按逻辑路径物化的 workspace 前缀，不能直接挂载 hash-only bucket
 - open() 缺失文件 → 自动拉取 → 缓存 = `--vfs-cache-mode full` 的定义行为
 - 本地缓存上限 + LRU 淘汰 = `--vfs-cache-max-size`，我们不用写
 - AI、脚本、看板全部透明
 
 自研 Finder 降级为"无 mount 环境下的兜底"（如纯 HTTP 部署），
-P2 再做。原始数据层首选 rclone mount。
+P2 再做。原始数据层可选 rclone mount；服务端必须先依据 tree manifest
+暴露逻辑路径。
 
 ### 3.4 脚本沙箱 → 轻量文本审查为主，apptainer 备选
 
@@ -182,7 +186,7 @@ run 快照仍是文件复制（ARCHITECTURE-0 §四），两者互补不冲突�
 |------|-----------|
 | Airflow / Prefect / Dagster | 状态机地狱本狱。DAG 抽象 + 任务状态数据库 + Web UI 全家桶，正是我们逃离的东西 |
 | Nextflow | 换一个引擎 = 推翻已选定的 Snakemake 轮子，DSL 生态（nf-core）虽强但锁定更重 |
-| DVC / git-annex | 引入**第二套命令体系和并行真相**（.dvc 元文件 vs 文件本身），违背单一真相原则。我们的 content store + rclone mount 已覆盖需求且更简单。参考 [DVC vs git-annex 对比](https://handbook.datalad.org/en/inm7/beyond_basics/101-168-dvc.html) |
+| DVC / git-annex | 产品不直接引入其命令体系；但采用同类成熟的 blob + tree/commit 分层，避免假设裸 CAS 可以恢复路径。 |
 | syncthing / 双向同步 | 双向 = 冲突 = 新状态。设计文档已拒绝，维持 |
 | Redis + RQ/Celery | 多一个有状态服务来管理一个四值字段，SQLite 队列表 50 行已够。单机不需要消息队列中间件 |
 | Kubernetes | 5-50 人团队自托管 k8s 是负资产。要集群时走 Snakemake slurm executor |
@@ -234,7 +238,8 @@ TDEase-zero server =
 ## 七、终审检验（每次想加组件时过一遍）
 
 ```
-1. 新状态?      → 停。runs.status 之外不该有第二个状态字段。
+1. 新状态轴?    → 停。runs.status 之外不该有第二个生命周期轴；
+                  Blob/tree/run commit 是不可约事实，不以“无状态”为由删除。
 2. 有轮子吗?    → 先查 rclone / S3 / systemd / snakemake 插件目录 / git
                   能不能配置出来。能配置就不写代码。
 3. 是业务吗?    → 队列准入/配额/权限/白名单是业务, 允许自研, 但保持薄。

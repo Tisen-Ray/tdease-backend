@@ -1,218 +1,166 @@
 /**
- * Workspace Store
- * 
- * Manages workspace file browser state and file content preview
+ * Workspace store — file-system-first.
+ *
+ * FRONTEND-ZERO: workspace = local directory. No more API client.
+ * File tree is loaded from the local filesystem (Electron fs / fetch).
+ * Sharing = sharing the workspace directory.
  */
 
 import { defineStore } from 'pinia'
 import { ref, computed, shallowRef, triggerRef } from 'vue'
-import type { FileTreeNode, FileContentResponse } from '@/types/workspace-data'
-import { workspaceFilesApi } from '@/services/api/workspace-files'
-import type { APIClientLike } from '@/services/api/client'
-import { createLogger } from '@/utils/logger'
+import type { FileTreeNode } from '@/types/workspace-data'
+import { getViewsFS } from '@/services/views-fs'
 
-const log = createLogger('workspace-store')
+const log = {
+  debug: (...args: unknown[]) => console.log('[workspace-store]', ...args),
+  error: (...args: unknown[]) => console.error('[workspace-store]', ...args),
+}
 
-const WORKSPACE_STORAGE_KEYS = {
-  userId: 'tdease.workspace.user_id',
-  workspaceId: 'tdease.workspace.workspace_id',
+const STORAGE_KEYS = {
+  workspacePath: 'tdease.workspace.path',
+  workspaceId: 'tdease.workspace.id',
 } as const
 
-function loadStoredValue(key: string, fallback: string): string {
+function loadStored(key: string, fallback: string): string {
   try {
     if (typeof window !== 'undefined') {
-      const value = window.localStorage.getItem(key)
-      if (value && value.trim()) {
-        return value.trim()
-      }
+      const v = window.localStorage.getItem(key)
+      // Reject absolute paths — in browser dev mode, workspace paths are
+      // DATA_ROOT-relative (e.g. "demo"), not filesystem absolute.
+      if (v?.trim() && !v.startsWith('/') && !v.includes(':\\')) return v.trim()
     }
-  } catch (error) {
-    log.warn('Failed to load persisted value:', error)
-  }
+  } catch { /* localStorage unavailable */ }
   return fallback
 }
 
-function persistValue(key: string, value: string) {
+function persist(key: string, value: string) {
   try {
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(key, value)
-    }
-  } catch (error) {
-    log.warn('Failed to persist value:', error)
-  }
+    if (typeof window !== 'undefined') window.localStorage.setItem(key, value)
+  } catch { /* noop */ }
+}
+
+export interface WorkspaceIdentity {
+  workspaceId: string
+  name: string
+  server?: string | null  // null = Pure Desktop
 }
 
 export const useWorkspaceStore = defineStore('workspace', () => {
-  // State
-  const currentUserId = ref<string>(loadStoredValue(WORKSPACE_STORAGE_KEYS.userId, 'test_user'))
-  const currentWorkspaceId = ref<string>(loadStoredValue(WORKSPACE_STORAGE_KEYS.workspaceId, ''))
+  const workspacePath = ref<string>(loadStored(STORAGE_KEYS.workspacePath, ''))
+  const workspaceId = ref<string>(loadStored(STORAGE_KEYS.workspaceId, ''))
   const fileTree = shallowRef<FileTreeNode[]>([])
   const expandedPaths = ref<Set<string>>(new Set())
   const selectedFilePath = ref<string | null>(null)
-  const fileContent = ref<FileContentResponse | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
-  const apiClient = ref<APIClientLike | null>(null)
 
-  // Lazy-loading cache: directory path → children FileTreeNode[]
+  // Lazy-loading cache: dir path → children
   const directoryCache = shallowRef<Map<string, FileTreeNode[]>>(new Map())
   const dirLoadingSet = ref<Set<string>>(new Set())
 
-  // Getters
-  const workspacePath = computed(() => {
-    return fileContent.value?.file_path ? 
-      fileContent.value.file_path.split('/').slice(0, -1).join('/') : 
-      ''
-  })
+  const isPathExpanded = computed(() => (path: string) => expandedPaths.value.has(path))
+  const hasWorkspace = computed(() => !!workspacePath.value && !!workspaceId.value)
 
-  const isPathExpanded = computed(() => (path: string) => {
-    return expandedPaths.value.has(path)
-  })
-
-  // Actions
-
-  /**
-   * Set API client for data fetching
-   */
-  function setApiClient(client: APIClientLike) {
-    apiClient.value = client
-  }
-
-  /**
-   * Set current workspace context
-   */
-  function setWorkspace(userId: string, workspaceId: string) {
-    if (currentUserId.value === userId && currentWorkspaceId.value === workspaceId) {
-      return
-    }
-    currentUserId.value = userId
-    currentWorkspaceId.value = workspaceId
-    persistValue(WORKSPACE_STORAGE_KEYS.userId, userId)
-    persistValue(WORKSPACE_STORAGE_KEYS.workspaceId, workspaceId)
+  function setWorkspace(path: string, id: string) {
+    workspacePath.value = path
+    workspaceId.value = id
+    persist(STORAGE_KEYS.workspacePath, path)
+    persist(STORAGE_KEYS.workspaceId, id)
     fileTree.value = []
     expandedPaths.value.clear()
     selectedFilePath.value = null
-    fileContent.value = null
     directoryCache.value = new Map()
     dirLoadingSet.value = new Set()
   }
 
-  let loadFileTreePromise: Promise<void> | null = null
-
-  /**
-   * Load workspace file tree (shallow — root level only).
-   * Subdirectories are loaded lazily via loadDirectory().
-   */
+  // FRONTEND-ZERO: file tree is loaded from local filesystem.
   async function loadFileTree() {
-    const client = apiClient.value
-    if (!client) {
-      log.error('API client not set')
-      return
-    }
-    if (loadFileTreePromise) {
-      return loadFileTreePromise
-    }
-
+    if (!workspacePath.value) return
     loading.value = true
     error.value = null
-
-    loadFileTreePromise = (async () => {
-      try {
-        // Clear lazy-load cache since the tree is being refreshed
-        directoryCache.value = new Map()
-        dirLoadingSet.value = new Set()
-
-        const scope = {
-          user_id: currentUserId.value,
-          workspace_id: currentWorkspaceId.value,
-        }
-        const response = await workspaceFilesApi.listRoot(client, scope)
-        fileTree.value = response.tree || []
-
-        // Subdirectories (skills/, workflows/, data/{raw,fasta,reference}/)
-        // are loaded lazily via loadDirectory() when the Data rail expands a
-        // node. Eagerly probing every section here fired 4–7 parallel /files
-        // requests on every workspace refresh and contributed to mount-time
-        // 429 storms; the root listing alone is enough to render the tree.
-      } catch (err) {
-        error.value = err instanceof Error ? err.message : 'Failed to load file tree'
-        log.error('Failed to load file tree:', err)
-      } finally {
-        loading.value = false
-        loadFileTreePromise = null
-      }
-    })()
-
-    return loadFileTreePromise
+    try {
+      const fs = getViewsFS()
+      log.debug('listing files in', workspacePath.value)
+      const files = await fs.listFiles('**/*', workspacePath.value)
+      log.debug('found', files.length, 'files:', files)
+      const nodes = buildTree(files, workspacePath.value)
+      log.debug('built tree with', nodes.length, 'root nodes')
+      fileTree.value = nodes
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : 'Failed to load file tree'
+      log.error('loadFileTree failed', err)
+    } finally {
+      loading.value = false
+    }
   }
 
-  /**
-   * Lazily load children of a directory, caching for subsequent access.
-   * Returns cached data immediately if already loaded.
-   * On error (e.g. directory not found), caches empty to prevent retry loops.
-   */
   async function loadDirectory(
-    path: string,
-    options: { missing?: 'empty' | 'error' } = {},
+    dirPath: string,
+    _options: { missing?: 'empty' | 'error' } = {},
   ): Promise<FileTreeNode[]> {
-    const client = apiClient.value
-    if (!client) return []
-
-    // Already cached
-    const cached = directoryCache.value.get(path)
-    if (cached) return cached
-
-    // Deduplicate concurrent loads
-    if (dirLoadingSet.value.has(path)) {
-      while (dirLoadingSet.value.has(path)) {
-        await new Promise((r) => setTimeout(r, 50))
-      }
-      return directoryCache.value.get(path) || []
-    }
-
-    dirLoadingSet.value = new Set(dirLoadingSet.value).add(path)
+    if (dirLoadingSet.value.has(dirPath)) return getCachedDir(dirPath) || []
+    dirLoadingSet.value.add(dirPath)
     try {
-      const children = await workspaceFilesApi.listDirectory(
-        client,
-        {
-          user_id: currentUserId.value,
-          workspace_id: currentWorkspaceId.value,
-        },
-        path,
-        { missing: options.missing ?? 'error' },
-      )
-      const next = new Map(directoryCache.value)
-      next.set(path, children)
-      directoryCache.value = next
-      return children
+      const fs = getViewsFS()
+      const files = await fs.listFiles('*', dirPath)
+      const nodes = buildTree(files.map(f => {
+        // Make paths relative to this directory
+        const rel = f.startsWith(dirPath) ? f.slice(dirPath.length).replace(/^[/\\]/, '') : f
+        return rel
+      }), dirPath)
+      directoryCache.value.set(dirPath, nodes)
+      return nodes
     } catch (err) {
-      if ((options.missing ?? 'error') !== 'empty') {
-        throw err
-      }
-      const next = new Map(directoryCache.value)
-      next.set(path, [])
-      directoryCache.value = next
+      log.error('Failed to load directory', dirPath, err)
       return []
     } finally {
-      const next = new Set(dirLoadingSet.value)
-      next.delete(path)
-      dirLoadingSet.value = next
+      dirLoadingSet.value.delete(dirPath)
     }
   }
 
-  async function loadDirectoryTree(
-    path: string,
-    options: { missing?: 'empty' | 'error' } = {},
-  ): Promise<FileTreeNode[]> {
-    const children = await loadDirectory(path, options)
-    const directoryChildren = children.filter((entry) => entry.type === 'directory')
-    if (directoryChildren.length === 0) {
-      return children
+  /** Build a tree from flat file list. Paths are assumed relative to workspace root. */
+  function buildTree(paths: string[], root: string): FileTreeNode[] {
+    // Strip the workspace root prefix from paths so tree paths are workspace-relative.
+    const prefix = root ? (root.replace(/\\/g, '/').replace(/\/?$/, '/')) : ''
+    const trimmed = prefix
+      ? paths.map(p => p.replace(/\\/g, '/').replace(prefix, ''))
+      : paths
+
+    const rootNode: FileTreeNode = {
+      name: root.split('/').pop() || root.split('\\').pop() || root,
+      path: '',
+      type: 'directory',
+      children: [],
+      loaded: true,
     }
-    await Promise.all(
-      directoryChildren.map((entry) => loadDirectoryTree(entry.path, options)),
-    )
-    return children
+
+    for (const p of trimmed.sort()) {
+      if (!p) continue
+      const parts = p.split('/')
+      let current = rootNode
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i]
+        if (!part) continue
+        const isLast = i === parts.length - 1
+        const childPath = parts.slice(0, i + 1).join('/')
+        let child = current.children?.find(c => c.name === part)
+        if (!child) {
+          child = {
+            name: part,
+            path: childPath,
+            type: isLast ? (part.includes('.') ? 'file' : 'directory') : 'directory',
+            status: 'local',
+            children: isLast ? undefined : [],
+            loaded: isLast,
+          }
+          if (!current.children) current.children = []
+          current.children.push(child)
+        }
+        if (!isLast) current = child
+      }
+    }
+
+    return rootNode.children || []
   }
 
   function isDirLoaded(path: string): boolean {
@@ -227,9 +175,6 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     return directoryCache.value.get(path)
   }
 
-  /**
-   * Toggle directory expansion
-   */
   function toggleExpand(path: string) {
     if (expandedPaths.value.has(path)) {
       expandedPaths.value.delete(path)
@@ -239,95 +184,48 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     triggerRef(expandedPaths)
   }
 
-  /**
-   * Expand all directories
-   */
   function expandAll() {
     const allPaths = new Set<string>()
-    const collectPaths = (nodes: FileTreeNode[]) => {
+    const collect = (nodes: FileTreeNode[]) => {
       for (const node of nodes) {
         if (node.type === 'directory') {
           allPaths.add(node.path)
-          if (node.children) {
-            collectPaths(node.children)
-          }
+          if (node.children) collect(node.children)
         }
       }
     }
-    collectPaths(fileTree.value)
+    collect(fileTree.value)
     expandedPaths.value = allPaths
   }
 
-  /**
-   * Collapse all directories
-   */
   function collapseAll() {
     expandedPaths.value.clear()
     triggerRef(expandedPaths)
   }
 
-  /**
-   * Select a file and load its content
-   */
-  async function selectFile(path: string) {
-    const client = apiClient.value
-    if (!client) {
-      log.error('API client not set')
-      return
-    }
-
+  function selectFile(path: string) {
     selectedFilePath.value = path
-    loading.value = true
-    error.value = null
-
-    try {
-      const response = await workspaceFilesApi.previewFile(client, {
-        user_id: currentUserId.value,
-        workspace_id: currentWorkspaceId.value,
-        path,
-        max_rows: 100
-      })
-      fileContent.value = response
-    } catch (err) {
-      error.value = err instanceof Error ? err.message : 'Failed to load file content'
-      log.error('Failed to load file content:', err)
-      fileContent.value = null
-    } finally {
-      loading.value = false
-    }
   }
 
-  /**
-   * Clear file selection
-   */
   function clearSelection() {
     selectedFilePath.value = null
-    fileContent.value = null
   }
 
   return {
-    // State
-    currentUserId,
-    currentWorkspaceId,
+    workspacePath,
+    workspaceId,
     fileTree,
     expandedPaths,
     selectedFilePath,
-    fileContent,
     loading,
     error,
     directoryCache,
     dirLoadingSet,
-
-    // Getters
-    workspacePath,
+    hasWorkspace,
     isPathExpanded,
-
-    // Actions
-    setApiClient,
     setWorkspace,
     loadFileTree,
     loadDirectory,
-    loadDirectoryTree,
     isDirLoaded,
     isDirLoading,
     getCachedDir,

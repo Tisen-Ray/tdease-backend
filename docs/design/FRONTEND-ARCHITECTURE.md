@@ -214,7 +214,7 @@ class TDEaseClient {
   pullFiles(runId: string, patterns?) → Promise<string[]>
   fetch(runId: string, path: string) → Promise<Blob>
 
-  // WebSocket
+  // SSE EventSource
   subscribe(runId: string, callback: (status) => void)
 
   // Workspace

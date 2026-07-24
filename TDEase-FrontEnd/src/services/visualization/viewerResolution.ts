@@ -1,33 +1,9 @@
 import type { ViewerContext, ViewerRegistration } from './ViewerRegistry'
 import { viewerRegistry } from './ViewerRegistry'
 import { ensureVisualizationRegistryBootstrapped } from './registry'
-import { buildViewerContext } from './viewerPayloadAdapter'
-import { canonicalizeViewerType, resolveVisualizationTypeFromNode } from './viewerTypeAliases'
+import { canonicalizeViewerType } from './viewerTypeAliases'
 import type { VisualizationSessionData } from './runtime-types'
 import { toTableData } from './tableData'
-import { resolveNodeId } from '@/services/workflow/node-identity'
-
-type WorkflowNodeLike = {
-  type: string
-  visualizationConfig?: Record<string, unknown>
-  nodeConfig?: Record<string, unknown>
-  data?: Record<string, unknown>
-  outputs?: Array<Record<string, unknown>>
-}
-
-interface ResolveWorkflowDataViewerOptions {
-  viewerNode?: WorkflowNodeLike | null
-  dataNode?: WorkflowNodeLike | null
-  portId?: string | null
-}
-
-interface ResolveViewerFromPayloadOptions {
-  kind?: string
-  displayHint?: { semanticType?: string; visualizationType?: string } | null
-  columnNames?: string[]
-  columnTypes?: Array<{ name: string; type: string }>
-  toolId?: string
-}
 
 interface ResolveViewerForSessionDataOptions {
   toolId?: string
@@ -49,15 +25,26 @@ interface ViewerContextOptions {
   }
 }
 
+/** Build a minimal ViewerContext from options alone (no longer depends on deleted viewerPayloadAdapter). */
+function buildMinimalViewerContext(options: {
+  kind?: string
+  displayHint?: { semanticType?: string; visualizationType?: string } | null
+  columnNames?: string[]
+  columnTypes?: Array<{ name: string; type: string }>
+  toolId?: string
+}): ViewerContext {
+  return {
+    toolId: [options.toolId].filter(Boolean).join(':') || undefined,
+    kind: options.kind ?? undefined,
+    semanticType: options.displayHint?.semanticType ?? undefined,
+    columnNames: options.columnNames ?? [],
+    columnTypes: options.columnTypes ?? [],
+  }
+}
+
 export function resolveViewerRegistration(ctx: ViewerContext): ViewerRegistration | undefined {
   ensureVisualizationRegistryBootstrapped()
   return viewerRegistry.resolve(ctx)
-}
-
-export function resolveViewerFromPayload(
-  options: ResolveViewerFromPayloadOptions,
-): ViewerRegistration | undefined {
-  return resolveViewerRegistration(buildViewerContext(options))
 }
 
 export function buildViewerContextForSessionData(
@@ -65,7 +52,7 @@ export function buildViewerContextForSessionData(
   options: ViewerContextOptions = {},
 ): ViewerContext {
   const tableData = toTableData(sessionData.data)
-  const baseCtx = buildViewerContext({
+  const baseCtx = buildMinimalViewerContext({
     kind: sessionData.source?.inlinePayload?.kind,
     displayHint: sessionData.displayHint ?? null,
     toolId: options.toolId,
@@ -95,26 +82,6 @@ export function resolveViewerForSessionData(
   options: ResolveViewerForSessionDataOptions = {},
 ): ViewerRegistration | undefined {
   return resolveViewerRegistration(buildViewerContextForSessionData(sessionData, options))
-}
-
-export function resolveWorkflowDataViewer(
-  options: ResolveWorkflowDataViewerOptions,
-): ViewerRegistration | undefined {
-  const dataNodeToolId = options.dataNode ? resolveNodeId(options.dataNode) : ''
-  const viewerVisualizationType = resolveVisualizationTypeFromNode(options.viewerNode)
-  const portId = options.portId || ''
-  const outputPort = (options.dataNode?.outputs || []).find((port) => port.id === portId) || null
-
-  return resolveViewerRegistration({
-    toolId: [dataNodeToolId, portId].filter(Boolean).join(':') || dataNodeToolId || portId,
-    semanticType: typeof outputPort?.semanticType === 'string' ? outputPort.semanticType : undefined,
-    portOutputType: typeof outputPort?.dataType === 'string'
-      ? outputPort.dataType
-      : typeof outputPort?.type === 'string'
-        ? outputPort.type
-        : undefined,
-    visualizationConfig: viewerVisualizationType ? { type: viewerVisualizationType } : undefined,
-  })
 }
 
 export function allowsNonTabularResultFallback(

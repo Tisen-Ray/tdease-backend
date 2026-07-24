@@ -368,7 +368,7 @@ checkpoint 完成后 Snakemake 重读下游依赖——动态扇入扇出无需�
 策略层（不写新机制，只组合三动词）：
 
 ```
-1. 自动 pull:  run DONE → 自动拉 results/**（小，KB-MB 级）
+1. 自动 pull:  run SUCCEEDED → 自动拉 results/**（小，KB-MB 级）
                raw 不自动拉（大，GB 级）
 
 2. 懒 fetch:   AI 读 raw/sampleA.mzML → 本地缺失

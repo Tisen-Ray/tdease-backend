@@ -32,7 +32,7 @@
 | 不做 | 替代方案 |
 |------|---------|
 | 可视化工作流编辑器 | AI 写 Snakemake DSL |
-| 自研 workflow DAG 引擎 | Snakemake (pip 依赖 + src/snakemake/ 封装) |
+| 自研 workflow DAG 引擎 | TDEase Execution Runtime (selectively migrated from Snakemake) |
 | 状态机 / state-machine.ts | 文件系统 = 状态 |
 | 流程编排节点 | AI 直接写脚本 |
 | 前端配置工作流 | prompt 约束全量交给 AI |
@@ -57,7 +57,21 @@ app/              FastAPI 后端
   ├── database/    DB lifecycle + migrations
   ├── models/      SQLModel 数据模型
   ├── schemas/     Pydantic 请求/响应模式
-  ├── worker/      后台 worker
+  └── main.py     入口
+
+src/              核心代码
+  ├── contracts/    类型真相 — 前后端/CLI/Agent 共享
+  ├── execution_runtime/  TDEase 执行引擎 (selectively migrated from Snakemake)
+  │   ├── storage.py     唯一文件写入原语
+  │   ├── events.py      从引擎内部直接发出 TDEase typed event
+  │   ├── errors.py      ExecError → ErrorCode
+  │   └── runtime.py     preflight / execute / cancel
+  ├── snakemake/    向后兼容封装 → 委托给 execution_runtime
+  ├── services/     文件/证据/worker 服务
+  ├── ai/          Agent 系统
+  ├── domain/      领域模型 (proteomics, identity...)
+  ├── tools/       原子工具
+  └── infrastructure/ 基础设施
   └── main.py     入口
 
 src/              核心代码
@@ -108,29 +122,38 @@ rule process_mzml:
 - 前端不渲染 DAG，只渲染结果。
 - 后端通过 `src/snakemake/service.py` 调用 SnakemakeApi。
 
-## Snakemake 集成
+## Snakemake / Workflow DSL
+
+Agent 直接写 Snakemake DSL。TDEase Execution Runtime 解析并执行。
+```python
+# 例：Agent 生成的 Snakefile
+# rule process_mzml:
+#     input: "raw/{sample}.mzML"
+#     output: "results/{sample}/features.csv"
+#     shell: "process.py {input} {output}"
+```
+
+无中间 DSL、无 WorkflowSpec、无代码生成。Snakefile 是用户 workspace 中的
+普通文件。Execution Runtime 直接从内部执行，不 shell out 到 `snakemake` 命令。
+
+## TDEase Execution Runtime
 
 ```python
-from src.snakemake import run_snakemake, WorkflowSpec, RuleSpec
+from src.execution_runtime import preflight, execute, cancel
 
-# 方式 1: 直接传 Snakefile
-result = run_snakemake(
-    snakefile="/workspace/workflow.smk",
-    workdir="/workspace",
-    cores=8,
-)
+# 校验
+pf = preflight(commit)  # -> PreflightResult (临时 view model, 不持久化)
 
-# 方式 2: 用 WorkflowSpec 构建
-spec = WorkflowSpec(rules=[
-    RuleSpec(
-        name="process",
-        input=["raw/{sample}.mzML"],
-        output=["results/{sample}/features.csv"],
-        shell="process.py {input} {output}",
-    ),
-])
-snakefile_content = spec.to_snakefile()
+# 执行
+result = execute(commit)  # -> ExecutionResult
+# 内部直接发出 TDEase typed events → events.jsonl
+# 内部只通过 Storage Layout 写入文件
 ```
+
+- 无 `import snakemake`
+- 无运行时 `snakemake` 命令
+- 无 `.snakemake/` 目录
+- 上游名称仅存于 `THIRD_PARTY.md` 和 `provenance/source-ledger.json`
 
 ## 设计参考（完整副本）
 

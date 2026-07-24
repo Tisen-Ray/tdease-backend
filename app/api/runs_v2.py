@@ -1,179 +1,235 @@
 """
-Runs API v2 — 基于新架构的轻量运行管理。
+Runs API v2 — SSE 事件流 + 状态查询。
 
-POST   /api/v2/runs          提交运行
-GET    /api/v2/runs          列出运行
-GET    /api/v2/runs/:id      查询状态
-POST   /api/v2/runs/:id/cancel  取消
-GET    /api/v2/runs/:id/log  获取日志
-GET    /api/v2/runs/:id/files  列出结果文件
-GET    /api/v2/runs/:id/files/:path  下载单个文件
+后端只做四件事：接受 commit、排队、执行、流出文件事件。
+使用 SSE + Last-Event-ID 推送。
+
+所有写入通过 Storage Layout（Route 不直接 open/write/mkdir）。
 """
 
 from __future__ import annotations
 
-import logging
+import asyncio
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse, FileResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from starlette.responses import StreamingResponse
 
-from app.models.run import Run, RunCreate, RunStatus
-
-logger = logging.getLogger(__name__)
+from src.contracts import (
+    RunCommit,
+    RunCreateRequest,
+    RunListResponse,
+    RunStatus,
+    RunStatusResponse,
+    run_not_found,
+)
+from src.execution_runtime.storage import get_storage
 
 router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
 
-# In-memory store (server mode) or delegates to LocalBackend
-# For now: simple in-memory dict shared across the process
-_runs: dict[str, dict] = {}
-_ws_clients: set[WebSocket] = set()
-
-
-def _get_backend():
-    """延迟导入，避免循环依赖。"""
-    from src.backends.resolver import resolve_backend
-    return resolve_backend()
-
-
-# ------------------------------------------------------------------
-# REST 端点
-# ------------------------------------------------------------------
 
 @router.post("", status_code=201)
-async def submit_run(body: RunCreate):
-    """提交一次 Snakemake 运行。"""
-    backend = _get_backend()
-    run = await backend.submit(
-        workspace=body.workspace,
-        snakefile=body.snakefile,
-        config=body.config,
-        cores=body.cores,
-    )
-    return {
-        "id": run.id,
-        "status": run.status,
-        "workspace": run.workspace,
-        "created_at": run.created_at,
-    }
+async def create_run(body: RunCreateRequest):
+    """
+    提交 Run commit。
 
+    使用 Storage Layout 原子写入 run.json + 初始事件。
+    """
+    commit = body.commit
+    storage = get_storage()
 
-@router.get("")
-async def list_runs(
-    workspace: Optional[str] = Query(None),
-):
-    """列出运行。可按 workspace 过滤。"""
-    backend = _get_backend()
-    if workspace:
-        runs = await backend.list_runs(workspace)
-    else:
-        runs = []  # 全局列表暂不支持
-    return [
-        {
-            "id": r.id,
-            "workspace": r.workspace,
-            "status": r.status,
-            "mode": r.mode,
-            "pid": r.pid,
-            "exit_code": r.exit_code,
-            "created_at": r.created_at,
-            "finished_at": r.finished_at,
-        }
-        for r in runs
-    ]
+    # Idempotent allocation (creates dir if not exists)
+    storage.allocate_run(commit.run_id)
 
+    run_json = storage.resolve(commit.run_id, "run.json")
 
-@router.get("/{run_id}")
-async def get_run_status(run_id: str):
-    """查询单个运行的状态。"""
-    backend = _get_backend()
-    run = await backend.status(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return {
-        "id": run.id,
-        "workspace": run.workspace,
-        "status": run.status,
-        "mode": run.mode,
-        "pid": run.pid,
-        "exit_code": run.exit_code,
-        "error": run.error,
-        "created_at": run.created_at,
-        "started_at": run.started_at,
-        "finished_at": run.finished_at,
-    }
+    # Check idempotency first
+    existing = storage.read_json(run_json)
+    if existing and existing.get("idempotency_key") == commit.idempotency_key:
+        return {"run_id": commit.run_id, "status": existing.get("status", "QUEUED"), "idempotent": True}
 
-
-@router.post("/{run_id}/cancel")
-async def cancel_run(run_id: str):
-    """取消运行。"""
-    backend = _get_backend()
-    ok = await backend.cancel(run_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Run not found or already completed")
-    return {"cancelled": True, "run_id": run_id}
-
-
-@router.get("/{run_id}/log")
-async def get_run_log(
-    run_id: str,
-    lines: int = Query(default=50, ge=1, le=1000),
-):
-    """获取运行日志（tail 最新 N 行）。"""
-    backend = _get_backend()
-    log = await backend.tail_log(run_id, lines=lines)
-    return PlainTextResponse(content=log)
-
-
-@router.get("/{run_id}/files")
-async def list_result_files(
-    run_id: str,
-    pattern: str = Query(default="results/**"),
-):
-    """列出/拉取结果文件。"""
-    backend = _get_backend()
-    files = await backend.pull(run_id, patterns=[pattern])
-    return {"files": files, "count": len(files)}
-
-
-@router.get("/{run_id}/files/{file_path:path}")
-async def get_result_file(run_id: str, file_path: str):
-    """下载单个结果文件。"""
-    backend = _get_backend()
-    path = await backend.fetch(run_id, file_path)
-    if not path:
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path)
-
-
-# ------------------------------------------------------------------
-# WebSocket: 实时状态推送
-# ------------------------------------------------------------------
-
-@router.websocket("/ws")
-async def runs_websocket(ws: WebSocket):
-    await ws.accept()
-    _ws_clients.add(ws)
+    if not commit.workspace_files:
+        raise HTTPException(status_code=422, detail="workspace_files is required; submit an immutable client file mapping")
     try:
+        storage.materialize_run_files(commit.run_id, commit.workspace_files)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    snake_entry = next((item for item in commit.workspace_files if item.path in {"Snakefile", "workflow.smk"}), None)
+    if snake_entry is None:
+        raise HTTPException(status_code=422, detail="workspace mapping must contain Snakefile or workflow.smk")
+    snake_text = storage.resolve(commit.run_id, snake_entry.path).read_text(encoding="utf-8")
+    if commit.snakefile and commit.snakefile != snake_text:
+        raise HTTPException(status_code=409, detail="embedded snakefile differs from mapped client file")
+
+    # Atomically write run.json (status QUEUED)
+    run_data = commit.model_dump()
+    run_data["snakefile"] = snake_text
+    run_data["snakefile_path"] = snake_entry.path
+    run_data["status"] = "QUEUED"
+    storage.atomic_write_json(run_json, run_data)
+
+    # Write initial event through storage (seq allocated by storage)
+    from src.execution_runtime.events import EventEmitter
+    emitter = EventEmitter(commit.run_id)
+    emitter.run_queued(
+        idempotency_key=commit.idempotency_key,
+        workspace_tree_hash=commit.workspace_tree_hash,
+        user_id=commit.user_id,
+        cores=commit.cores,
+        workflow_steps=0,
+    )
+
+    return {"run_id": commit.run_id, "status": "QUEUED", "idempotent": False}
+
+
+@router.get("/{run_id}", response_model=RunStatusResponse)
+async def get_run(run_id: str):
+    """查询 Run 状态 — 从 run.json + events.jsonl 投影。"""
+    storage = get_storage()
+    data = storage.read_json(storage.resolve(run_id, "run.json"))
+    if not data:
+        raise HTTPException(status_code=404, detail=run_not_found(run_id).message)
+
+    last_seq = storage.recover_seq(run_id)
+
+    return RunStatusResponse(
+        run_id=run_id,
+        workspace_id=data.get("workspace_id", ""),
+        status=RunStatus(data.get("status", "QUEUED")),
+        mode=data.get("mode", "local"),
+        cores=data.get("cores", 4),
+        pid=data.get("pid"),
+        exit_code=data.get("exit_code"),
+        error=data.get("error"),
+        created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.utcnow(),
+        started_at=datetime.fromisoformat(data["started_at"]) if data.get("started_at") else None,
+        finished_at=datetime.fromisoformat(data["finished_at"]) if data.get("finished_at") else None,
+        event_seq_last=last_seq,
+    )
+
+
+@router.get("/{run_id}/events")
+async def get_events_sse(
+    run_id: str, request: Request,
+    last_event_id: Optional[int] = Query(default=None, alias="last_event_id"),
+):
+    """SSE 事件流 — events.jsonl 尾部 → SSE。Last-Event-ID 断点续传。"""
+    storage = get_storage()
+
+    async def event_generator():
+        events_file = storage.events_path(run_id)
+        sent_seq = last_event_id or 0
+
+        if events_file.exists():
+            for line in events_file.read_text(encoding="utf-8").strip().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    evt = json.loads(line)
+                    if evt.get("seq", 0) > sent_seq:
+                        yield f"id: {evt['seq']}\ndata: {line}\n\n"
+                        sent_seq = evt["seq"]
+                except json.JSONDecodeError:
+                    continue
+
         while True:
-            data = await ws.receive_text()
-            # 客户端可以发送 { "subscribe": "run_id" } 来订阅特定 run
-            # 当前实现：全部广播
-    except WebSocketDisconnect:
-        _ws_clients.discard(ws)
-    except Exception:
-        _ws_clients.discard(ws)
+            if await request.is_disconnected():
+                break
+            if events_file.exists():
+                lines = events_file.read_text(encoding="utf-8").strip().splitlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        evt = json.loads(line)
+                        if evt.get("seq", 0) > sent_seq:
+                            yield f"id: {evt['seq']}\ndata: {line}\n\n"
+                            sent_seq = evt["seq"]
+                    except json.JSONDecodeError:
+                        continue
+            data = storage.read_json(storage.resolve(run_id, "run.json"))
+            if data and data.get("status") in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                yield f"event: done\ndata: {{\"status\": \"{data['status']}\"}}\n\n"
+                break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
-async def broadcast_run_status(run_id: str, status: str, **extra):
-    """向所有 WebSocket 客户端广播运行状态。"""
-    import json
-    msg = json.dumps({"type": "run_status", "run_id": run_id, "status": status, **extra})
-    dead = set()
-    for ws in _ws_clients:
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    _ws_clients -= dead
+@router.get("", response_model=RunListResponse)
+async def list_runs(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    workspace_id: Optional[str] = None,
+):
+    """列出 Run — 从文件系统扫描。"""
+    storage = get_storage()
+    runs_dir = storage.data / "runs"
+    if not runs_dir.exists():
+        return RunListResponse(runs=[], total=0, offset=offset, limit=limit)
+
+    all_runs = []
+    for rd in sorted(runs_dir.iterdir(), reverse=True):
+        if not rd.is_dir():
+            continue
+        data = storage.read_json(rd / "run.json")
+        if not data:
+            continue
+        if workspace_id and data.get("workspace_id") != workspace_id:
+            continue
+        all_runs.append(data)
+
+    total = len(all_runs)
+    page = all_runs[offset:offset + limit]
+
+    runs = [
+        RunStatusResponse(
+            run_id=r.get("run_id", ""),
+            workspace_id=r.get("workspace_id", ""),
+            status=RunStatus(r.get("status", "QUEUED")),
+            mode=r.get("mode", "local"),
+            cores=r.get("cores", 4),
+            pid=r.get("pid"),
+            exit_code=r.get("exit_code"),
+            error=r.get("error"),
+            created_at=datetime.fromisoformat(r["created_at"]) if r.get("created_at") else datetime.utcnow(),
+            started_at=datetime.fromisoformat(r["started_at"]) if r.get("started_at") else None,
+            finished_at=datetime.fromisoformat(r["finished_at"]) if r.get("finished_at") else None,
+            event_seq_last=0,
+        )
+        for r in page
+    ]
+    return RunListResponse(runs=runs, total=total, offset=offset, limit=limit)
+
+
+@router.post("/{run_id}/cancel", status_code=200)
+async def cancel_run(run_id: str):
+    """取消 Run — 通过 Storage Layout 写入 cancel 标记。"""
+    storage = get_storage()
+    data = storage.read_json(storage.resolve(run_id, "run.json"))
+    if not data:
+        raise HTTPException(status_code=404, detail=run_not_found(run_id).message)
+
+    status = data.get("status", "")
+    if status not in ("QUEUED", "RUNNING"):
+        from src.contracts import run_not_queued
+        raise HTTPException(status_code=409, detail=run_not_queued(run_id, status).message)
+
+    # Write cancel marker — worker's task loop checks this
+    storage.mark_cancelled(run_id)
+
+    # Dequeue: mark CANCELLED if still QUEUED (not yet claimed)
+    if status == "QUEUED":
+        storage.atomic_write_json(
+            storage.resolve(run_id, "run.json"),
+            {**data, "status": "CANCELLED"},
+        )
+
+    return {"run_id": run_id, "status": "CANCELLED"}

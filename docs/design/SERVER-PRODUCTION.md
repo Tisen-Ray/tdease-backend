@@ -165,15 +165,14 @@ content-addressed 存储 → 引用计数来自 run 目录
 用户点取消:
   1. SIGTERM → 进程组 (Snakemake 收到后等运行中 job 收尾)
   2. 宽限 30s → SIGKILL 进程组
-  3. status = FAILED, error = "cancelled_by_user"
+  3. status = CANCELLED, reason = "cancelled_by_user"
 ```
 
-**不加 CANCELLED 状态。** 理由：
+**保留 CANCELLED 终态，但不新增第二条状态轴。** 取消是用户意图，不是执行故障：
 
 - 文件真相不变：半成品输出留在 run 目录，重跑自动续。
-- 状态轴保持 QUEUED/RUNNING/DONE/FAILED 四个。
-- 前端用 `error == "cancelled_by_user"` 区分显示"已取消"和"失败"，
-  这是展示层策略，不是协议层状态。
+- 生命周期统一为 QUEUED/RUNNING/SUCCEEDED/FAILED/CANCELLED。
+- 取消独立于失败，保证告警、失败率、重试和审计语义正确。
 
 ### 超时
 
@@ -240,18 +239,9 @@ RETURNING id;
 
 ### 断点续传的具体形态
 
-```
-上传:
-  1. manifest 握手 → 拿到 upload_session_id
-  2. 分块 POST (如 8MB/块), 每块带 sha256
-  3. 服务器记录 session → 已收块清单
-  4. 中断重连 → 查询 session 已收块 → 只补缺的
-  5. 最后一块到 → 拼合 + 整体 hash 校验 → 物化到 content store
-  6. session 24h 未完成 → tmp 清除 (见 §三)
-
-下载: 同一套分块协议, 客户端记录已收块
-服务器重启 mid-transfer: session 状态在磁盘上, 无感恢复
-```
+上传直接使用 S3/MinIO multipart + presigned URL。应用服务器只校验 tree
+manifest、配额和 blob digest，并发放 URL；upload session、已收块清单、
+超时清理由对象存储托管。下载使用 S3 range/rclone，不自研第二套协议。
 
 ### 并发与限速
 
@@ -319,9 +309,9 @@ run 目录在磁盘上, 升级不碰它们 → 零数据风险
 **DB 是可重建的索引，文件才是真相**（与旧架构 §10 原则一致）：
 
 ```
-runs 表损坏 → 扫 workspaces/*/runs/*/ 目录:
+runs 表损坏 → 扫 runs/*/ 目录:
   每个 run 目录的 events.jsonl + run.json → 重建表记录
-  状态推导: 有 finished 事件 → DONE/FAILED
+  状态推导: 有 finished 事件 → SUCCEEDED/FAILED/CANCELLED
             有 started 无 finished → 孤儿 → QUEUED (对账逻辑复用)
 
 恢复 = 同一个启动对账代码路径, 不是另一套系统
@@ -375,7 +365,7 @@ DB schema 迁移只做**加列/加表**，不改旧列语义。
 | cgroup/超时/进程组杀伤（systemd-run 包装） | ~1 天 |
 | 容器执行（--use-apptainer 路径） | ~2 天（可后置） |
 | 配额检查（manifest 握手扩展） | ~0.5 天 |
-| 分块续传协议（双向） | ~2 天（与之前估计合并） |
+| S3 multipart/presigned URL 胶水 | ~0.5 天 |
 | 原子 dequeue + per-user 公平轮转 | ~0.5 天 |
 | 幂等键 | ~10 行 |
 | events.jsonl 追加 | ~0.5 天 |
@@ -384,24 +374,29 @@ DB schema 迁移只做**加列/加表**，不改旧列语义。
 | 软删除 + GC + tmp 清理 | ~1 天 |
 | push 乐观锁（expected_revision） | ~0.5 天 |
 
-### 分期建议
+### 分期建议（v0.3 修订：desktop 优先，正式化后置）
+
+**当前决策：主线是 desktop 场景。** 配额、多租户等正式化能力先不管，
+对应的门禁测试已打 `cloud` 标记，desktop 阶段 `-m "not cloud"` 排除。
 
 ```
-P0 (多用户上线前必须):
-  路径校验、配额、超时+进程组杀伤、原子 dequeue、
-  幂等键、events.jsonl、health 端点、tmp 清理、Snakefile 文本审查
+P0 (desktop 首发):
+  CLI + LocalBackend、单机任务队列、原子 dequeue、幂等键、
+  events.jsonl、health 端点、Snakefile 文本审查、路径校验、
+  超时+进程组杀伤、启动对账、取消语义、模板扫描
 
-P1 (真实用户跑起来后):
-  per-user 公平轮转、软删除+GC、断点续传、admin CLI、乐观锁
+P1 (接入服务器/真实使用后):
+  manifest 握手+去重、S3 断点续传、双级 token、软删除+GC、
+  per-user 公平轮转、admin CLI、push 乐观锁
 
-P2 (云模式/不可信用户):
-  容器隔离、网络隔离、metrics、跨机迁移工具
+P2 (多用户/云模式才做):
+  配额体系、多用户隔离强化、容器隔离、网络隔离、metrics、跨机迁移工具
 ```
 
 ### 零范式检验
 
 ```
-1. 新增状态轴了吗？ → 没有。CANCELLED 都没加。
+1. 新增状态轴了吗？ → 没有。CANCELLED 是同一生命周期轴上的必要终态。
    配额/会话/宽限期全是"带 TTL 的文件 + 单表字段"。
 2. 能用文件操作实现吗？ → events.jsonl、身份文件、软删除(mv)、
    content store、GC(引用计数+rm) 全是文件操作。
