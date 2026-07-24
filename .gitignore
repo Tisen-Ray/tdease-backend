@@ -9,3 +9,4 @@ logs/
 .env
 *.bak
 uv.lock
+data/
