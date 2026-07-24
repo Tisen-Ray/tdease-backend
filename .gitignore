@@ -10,3 +10,10 @@ logs/
 *.bak
 uv.lock
 data/
+.snakemake/log/
+server-data/
+user-data/
+downloads/
+test_out
+.codex/
+.pi/
