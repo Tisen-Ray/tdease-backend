@@ -1,0 +1,46 @@
+{
+  "appId": "com.ray.tdease-frontend",
+  "productName": "TDEase",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**",
+    "electron/**",
+    "package.json"
+  ],
+  "extraResources": [
+    { "from": "../app", "to": "backend/app" },
+    { "from": "../src", "to": "backend/src" },
+    { "from": "../pyproject.toml", "to": "backend/pyproject.toml" },
+    { "from": "../uv.lock", "to": "backend/uv.lock" },
+    { "from": "../README.md", "to": "backend/README.md" },
+    { "from": "../data/system", "to": "backend/data/system" },
+    { "from": "../data/seed", "to": "backend/data/seed" }
+  ],
+  "extraMetadata": {
+    "main": "electron/main.cjs"
+  },
+  "publish": [
+    {
+      "provider": "generic",
+      "url": "https://example.com/tdease/updates/"
+    }
+  ],
+  "win": {
+    "icon": "electron/assets/icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "perMachine": false
+  }
+}
