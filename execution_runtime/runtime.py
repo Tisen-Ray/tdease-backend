@@ -157,12 +157,12 @@ def execute(commit: RunCommit) -> ExecutionResult:
     total, succeeded, failed = 1, 0, 0
     run_dir = str(storage.resolve(run_id))
     snakefile_path = storage.resolve(run_id, "Snakefile")
-    command_parts = [sys.executable, "-m", "snakemake", "-s", str(snakefile_path),
+    command_parts = [sys.executable, "-m", "src.execution_runtime.engine_runner", "-s", str(snakefile_path),
                      "--cores", str(commit.cores), "--rerun-incomplete", "--printshellcmds"]
     command_parts.extend(commit.targets)
     command = subprocess.list2cmdline(command_parts)
     ok, ec, _elapsed, err_text = execute_task(
-        run_id=run_id, task_id="snakemake", step_label="Snakemake",
+        run_id=run_id, task_id="engine", step_label="Workflow engine",
         command=command, cwd=run_dir, emitter=emitter,
         timeout=7 * 24 * 60 * 60,
     )
@@ -176,7 +176,7 @@ def execute(commit: RunCommit) -> ExecutionResult:
     else:
         failed = 1
         total_elapsed = time.perf_counter() - start
-        error = task_failed("snakemake", ec, err_text)
+        error = task_failed("engine", ec, err_text)
         emitter.run_failed(ec, total_elapsed, str(error))
         return ExecutionResult(success=False, exit_code=ec, error=error,
             run_time_seconds=total_elapsed, total_tasks=1, failed_tasks=1,

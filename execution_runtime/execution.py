@@ -80,6 +80,8 @@ def execute_task(
             if stream is None:
                 return
             for line in iter(stream.readline, ""):
+                if task_id == "engine":
+                    line = _brand_engine_output(line)
                 storage.append_task_output(run_id, task_id, name, line)
                 if name == "stderr":
                     stderr_lines.append(line)
@@ -155,6 +157,16 @@ def _sanitize_command(cmd: str) -> str:
                  r'(--password[=\s]+)\S+', r'(Bearer\s+)\S+']:
         s = re.sub(pat, r'\1***', s, flags=re.IGNORECASE)
     return s
+
+
+def _brand_engine_output(text: str) -> str:
+    """Keep the product log protocol TDEase-owned while retaining diagnostics."""
+    return (
+        text.replace("SNAKEMAKE", "TDEASE WORKFLOW ENGINE")
+        .replace("Snakemake version:", "Engine version:")
+        .replace("snakemake --", "workflow-engine --")
+        .replace(".snakemake", ".tdease-runtime/engine")
+    )
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:

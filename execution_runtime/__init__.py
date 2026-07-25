@@ -1,7 +1,7 @@
 """
 TDEase Execution Runtime — 产品执行引擎。
 
-直接使用 TDEase namespace 和类型。不 import snakemake。
+产品代码只使用 TDEase namespace 和类型；上游依赖封闭在私有 engine_runner。
 解析、规划、调度、执行算法从成熟实现中迁入（按能力，不按目录）。
 
 公开入口:

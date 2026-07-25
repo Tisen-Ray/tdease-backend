@@ -29,14 +29,15 @@ class PackageLock(BaseModel):
 
 
 class NodeBinding(BaseModel):
-    """Run commit 中锁定的节点二进制路径。"""
+    """Run commit 中锁定的服务端 Node package identity。"""
 
-    name: str = Field(description="节点名称 (e.g. msconvert)")
-    binary_path: str = Field(description="服务端解析后的绝对路径")
-    binary_digest: str = Field(
-        description="二进制 sha256",
+    id: str = Field(description="Node ID (e.g. topfd)", pattern=r"^[a-zA-Z0-9_.-]+$")
+    version: str = Field(description="Node package version")
+    digest: str = Field(
+        description="完整 Node package sha256",
         pattern=r"^[a-f0-9]{64}$",
     )
+    rules: list[str] = Field(default_factory=list, description="本 Run 使用的公开 rule 名")
 
 
 class RunCommit(BaseModel):
@@ -62,6 +63,10 @@ class RunCommit(BaseModel):
     workspace_files: list[TreeEntry] = Field(
         default_factory=list,
         description="客户端冻结的 path→blob 映射；服务端据此物化隔离运行快照",
+    )
+    local_workspace_root: Optional[str] = Field(
+        default=None,
+        description="仅 local 部署使用的用户 workspace 绝对路径；remote 必须为空",
     )
 
     # Snakemake 执行参数

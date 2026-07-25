@@ -154,6 +154,27 @@ class StorageLayout:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def file_digest(self, path: Path, chunk_size: int = 1024 * 1024) -> str:
+        """Hash large files without loading RAW/mzML/results into memory."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            while chunk := source.read(chunk_size):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def claim_run(self, run_id: str) -> bool:
+        """Atomically claim one queued run; claim storage is runtime-owned."""
+        claim = self.resolve(run_id, ".runtime", "claimed")
+        try:
+            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return True
+        except FileExistsError:
+            return False
+
+    def release_claim(self, run_id: str) -> None:
+        self.resolve(run_id, ".runtime", "claimed").unlink(missing_ok=True)
+
     # ── Events (JSONL append, single-writer) ──
 
     def events_path(self, run_id: str) -> Path:
@@ -288,6 +309,39 @@ class StorageLayout:
         os.replace(tmp, dest)
         return h
 
+    def blob_put_stream(self, source, expected_digest: str,
+                        chunk_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+        """Stream an uploaded file into CAS with one pass and bounded memory."""
+        incoming = self.data / "store" / ".incoming"
+        incoming.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(incoming), prefix="upload-")
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with os.fdopen(fd, "wb") as target:
+                while chunk := source.read(chunk_size):
+                    digest.update(chunk)
+                    size += len(chunk)
+                    target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            actual = digest.hexdigest()
+            if actual != expected_digest:
+                raise ValueError(f"digest mismatch: {actual}")
+            dest = self.data / "store" / actual[:2] / actual
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                os.unlink(tmp)
+            else:
+                os.replace(tmp, dest)
+            return actual, size
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     def blob_get(self, hash_hex: str) -> bytes:
         return (self.data / "store" / hash_hex[:2] / hash_hex).read_bytes()
 
@@ -308,6 +362,75 @@ class StorageLayout:
             if not self.blob_exists(digest):
                 raise FileNotFoundError(f"missing blob for {path}: {digest}")
             self.atomic_write(target, self.blob_get(digest))
+
+    def materialize_local_run_files(self, run_id: str, workspace_root: Path,
+                                    entries: list[Any]) -> None:
+        """Freeze controls and share large local inputs without network/CAS transfer."""
+        workspace_root = workspace_root.resolve()
+        run_dir = self.allocate_run(run_id).resolve()
+        shared: list[dict[str, Any]] = []
+        for entry in entries:
+            rel = entry.path if hasattr(entry, "path") else entry["path"]
+            expected = entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
+            source = (workspace_root / rel).resolve(strict=True)
+            try:
+                source.relative_to(workspace_root)
+            except ValueError as exc:
+                raise ValueError(f"local source escapes workspace: {rel}") from exc
+            if self.file_digest(source) != expected:
+                raise ValueError(f"local source digest changed: {rel}")
+            target = (run_dir / rel).resolve(strict=False)
+            target.relative_to(run_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            is_control = rel == "Snakefile" or rel.endswith(".smk") or rel == "config.yaml" or rel.startswith("scripts/")
+            if is_control:
+                self.atomic_write(target, source.read_bytes())
+            else:
+                try:
+                    os.link(source, target)
+                    strategy = "hardlink"
+                except OSError:
+                    shutil.copy2(source, target)
+                    strategy = "copy"
+                shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": strategy})
+        self.atomic_write_json(self.resolve(run_id, ".tdease-runtime", "local-inputs.json"), shared)
+
+    def verify_local_inputs(self, run_id: str) -> None:
+        manifest = self.read_json(self.resolve(run_id, ".tdease-runtime", "local-inputs.json")) or []
+        for item in manifest:
+            path = self.resolve(run_id, item["path"])
+            if not path.is_file() or self.file_digest(path) != item["sha256"]:
+                raise ValueError(f"local shared input changed: {item['path']}")
+
+    def write_results_manifest(self, run_id: str) -> Path:
+        entries = []
+        for path in self.result_files(run_id):
+            if path.is_file():
+                entries.append({"path": path.relative_to(self.resolve(run_id)).as_posix(),
+                                "size": path.stat().st_size, "sha256": self.file_digest(path)})
+        target = self.resolve(run_id, "results.manifest.json")
+        self.atomic_write_json(target, {"schema_version": 1, "run_id": run_id, "files": entries})
+        return target
+
+    def reconcile_orphaned_runs(self) -> list[str]:
+        """Return dead RUNNING runs to QUEUED using file truth, no extra state axis."""
+        import psutil
+        recovered: list[str] = []
+        runs = self.data / "runs"
+        if not runs.is_dir():
+            return recovered
+        for directory in runs.iterdir():
+            data = self.read_json(directory / "run.json") if directory.is_dir() else None
+            if not data or data.get("status") != "RUNNING":
+                continue
+            pid = data.get("pid")
+            if pid and psutil.pid_exists(int(pid)):
+                continue
+            run_id = data["run_id"]
+            self.release_claim(run_id)
+            self.atomic_write_json(directory / "run.json", {**data, "status": "QUEUED", "pid": None})
+            recovered.append(run_id)
+        return recovered
 
     # ── Trash ──
 

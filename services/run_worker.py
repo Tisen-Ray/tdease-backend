@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from threading import Event
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -43,12 +44,11 @@ def _dequeue() -> Optional[dict]:
         if data.get("status") != "QUEUED":
             continue
 
-        claim = rd / ".claimed"
         try:
-            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return data
-        except FileExistsError:
+            if get_storage().claim_run(data["run_id"]):
+                return data
+            continue
+        except (FileExistsError, KeyError, ValueError):
             continue
 
     return None
@@ -68,6 +68,8 @@ def execute_run(run_data: dict) -> None:
         idempotency_key=run_data.get("idempotency_key", ""),
         workspace_id=run_data.get("workspace_id", ""),
         workspace_tree_hash=run_data.get("workspace_tree_hash", "0" * 64),
+        workspace_files=run_data.get("workspace_files", []),
+        local_workspace_root=run_data.get("local_workspace_root"),
         snakefile=run_data.get("snakefile", ""),
         config=run_data.get("config", {}),
         cores=run_data.get("cores", 4),
@@ -75,6 +77,9 @@ def execute_run(run_data: dict) -> None:
         mode=run_data.get("mode", "local"),
         packages=run_data.get("packages", []),
         nodes=run_data.get("nodes", []),
+        targets=run_data.get("targets", []),
+        memory_mb=run_data.get("memory_mb"),
+        labels=run_data.get("labels", {}),
     )
 
     # Update status to RUNNING via storage
@@ -85,7 +90,16 @@ def execute_run(run_data: dict) -> None:
          "started_at": datetime.now(timezone.utc).isoformat()},
     )
 
-    result = execute(commit)
+    try:
+        if commit.mode == "local":
+            storage.verify_local_inputs(run_id)
+        result = execute(commit)
+        if commit.mode == "local":
+            storage.verify_local_inputs(run_id)
+    except Exception as exc:
+        from src.execution_runtime.runtime import ExecutionResult
+        from src.execution_runtime.errors import runtime_internal
+        result = ExecutionResult(success=False, exit_code=-1, error=runtime_internal(str(exc)))
 
     # Terminal status via storage
     status = (
@@ -102,15 +116,26 @@ def execute_run(run_data: dict) -> None:
         "finished_at": datetime.now(timezone.utc).isoformat(),
     })
 
+    if status == "SUCCEEDED":
+        storage.write_results_manifest(run_id)
+
     # Cleanup claim
-    (_data_root() / "runs" / run_id / ".claimed").unlink(missing_ok=True)
+    storage.release_claim(run_id)
 
 
-def run_loop(poll_interval: float = 1.0, once: bool = False) -> None:
+def run_loop(
+    poll_interval: float = 1.0,
+    once: bool = False,
+    stop_event: Event | None = None,
+) -> None:
     """Worker 主循环。"""
-    get_storage().bootstrap()
+    storage = get_storage()
+    storage.bootstrap()
+    storage.reconcile_orphaned_runs()
 
     while True:
+        if stop_event and stop_event.is_set():
+            return
         try:
             run_data = _dequeue()
             if run_data:
@@ -118,7 +143,10 @@ def run_loop(poll_interval: float = 1.0, once: bool = False) -> None:
             elif once:
                 break
             else:
-                time.sleep(poll_interval)
+                if stop_event:
+                    stop_event.wait(poll_interval)
+                else:
+                    time.sleep(poll_interval)
         except KeyboardInterrupt:
             break
         except Exception:
