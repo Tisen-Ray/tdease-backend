@@ -25,7 +25,8 @@ from src.execution_runtime.storage import StorageLayout
 
 
 def _data_root() -> Path:
-    return Path(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
+    # 走唯一入口 get_storage()，避免散落的 os.environ.get(..., "server-data")。
+    return get_storage().data
 
 
 def _dequeue() -> Optional[dict]:
@@ -91,6 +92,17 @@ def execute_run(run_data: dict) -> None:
     )
 
     try:
+        # §4.3 defense-in-depth: create_run is the load-bearing gate, but a
+        # hand-edited / replayed run.json could still reach the worker. Reject
+        # before the engine starts so the run fails with an explicit Profile
+        # error instead of producing a DAG the frontend cannot draw.
+        from src.execution_runtime.profile_validator import validate_snakefile_profile
+        profile = validate_snakefile_profile(commit.snakefile)
+        if not profile.valid:
+            raise ValueError(
+                "Snakefile violates the static-parseable Profile (§4.3): "
+                + "; ".join(profile.errors())
+            )
         if commit.mode == "local":
             storage.verify_local_inputs(run_id)
         result = execute(commit)

@@ -89,7 +89,10 @@ def verify_digest(path: Path, expected_sha256: str) -> None:
 # --- Blob store（本地文件系统）---
 
 def data_root() -> Path:
-    return Path(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
+    # 走唯一入口 get_storage()，避免散落的 os.environ.get(..., "server-data")。
+    # 与 src/execution_runtime/storage.py 保持单一解析点。
+    from src.execution_runtime.storage import get_storage
+    return get_storage().data
 
 
 def blob_path(hash_hex: str) -> Path:

@@ -55,11 +55,15 @@ class StorageLayout:
     # ── Bootstrap ──
 
     def bootstrap(self) -> None:
-        """一次性创建固定目录结构。"""
+        """一次性创建固定目录结构。
+
+        与 electron/runtime_config.cjs ensureRuntimeDirectories 对齐。
+        不创建 workspaces/（老布局遗留：归属是 run.json 字段而非目录）。
+        不创建 system/（随应用发布的资产投影，非运行时 mkdir）。
+        """
         for d in [
             self.data / "database",
             self.data / "store",
-            self.data / "workspaces",
             self.data / "runs",
             self.cache,
             self.trash,
@@ -413,7 +417,12 @@ class StorageLayout:
         return target
 
     def reconcile_orphaned_runs(self) -> list[str]:
-        """Return dead RUNNING runs to QUEUED using file truth, no extra state axis."""
+        """Return dead RUNNING runs to QUEUED using file truth, no extra state axis.
+
+        Checks engine_pid (the actual engine_runner subprocess) before falling back
+        to pid (the worker). Kills a surviving orphan engine before re-queueing to
+        prevent double-run.
+        """
         import psutil
         recovered: list[str] = []
         runs = self.data / "runs"
@@ -423,12 +432,31 @@ class StorageLayout:
             data = self.read_json(directory / "run.json") if directory.is_dir() else None
             if not data or data.get("status") != "RUNNING":
                 continue
-            pid = data.get("pid")
-            if pid and psutil.pid_exists(int(pid)):
-                continue
+            # 优先查 engine_pid（engine_runner 子进程），其次 pid（worker）。
+            engine_pid = data.get("engine_pid")
+            worker_pid = data.get("pid")
             run_id = data["run_id"]
+            orphan_alive = False
+            for pid_val in (engine_pid, worker_pid):
+                if pid_val and psutil.pid_exists(int(pid_val)):
+                    orphan_alive = True
+                    # 孤儿 engine 存活：先 kill 再重排，防双跑。
+                    if pid_val == engine_pid:
+                        try:
+                            p = psutil.Process(int(pid_val))
+                            p.terminate()
+                            p.wait(timeout=3)
+                        except Exception:
+                            try:
+                                p.kill()
+                            except Exception:
+                                pass
+                    break
+            if orphan_alive:
+                # 孤儿还在跑，不重排队——等下次 reconcile。
+                continue
             self.release_claim(run_id)
-            self.atomic_write_json(directory / "run.json", {**data, "status": "QUEUED", "pid": None})
+            self.atomic_write_json(directory / "run.json", {**data, "status": "QUEUED", "pid": None, "engine_pid": None})
             recovered.append(run_id)
         return recovered
 
@@ -455,10 +483,44 @@ _storage: Optional[StorageLayout] = None
 
 
 def get_storage() -> StorageLayout:
+    """唯一 backend data-root 解析入口。
+
+    优先级：TDEASE_DATA_ROOT 环境变量 > "server-data" 字面量（仅手工后端
+    开发兜底）。桌面 app 由 Electron backend_manager.cjs 注入
+    `<dataRoot>/backend/`；测试由 conftest/fixture 注入临时目录。
+    其它模块不得再独立读 TDEASE_DATA_ROOT —— 一律走本函数。
+    """
     global _storage
     if _storage is None:
         _storage = StorageLayout(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
     return _storage
+
+
+def get_system_root() -> Path:
+    """System 资产根目录。
+
+    TDEASE_SYSTEM_ROOT 环境变量由 Electron backend_manager.cjs 注入
+    为 `<dataRoot>/system/`。仅手工后端开发（无 Electron 时）回退到
+    仓库 `data/system/`。
+    """
+    from pathlib import Path as _Path
+    return _Path(os.environ.get(
+        "TDEASE_SYSTEM_ROOT",
+        str(_Path(__file__).resolve().parent.parent.parent / "data" / "system")
+    ))
+
+
+def get_tools_root() -> Path:
+    """计算工具根目录（topfd/toppic/msconvert 等本地可执行文件）。
+
+    TDEASE_TOOLS_ROOT 环境变量由 Electron backend_manager.cjs 注入
+    为 `<dataRoot>/backend/nodes/`。
+    """
+    from pathlib import Path as _Path
+    return _Path(os.environ.get(
+        "TDEASE_TOOLS_ROOT",
+        str(get_storage().data / "nodes"),
+    ))
 
 
 def set_storage(s: StorageLayout) -> None:

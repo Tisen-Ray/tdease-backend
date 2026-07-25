@@ -67,6 +67,10 @@ def execute_task(
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(command, **popen_kwargs)
+        # 记录 engine_runner 真实 pid（非 worker/uvicorn pid），
+        # 以便 reconcile_orphaned_runs 正确识别并 kill 孤儿进程。
+        if task_id == "engine":
+            _record_engine_pid(run_id, proc.pid)
     except FileNotFoundError:
         elapsed = time.perf_counter() - start
         msg = f"command not found: {command.split()[0]}"
@@ -167,6 +171,20 @@ def _brand_engine_output(text: str) -> str:
         .replace("snakemake --", "workflow-engine --")
         .replace(".snakemake", ".tdease-runtime/engine")
     )
+
+
+def _record_engine_pid(run_id: str, pid: int) -> None:
+    """Write engine_runner pid into run.json so reconcile can find/kill orphans."""
+    try:
+        import json as _json
+        storage = get_storage()
+        run_json = storage.resolve(run_id, "run.json")
+        data = storage.read_json(run_json)
+        if data:
+            data["engine_pid"] = pid
+            storage.atomic_write_json(run_json, data)
+    except Exception:
+        pass  # best-effort; pid record failure must not crash the engine
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
