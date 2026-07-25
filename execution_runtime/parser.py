@@ -430,11 +430,37 @@ def _parse_string_list_section(tokens: list, start: int, rule: Rule, attr: str) 
 
 
 def _skip_section(tokens: list, start: int) -> int:
-    """跳过不支持的 section。"""
+    """跳过不支持的 section,正确消费其 block (INDENT...DEDENT)。
+
+    Previously this returned at the first NEWLINE, leaving the section's
+    INDENT/DEDENT and body tokens for the main loop to mis-parse. For a
+    `resources:`/`params:` block that desynchronised indent_depth and caused
+    later directives (notably `shell:`) to be dropped — which in turn made
+    every real msconvert/topfd/toppic template fail Profile validation.
+    """
     idx = start + 1
+    while idx < len(tokens) and _is(tokens[idx], OP) and tokens[idx].string == ":":
+        idx += 1
+    depth = 0
+    started_block = False
     while idx < len(tokens):
         tok = tokens[idx]
+        if _is(tok, INDENT):
+            depth += 1
+            started_block = True
+            idx += 1
+            continue
+        if _is(tok, DEDENT):
+            depth -= 1
+            idx += 1
+            if started_block and depth <= 0:
+                return idx
+            continue
         if _is(tok, NEWLINE) or _is(tok, NL):
-            return idx + 1
+            # Inline (single-line) section with no INDENT block.
+            if not started_block:
+                return idx + 1
+            idx += 1
+            continue
         idx += 1
     return idx

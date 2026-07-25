@@ -24,6 +24,7 @@ from typing import Any, Optional
 from src.contracts import RunCommit
 from src.execution_runtime.parser import parse_snakefile
 from src.execution_runtime.execution import execute_task
+from src.execution_runtime.profile_validator import validate_snakefile_profile
 from src.execution_runtime.errors import (
     ExecutionError,
     invalid_workflow,
@@ -66,6 +67,7 @@ def preflight(commit: RunCommit) -> PreflightResult:
     统一使用 parser.py 的 parse_snakefile 作为唯一解析入口。
     """
     errors: list[str] = []
+    warnings: list[str] = []
     tools: set[str] = set()
     step_labels: list[str] = []
 
@@ -123,9 +125,17 @@ def preflight(commit: RunCommit) -> PreflightResult:
     if unsupported:
         errors.insert(0, f"unsupported directives: {', '.join(sorted(unsupported))}")
 
+    # ── Profile validation (§4.3): guarantee frontend DAG parity ──
+    profile = validate_snakefile_profile(commit.snakefile)
+    if not profile.valid:
+        errors.extend(profile.errors())
+    elif profile.rule_count > 0:
+        warnings.append(f"Profile valid: {profile.rule_count} rules, ~{profile.job_count} jobs")
+
     return PreflightResult(
         valid=len(errors) == 0,
         errors=errors,
+        warnings=warnings,
         estimated_steps=len(wf.rules),
         tools_required=sorted(tools),
         step_labels=step_labels,
