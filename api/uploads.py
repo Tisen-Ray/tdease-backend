@@ -1,10 +1,9 @@
 """Content-addressed upload handshake used by CLI/Desktop clients."""
 from __future__ import annotations
 
-import hashlib
 import re
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, File, HTTPException, UploadFile
 
 from src.contracts import TreeEntry
 from src.execution_runtime.storage import get_storage
@@ -21,12 +20,13 @@ async def negotiate_manifest(entries: list[TreeEntry] = Body(..., embed=True)):
 
 
 @router.put("/{digest}")
-async def upload_blob(digest: str, request: Request):
+async def upload_blob(digest: str, file: UploadFile = File(...)):
     if not _DIGEST.fullmatch(digest):
         raise HTTPException(status_code=400, detail="invalid sha256 digest")
-    data = await request.body()
-    actual = hashlib.sha256(data).hexdigest()
-    if actual != digest:
-        raise HTTPException(status_code=422, detail=f"digest mismatch: {actual}")
-    stored = get_storage().blob_put(data)
-    return {"sha256": stored, "size": len(data)}
+    try:
+        stored, size = get_storage().blob_put_stream(file.file, digest)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        await file.close()
+    return {"sha256": stored, "size": size}

@@ -178,6 +178,5 @@ async def write_file(
 
     storage = get_storage()
     storage.bootstrap()
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
     storage.atomic_write(abs_path, content)
     return {"path": path, "written": True}

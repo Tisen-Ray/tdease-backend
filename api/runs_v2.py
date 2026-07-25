@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
+import base64
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from starlette.responses import StreamingResponse
+from fastapi import APIRouter, Body, HTTPException, Query, Request
+from starlette.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from src.contracts import (
     RunCommit,
@@ -27,8 +32,88 @@ from src.contracts import (
     run_not_found,
 )
 from src.execution_runtime.storage import get_storage
+from src.services.node_catalog import materialize_bindings, resolve_bindings
 
 router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
+
+
+def _run_file(run_id: str, relative: str) -> Path:
+    storage = get_storage()
+    path = storage.resolve(run_id, relative).resolve(strict=False)
+    root = storage.resolve(run_id).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="run path traversal denied") from exc
+    return path
+
+
+@router.post("/dry-run")
+async def dry_run(payload: dict = Body(...)):
+    """Ask real Snakemake to validate the submitted immutable client snapshot."""
+    try:
+        commit = RunCreateRequest.model_validate({"commit": payload["commit"]}).commit
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="invalid dry-run commit") from exc
+    inline_blobs = payload.get("inline_blobs", {})
+    storage = get_storage()
+    if not commit.workspace_files:
+        raise HTTPException(status_code=422, detail="workspace_files is required")
+    try:
+        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with storage.temp_dir("dry-run", commit.run_id) as root:
+        materialize_bindings(root, resolved_nodes, storage.atomic_write)
+        if commit.mode == "local":
+            if os.environ.get("TDEASE_DEPLOYMENT_MODE", "local") != "local" or not commit.local_workspace_root:
+                raise HTTPException(status_code=409, detail="local dry-run is unavailable")
+            workspace = Path(commit.local_workspace_root).resolve()
+            for entry in commit.workspace_files:
+                source = (workspace / entry.path).resolve(strict=True)
+                try:
+                    source.relative_to(workspace)
+                except ValueError as exc:
+                    raise HTTPException(status_code=403, detail="local source escapes workspace") from exc
+                if storage.file_digest(source) != entry.blob_hash:
+                    raise HTTPException(status_code=409, detail=f"local source changed: {entry.path}")
+                target = root / entry.path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, target)
+                except OSError:
+                    import shutil
+                    shutil.copy2(source, target)
+        else:
+            missing = [entry.blob_hash for entry in commit.workspace_files
+                       if not storage.blob_exists(entry.blob_hash) and entry.blob_hash not in inline_blobs]
+            if missing:
+                raise HTTPException(status_code=422, detail={"missing_blobs": sorted(set(missing))})
+            for entry in commit.workspace_files:
+                target = (root / entry.path).resolve(strict=False)
+                try:
+                    target.relative_to(root.resolve())
+                except ValueError as exc:
+                    raise HTTPException(status_code=403, detail="snapshot path traversal denied") from exc
+                if storage.blob_exists(entry.blob_hash):
+                    content = storage.blob_get(entry.blob_hash)
+                else:
+                    try:
+                        content = base64.b64decode(inline_blobs[entry.blob_hash], validate=True)
+                    except (KeyError, ValueError) as exc:
+                        raise HTTPException(status_code=422, detail=f"invalid inline blob: {entry.blob_hash}") from exc
+                    if hashlib.sha256(content).hexdigest() != entry.blob_hash:
+                        raise HTTPException(status_code=422, detail=f"inline blob digest mismatch: {entry.blob_hash}")
+                storage.atomic_write(target, content)
+        snake = next((entry.path for entry in commit.workspace_files if entry.path in {"Snakefile", "workflow.smk"}), None)
+        if snake is None:
+            raise HTTPException(status_code=422, detail="workspace mapping must contain Snakefile or workflow.smk")
+        command = [sys.executable, "-m", "src.execution_runtime.engine_runner", "-s", snake, "--cores", str(commit.cores),
+                   "--dry-run", "--printshellcmds", *commit.targets]
+        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=300, env=os.environ)
+        output = completed.stdout + completed.stderr
+        return {"valid": completed.returncode == 0, "exit_code": completed.returncode,
+                "command": command[2:], "output": output[-200_000:]}
 
 
 @router.post("", status_code=201)
@@ -53,8 +138,20 @@ async def create_run(body: RunCreateRequest):
 
     if not commit.workspace_files:
         raise HTTPException(status_code=422, detail="workspace_files is required; submit an immutable client file mapping")
+    deployment_mode = os.environ.get("TDEASE_DEPLOYMENT_MODE", "local").lower()
+    if commit.mode != deployment_mode:
+        raise HTTPException(status_code=409, detail=f"run mode {commit.mode} does not match deployment mode {deployment_mode}")
     try:
-        storage.materialize_run_files(commit.run_id, commit.workspace_files)
+        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        if deployment_mode == "local":
+            if not commit.local_workspace_root:
+                raise ValueError("local_workspace_root is required in local mode")
+            storage.materialize_local_run_files(commit.run_id, Path(commit.local_workspace_root), commit.workspace_files)
+        else:
+            if commit.local_workspace_root:
+                raise ValueError("local_workspace_root is forbidden in remote mode")
+            storage.materialize_run_files(commit.run_id, commit.workspace_files)
+        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_write)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -110,6 +207,43 @@ async def get_run(run_id: str):
         finished_at=datetime.fromisoformat(data["finished_at"]) if data.get("finished_at") else None,
         event_seq_last=last_seq,
     )
+
+
+@router.get("/{run_id}/files")
+async def list_run_files(run_id: str, pattern: str = Query("results/**")):
+    """Return a hash-addressed manifest for pull/fetch and AI discovery."""
+    root = get_storage().resolve(run_id)
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail=run_not_found(run_id).message)
+    files = []
+    for path in sorted(root.glob(pattern)):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith((".runtime/", ".tdease-runtime/")):
+            continue
+        digest = get_storage().file_digest(path)
+        files.append({"path": rel, "size": path.stat().st_size, "sha256": digest})
+    return {"run_id": run_id, "files": files}
+
+
+@router.get("/{run_id}/files/{file_path:path}")
+async def download_run_file(run_id: str, file_path: str):
+    """Stream one run snapshot/result file; Starlette provides HTTP Range support."""
+    path = _run_file(run_id, file_path)
+    if not path.is_file() or file_path.startswith((".runtime/", ".tdease-runtime/")):
+        raise HTTPException(status_code=404, detail="run file not found")
+    digest = get_storage().file_digest(path)
+    return FileResponse(path, filename=path.name, headers={"ETag": f'"sha256-{digest}"'})
+
+
+@router.get("/{run_id}/log")
+async def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000)):
+    path = _run_file(run_id, "logs/tasks/engine.stdout.log")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="run log not found")
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return PlainTextResponse("\n".join(lines[-tail:]) + ("\n" if lines else ""))
 
 
 @router.get("/{run_id}/events")

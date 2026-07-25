@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,9 +36,6 @@ from app.database.lifecycle import migrate_database
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
-LOG_DIR = Path(os.getenv("TDEASE_LOG_DIR", str(_project_root / "logs")))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
 log_level = getattr(logging, os.getenv("TDEASE_LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
     level=log_level,
@@ -54,19 +52,22 @@ from app.api.runs_v2 import router as runs_v2_router
 from app.api.files import router as files_router
 from app.api.workflow_templates import router as workflow_templates_router
 from app.api.uploads import router as uploads_router
+from app.api.nodes import router as nodes_router
+from app.api.templates import router as templates_router
 
 # ---------------------------------------------------------------------------
 # 生命周期
 # ---------------------------------------------------------------------------
-SERVER_DATA = _project_root / "server-data"
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("TDEase-zero starting (env=%s)", os.getenv("TDEASE_ENV", "development"))
-    SERVER_DATA.mkdir(parents=True, exist_ok=True)
-
-    db_path = str(SERVER_DATA / "db.sqlite3")
+    from src.execution_runtime.storage import get_storage
+    storage = get_storage()
+    storage.bootstrap()
+    recovered = storage.reconcile_orphaned_runs()
+    if recovered:
+        logger.warning("Recovered orphaned runs: %s", recovered)
+    db_path = str(storage.data / "database" / "db.sqlite3")
     try:
         migrate_database(db_path)
         check_database_health(db_path)
@@ -74,8 +75,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Database migration skipped: %s", e)
 
+    worker_stop = None
+    worker_task = None
+    if os.getenv("TDEASE_EMBEDDED_WORKER", "1") == "1":
+        from threading import Event
+        from src.services.run_worker import run_loop
+
+        worker_stop = Event()
+        worker_task = asyncio.create_task(
+            asyncio.to_thread(run_loop, 1.0, False, worker_stop)
+        )
+        logger.info("Embedded run worker started")
+
     logger.info("TDEase-zero ready")
     yield
+    if worker_stop:
+        worker_stop.set()
+    if worker_task:
+        await worker_task
     logger.info("TDEase-zero shutting down")
 
 # ---------------------------------------------------------------------------
@@ -122,6 +139,8 @@ app.include_router(runs_v2_router)
 app.include_router(files_router)
 app.include_router(workflow_templates_router)
 app.include_router(uploads_router)
+app.include_router(nodes_router)
+app.include_router(templates_router)
 
 
 @app.get("/")
@@ -148,10 +167,10 @@ async def ready():
     """Readiness reflects execution capability, not optional JSON references."""
     import importlib.util
     if importlib.util.find_spec("snakemake") is None:
-        return JSONResponse(status_code=503, content={"status": "not_ready", "missing": "snakemake"})
+        return JSONResponse(status_code=503, content={"status": "not_ready", "missing": "workflow-engine"})
     storage = __import__("src.execution_runtime.storage", fromlist=["get_storage"]).get_storage()
     storage.bootstrap()
-    return {"status": "ready", "engine": "snakemake"}
+    return {"status": "ready", "engine": "tdease-workflow"}
 
 
 @app.exception_handler(Exception)
