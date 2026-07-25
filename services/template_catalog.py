@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -9,13 +10,23 @@ import yaml
 
 
 def project_template(root: Path) -> dict[str, Any]:
-    manifest_path, snakefile = root / "template.yaml", root / "Snakefile"
-    if not manifest_path.is_file() or not snakefile.is_file():
-        raise ValueError("template.yaml and Snakefile are required")
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    # Manifest: template.json preferred (JSON-first), template.yaml accepted for compat.
+    json_manifest = root / "template.json"
+    yaml_manifest = root / "template.yaml"
+    snakefile = root / "Snakefile"
+    if not snakefile.is_file():
+        raise ValueError("Snakefile is required")
+    if json_manifest.is_file():
+        manifest = json.loads(json_manifest.read_text(encoding="utf-8"))
+        manifest_path = json_manifest
+    elif yaml_manifest.is_file():
+        manifest = yaml.safe_load(yaml_manifest.read_text(encoding="utf-8")) or {}
+        manifest_path = yaml_manifest
+    else:
+        raise ValueError("template.json (or template.yaml) is required")
     template_id = manifest.get("id")
     if not isinstance(template_id, str) or not template_id:
-        raise ValueError("template.yaml requires id")
+        raise ValueError("template manifest requires id")
     digest = hashlib.sha256()
     files = {}
     for path in sorted(p for p in root.rglob("*") if p.is_file()):

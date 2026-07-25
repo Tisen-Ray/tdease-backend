@@ -1,15 +1,30 @@
-"""Single read-only catalog for executable node packages deployed by the server."""
+"""Single read-only catalog for executable node packages deployed by the server.
+
+A node package is a self-contained directory under <dataRoot>/backend/nodes/<id>/:
+  - rules.smk   (required) — Snakemake rule fragments. The rules.smk IS the
+                              declaration: rule names = capabilities,
+                              params/input/output sections = the contract,
+                              comments + message directives = human docs.
+  - README.md   (optional) — prose usage guide for the AI.
+  - bin/, *.exe, *.dll, …   — the actual binaries.
+
+No manifest file. Directory name = node id. Directory content sha256 = digest.
+The scanner derives everything else from rules.smk by reusing the same
+text-slicing logic the Profile validator uses (so node capabilities and the
+submittable Profile stay in lockstep).
+"""
 from __future__ import annotations
 
 import hashlib
-import sys
+import re
 from pathlib import Path
 from typing import Any
 
-import yaml
+from src.execution_runtime.profile_validator import _extract_sections, _split_rules
 
 
 def package_digest(root: Path) -> str:
+    """sha256 over every file's relative path + bytes in the package dir."""
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
@@ -19,39 +34,137 @@ def package_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+# ── Rule contract extraction ─────────────────────────────────────────────────
+# Reuses profile_validator._split_rules + _extract_sections so the capability
+# view and the Profile gate see the same structure.
+
+_NAMED_FIELD_RE = re.compile(r"^(\w+)\s*=\s*(.+)$")
+_WILDCARD_RE = re.compile(r"\{(\w+)\}")
+
+
+def _strip_inline_comment(line: str) -> str:
+    """Remove a trailing `# comment`, respecting quotes. A `#` inside a
+    string literal is preserved."""
+    in_single = in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _split_named_fields(section_text: str) -> list[dict[str, str]]:
+    """Parse a `input:` / `output:` / `params:` body into named entries.
+
+    Each entry: {name, pattern}. For unnamed entries name == pattern.
+    Lambdas (params:) are captured verbatim as `pattern` so the AI can read
+    the default value from the lambda body. Inline `# comments` are stripped
+    (quote-aware, so a `#` inside a string literal survives).
+    """
+    entries: list[dict[str, str]] = []
+    # Strip inline comments line-by-line BEFORE comma-splitting, so a `#`
+    # containing a comma (e.g. an enum hint) doesn't split mid-comment.
+    cleaned_lines = [_strip_inline_comment(line) for line in section_text.split("\n")]
+    cleaned = "\n".join(cleaned_lines)
+    for raw in cleaned.split(","):
+        line = raw.strip().rstrip(",").strip()
+        if not line:
+            continue
+        m = _NAMED_FIELD_RE.match(line)
+        if m:
+            entries.append({"name": m.group(1), "pattern": m.group(2).strip()})
+        else:
+            entries.append({"name": line, "pattern": line})
+    return entries
+
+
+def _extract_capabilities(rules_text: str) -> list[dict[str, Any]]:
+    """Derive a capability record per `rule` block in rules.smk."""
+    capabilities: list[dict[str, Any]] = []
+    for raw_rule in _split_rules(rules_text):
+        sections = _extract_sections(raw_rule.lines)
+        inputs = _split_named_fields(sections.get("input", ""))
+        outputs = _split_named_fields(sections.get("output", ""))
+        params = _split_named_fields(sections.get("params", ""))
+        message = sections.get("message", "").strip().strip('"').strip("'")
+        capabilities.append({
+            "name": raw_rule.name,
+            "inputs": inputs,
+            "outputs": outputs,
+            "params": params,
+            "message": message,
+        })
+    return capabilities
+
+
+def _extract_description(rules_text: str, readme: str) -> str:
+    """First leading comment block of rules.smk, or first paragraph of README."""
+    # 1. leading comments in rules.smk (lines starting with # before the first rule)
+    leading: list[str] = []
+    for line in rules_text.split("\n"):
+        if line.startswith("#"):
+            leading.append(line.lstrip("# ").strip())
+        elif line.strip() == "" and not leading:
+            continue
+        else:
+            break
+    if leading:
+        return " ".join(part for part in leading if part)
+    # 2. first non-empty, non-heading paragraph of README
+    if readme:
+        for para in readme.split("\n\n"):
+            text = para.strip()
+            if text and not text.startswith("#"):
+                return text
+    return ""
+
+
+# ── Public scanner API ───────────────────────────────────────────────────────
+
 def project_package(package_dir: Path) -> dict[str, Any]:
-    manifest_path = package_dir / "package.yaml"
-    if not manifest_path.is_file():
-        raise ValueError("package.yaml is required")
-    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    node_id, version = manifest.get("id"), manifest.get("version")
-    if not isinstance(node_id, str) or not node_id or not isinstance(version, (str, int, float)):
-        raise ValueError("package.yaml requires id and version")
-    rules = manifest.get("rules", [])
+    """Project a node package directory into its public catalog record.
+
+    No manifest required — derives everything from rules.smk + README.md.
+    Raises ValueError if rules.smk is missing (a node without rules is not a node).
+    """
+    rules_path = package_dir / "rules.smk"
+    if not rules_path.is_file():
+        raise ValueError("rules.smk is required")
+    rules_text = rules_path.read_text(encoding="utf-8")
+    readme_path = package_dir / "README.md"
+    readme = readme_path.read_text(encoding="utf-8") if readme_path.is_file() else ""
+
+    capabilities = _extract_capabilities(rules_text)
+    if not capabilities:
+        raise ValueError("rules.smk contains no rule blocks")
+
     return {
-        "id": node_id,
-        "version": str(version),
+        "id": package_dir.name,
+        "version": "1",
         "digest": package_digest(package_dir),
-        "platforms": manifest.get("platforms", []),
-        "description": manifest.get("description", ""),
-        "inputs": manifest.get("inputs", []),
-        "outputs": manifest.get("outputs", []),
-        "rules": rules if isinstance(rules, list) else [],
-        "entrypoints": manifest.get("entrypoints", {}),
-        "rules_text": (package_dir / "rules.smk").read_text(encoding="utf-8") if (package_dir / "rules.smk").is_file() else "",
-        "readme": (package_dir / "README.md").read_text(encoding="utf-8") if (package_dir / "README.md").is_file() else "",
+        # platforms are inferred from the binaries present, not declared.
+        # Left empty; the engine resolves the right binary at runtime.
+        "platforms": [],
+        "description": _extract_description(rules_text, readme),
+        "capabilities": capabilities,
+        "rules_text": rules_text,
+        "readme": readme,
         "package_dir": package_dir,
     }
 
 
 def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Scan <root>/<id>/ directories. Malformed packages go to errors[], not raise."""
     if not root.is_dir():
         return [], []
     nodes, errors = [], []
     for package_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         try:
             nodes.append(project_package(package_dir))
-        except (OSError, ValueError, yaml.YAMLError) as exc:
+        except (OSError, ValueError) as exc:
             errors.append({"path": package_dir.name, "error": str(exc)})
     if len({node["id"] for node in nodes}) != len(nodes):
         errors.append({"path": root.as_posix(), "error": "duplicate node id"})
@@ -59,11 +172,17 @@ def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
 
 
 def platform_id() -> str:
+    import sys
     os_name = "win" if sys.platform == "win32" else "linux" if sys.platform.startswith("linux") else "macos"
     return f"{os_name}-x64"
 
 
 def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[str, Any]]]:
+    """Validate that each binding still resolves to the same deployed node
+    (by id + content digest). Rule-name lists on bindings are no longer
+    enforced — the capabilities are derived from rules.smk at scan time, so
+    a binding just pins identity.
+    """
     nodes, errors = scan_nodes(root)
     if errors:
         raise ValueError(f"invalid node catalog: {errors}")
@@ -73,17 +192,14 @@ def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[st
         node = by_id.get(binding.id)
         if not node:
             raise ValueError(f"node not found: {binding.id}")
-        if node["version"] != binding.version or node["digest"] != binding.digest:
+        if node["digest"] != binding.digest:
             raise ValueError(f"node identity changed: {binding.id}")
-        if node["platforms"] and platform_id() not in node["platforms"]:
-            raise ValueError(f"node does not support {platform_id()}: {binding.id}")
-        unknown = sorted(set(binding.rules) - set(node["rules"]))
-        if unknown:
-            raise ValueError(f"unknown node rules for {binding.id}: {unknown}")
         resolved.append((binding, node))
     return resolved
 
 
 def materialize_bindings(target_root: Path, resolved: list[tuple[Any, dict[str, Any]]], atomic_write) -> None:
+    """Write each bound node's rules.smk into <target>/nodes/<id>/rules.smk
+    so the Snakefile can `include: "nodes/<id>/rules.smk"`."""
     for binding, node in resolved:
         atomic_write(target_root / "nodes" / binding.id / "rules.smk", node["rules_text"])

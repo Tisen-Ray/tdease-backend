@@ -169,7 +169,7 @@ def _brand_engine_output(text: str) -> str:
         text.replace("SNAKEMAKE", "TDEASE WORKFLOW ENGINE")
         .replace("Snakemake version:", "Engine version:")
         .replace("snakemake --", "workflow-engine --")
-        .replace(".snakemake", ".tdease-runtime/engine")
+        .replace(".snakemake", ".tdease/engine")
     )
 
 

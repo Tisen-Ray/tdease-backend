@@ -397,10 +397,10 @@ class StorageLayout:
                     shutil.copy2(source, target)
                     strategy = "copy"
                 shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": strategy})
-        self.atomic_write_json(self.resolve(run_id, ".tdease-runtime", "local-inputs.json"), shared)
+        self.atomic_write_json(self.resolve(run_id, ".tdease", "local-inputs.json"), shared)
 
     def verify_local_inputs(self, run_id: str) -> None:
-        manifest = self.read_json(self.resolve(run_id, ".tdease-runtime", "local-inputs.json")) or []
+        manifest = self.read_json(self.resolve(run_id, ".tdease", "local-inputs.json")) or []
         for item in manifest:
             path = self.resolve(run_id, item["path"])
             if not path.is_file() or self.file_digest(path) != item["sha256"]:

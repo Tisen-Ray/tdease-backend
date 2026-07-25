@@ -153,7 +153,26 @@ def _validate_rule(rule: _RawRule) -> list[ProfileViolation]:
 
     sections = _extract_sections(rule.lines)
 
-    # 1. shell required.
+    # 1. shell required — UNLESS this is a pure aggregator rule (has input,
+    #    no output, no shell). `rule all:` with only an `input:` directive is
+    #    the canonical Snakemake DAG root; it produces no file and runs no
+    #    shell, so it is statically trivial and must be allowed.
+    is_aggregator = (
+        "input" in sections and sections["input"].strip()
+        and not sections.get("output", "").strip()
+        and ("shell" not in sections or not sections["shell"].strip())
+    )
+    if is_aggregator:
+        # Aggregators still must not use dynamic input patterns.
+        if _looks_dynamic(sections["input"]):
+            out.append(ProfileViolation(
+                rule.name,
+                "input contains a dynamic expression (lambda/function call) — "
+                "only literal patterns with {wildcards} are supported",
+                "dynamic-input",
+            ))
+        return out
+
     if "shell" not in sections or not sections["shell"].strip():
         out.append(ProfileViolation(rule.name, "only shell rules are supported (no shell directive found)", "no-shell"))
 
@@ -178,10 +197,33 @@ def _validate_rule(rule: _RawRule) -> list[ProfileViolation]:
     return out
 
 
+def _strip_inline_comments(section_body: str) -> str:
+    """Remove `# ...` comments line by line, quote-aware (a `#` inside a
+    string literal survives). Inline comments with parentheses were causing
+    false-positive 'function call' detection in _looks_dynamic."""
+    out_lines: list[str] = []
+    for line in section_body.split("\n"):
+        in_single = in_double = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == "#" and not in_single and not in_double:
+                cut = i
+                break
+        out_lines.append(line[:cut])
+    return "\n".join(out_lines)
+
+
 def _looks_dynamic(section_body: str) -> bool:
     """True if the section body contains a lambda or function call that would
     break static parsing. Bare `expand(...)` is allowed (the frontend reduces
     it to literal patterns); lambda and any other call are not."""
+    # Strip inline comments first — a `#` with parentheses (e.g. an enum hint
+    # in a comment) must not be mistaken for a function call.
+    section_body = _strip_inline_comments(section_body)
     # expand() is explicitly allowed.
     stripped = re.sub(r"\bexpand\s*\(", "", section_body)
     if re.search(r"\blambda\b", stripped):
