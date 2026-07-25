@@ -61,7 +61,7 @@ async def dry_run(payload: dict = Body(...)):
     if not commit.workspace_files:
         raise HTTPException(status_code=422, detail="workspace_files is required")
     try:
-        resolved_nodes = resolve_bindings(storage.data / "system" / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     with storage.temp_dir("dry-run", commit.run_id) as root:
@@ -143,7 +143,7 @@ async def create_run(body: RunCreateRequest):
     if commit.mode != deployment_mode:
         raise HTTPException(status_code=409, detail=f"run mode {commit.mode} does not match deployment mode {deployment_mode}")
     try:
-        resolved_nodes = resolve_bindings(storage.data / "system" / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
         if deployment_mode == "local":
             if not commit.local_workspace_root:
                 raise ValueError("local_workspace_root is required in local mode")
@@ -232,7 +232,7 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**")):
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
-        if rel.startswith((".runtime/", ".tdease-runtime/")):
+        if rel.startswith((".runtime/", ".tdease/", ".snakemake/")):
             continue
         digest = get_storage().file_digest(path)
         files.append({"path": rel, "size": path.stat().st_size, "sha256": digest})
@@ -243,7 +243,7 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**")):
 async def download_run_file(run_id: str, file_path: str):
     """Stream one run snapshot/result file; Starlette provides HTTP Range support."""
     path = _run_file(run_id, file_path)
-    if not path.is_file() or file_path.startswith((".runtime/", ".tdease-runtime/")):
+    if not path.is_file() or file_path.startswith((".runtime/", ".tdease/", ".snakemake/")):
         raise HTTPException(status_code=404, detail="run file not found")
     digest = get_storage().file_digest(path)
     return FileResponse(path, filename=path.name, headers={"ETag": f'"sha256-{digest}"'})

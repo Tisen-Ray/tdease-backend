@@ -34,6 +34,8 @@ _PROTECTED_WRITE_PREFIXES = (
     "database/",
     "store/",
     ".runtime/",
+    ".tdease/",
+    ".snakemake/",
     "blobs/",
 )
 

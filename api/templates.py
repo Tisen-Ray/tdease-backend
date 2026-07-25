@@ -6,19 +6,22 @@ from src.services.template_catalog import scan_templates
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 
+# Templates live directly under <systemRoot>/templates/<id>/ (one dir per
+# template: template.json + Snakefile + config.yaml). No "builtin" subdir —
+# the flat layout matches node packages under <dataRoot>/nodes/<id>/.
+_TEMPLATES_ROOT = lambda: get_system_root() / "templates"
+
 
 @router.get("")
 async def list_templates():
-    root = get_system_root() / "templates" / "builtin"
-    templates, errors = scan_templates(root)
+    templates, errors = scan_templates(_TEMPLATES_ROOT())
     summaries = [{key: value for key, value in item.items() if key not in {"files", "readme"}} for item in templates]
     return {"templates": summaries, "errors": errors}
 
 
 @router.get("/{template_id}")
 async def get_template(template_id: str):
-    root = get_system_root() / "templates" / "builtin"
-    templates, _ = scan_templates(root)
+    templates, _ = scan_templates(_TEMPLATES_ROOT())
     for item in templates:
         if item["id"] == template_id:
             return item
