@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import glob as glob_mod
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,9 +39,11 @@ _PROTECTED_WRITE_PREFIXES = (
 
 # ── Helpers ──
 
-# Root directory for file operations — respects TDEASE_DATA_ROOT env
+# Root directory for file operations — 单一解析点 get_storage()
+# （src/execution_runtime/storage.py），不再散落 os.environ.get(..., "server-data")。
 def _data_root() -> Path:
-    return Path(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
+    from src.execution_runtime.storage import get_storage
+    return get_storage().data
 
 
 def _safe_path(rel_path: str) -> Path:

@@ -1,7 +1,7 @@
 """Read-only workflow template projection."""
 from fastapi import APIRouter, HTTPException
 
-from src.execution_runtime.storage import get_storage
+from src.execution_runtime.storage import get_system_root
 from src.services.template_catalog import scan_templates
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
@@ -9,14 +9,16 @@ router = APIRouter(prefix="/api/templates", tags=["templates"])
 
 @router.get("")
 async def list_templates():
-    templates, errors = scan_templates(get_storage().data / "templates")
+    root = get_system_root() / "templates" / "builtin"
+    templates, errors = scan_templates(root)
     summaries = [{key: value for key, value in item.items() if key not in {"files", "readme"}} for item in templates]
     return {"templates": summaries, "errors": errors}
 
 
 @router.get("/{template_id}")
 async def get_template(template_id: str):
-    templates, _ = scan_templates(get_storage().data / "templates")
+    root = get_system_root() / "templates" / "builtin"
+    templates, _ = scan_templates(root)
     for item in templates:
         if item["id"] == template_id:
             return item

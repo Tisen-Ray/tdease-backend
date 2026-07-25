@@ -31,6 +31,7 @@ from src.contracts import (
     RunStatusResponse,
     run_not_found,
 )
+from src.execution_runtime.profile_validator import validate_snakefile_profile
 from src.execution_runtime.storage import get_storage
 from src.services.node_catalog import materialize_bindings, resolve_bindings
 
@@ -60,7 +61,7 @@ async def dry_run(payload: dict = Body(...)):
     if not commit.workspace_files:
         raise HTTPException(status_code=422, detail="workspace_files is required")
     try:
-        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(storage.data / "system" / "nodes", commit.nodes)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     with storage.temp_dir("dry-run", commit.run_id) as root:
@@ -142,7 +143,7 @@ async def create_run(body: RunCreateRequest):
     if commit.mode != deployment_mode:
         raise HTTPException(status_code=409, detail=f"run mode {commit.mode} does not match deployment mode {deployment_mode}")
     try:
-        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(storage.data / "system" / "nodes", commit.nodes)
         if deployment_mode == "local":
             if not commit.local_workspace_root:
                 raise ValueError("local_workspace_root is required in local mode")
@@ -161,6 +162,17 @@ async def create_run(body: RunCreateRequest):
     snake_text = storage.resolve(commit.run_id, snake_entry.path).read_text(encoding="utf-8")
     if commit.snakefile and commit.snakefile != snake_text:
         raise HTTPException(status_code=409, detail="embedded snakefile differs from mapped client file")
+
+    # §4.3 Profile gate — "能提交的工作流 = 前端能画 DAG 的工作流". Must run
+    # AFTER the Snakefile content is settled and BEFORE the run is queued; an
+    # out-of-Profile Snakefile cannot be drawn as a DAG, so rejecting it here is
+    # the load-bearing half of the contract (preflight() is the other, advisory half).
+    profile = validate_snakefile_profile(snake_text)
+    if not profile.valid:
+        raise HTTPException(
+            status_code=422,
+            detail={"profile_violations": profile.errors(), "rule_count": profile.rule_count},
+        )
 
     # Atomically write run.json (status QUEUED)
     run_data = commit.model_dump()
@@ -256,7 +268,16 @@ async def get_events_sse(
 
     async def event_generator():
         events_file = storage.events_path(run_id)
-        sent_seq = last_event_id or 0
+        # query param 优先，其次读标准 SSE Last-Event-ID header
+        cursor = last_event_id
+        if cursor is None:
+            header_val = request.headers.get("Last-Event-ID")
+            if header_val is not None:
+                try:
+                    cursor = int(header_val)
+                except (ValueError, TypeError):
+                    cursor = 0
+        sent_seq = cursor or 0
 
         if events_file.exists():
             for line in events_file.read_text(encoding="utf-8").strip().splitlines():

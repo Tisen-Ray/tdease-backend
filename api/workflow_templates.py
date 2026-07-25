@@ -11,9 +11,11 @@ router = APIRouter(prefix="/api/v2/workflow-templates", tags=["workflow-template
 
 
 def _system_workflows() -> Path:
-    data_root = Path(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
+    # 内置 workflow 模板：TDEASE_SYSTEM_WORKFLOWS override 优先；否则
+    # <dataRoot>/system/workflows（走单一解析点 get_system_root()）。
+    from src.execution_runtime.storage import get_system_root
     configured = os.environ.get("TDEASE_SYSTEM_WORKFLOWS")
-    return Path(configured) if configured else data_root / "system" / "workflows"
+    return Path(configured) if configured else get_system_root() / "workflows"
 
 
 @router.get("/{template_id}")

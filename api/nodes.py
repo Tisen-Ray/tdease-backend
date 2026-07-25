@@ -6,10 +6,13 @@ from src.services.node_catalog import scan_nodes
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
+# 内置计算工具位于 <dataRoot>/backend/nodes/ (TDEASE_TOOLS_ROOT)
+_TOOLS_NODES = get_storage().data / "nodes"
+
 
 @router.get("")
 async def list_nodes():
-    nodes, errors = scan_nodes(get_storage().data / "nodes")
+    nodes, errors = scan_nodes(_TOOLS_NODES)
     public = [{key: value for key, value in node.items() if key != "package_dir"} for node in nodes]
     return {"nodes": public, "errors": errors}
 
