@@ -1,16 +1,16 @@
 """
-TDEase Storage Layout — 系统中唯一的文件写入原语。
+TDEase Storage Layout -- system-wide single file-write primitive.
 
 Not an adapter, not an interceptor. This IS the file primitive.
 No module may use raw open/write/mkdir directly.
 
-Rules (CONVERGENCE-PLAN.md §3.5):
+Rules (CONVERGENCE-PLAN.md Sec 3.5):
 - atomic_write: temp + fsync + rename + tmp cleanup + parent fsync
 - append_event: JSONL, single-writer, internally-allocated monotonic seq
-- blob: store/.incoming/<id> → rename to digest key
+- blob: store/.incoming/<id> -> rename to digest key
 - temp: TemporaryDirectory only
 - logs: fixed names, size caps, rotation, deep write operations
-- trash: move → GC with retention
+- trash: move -> GC with retention
 
 P1 fixes (code review):
 - allocate_run: exist_ok=True (API + worker both call, must be idempotent)
@@ -22,6 +22,13 @@ P2 fixes:
 - atomic_write: tmp cleanup on write/fsync/replace failure; fsync parent
 - append_event: allocates seq internally (only writer)
 - append_runtime_record / append_task_output: deep log operations
+
+CORE-ARCHITECTURE.md Sec 1.4:
+- run.json "status" field is a projection, derived from events.jsonl by
+  src.execution_runtime.run_projector.project_run through
+  sync_run_projection -- the only place this module writes that field.
+  Nothing else may write "status" independently; run_worker.py and
+  reconcile_orphaned_runs below both go through it now.
 """
 
 from __future__ import annotations
@@ -36,11 +43,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from src.execution_runtime.run_projector import RunProjection, project_run
+
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
 
 class StorageLayout:
-    """TDEase 唯一文件原语。"""
+    """TDEase single file primitive."""
 
     def __init__(
         self,
@@ -52,14 +61,15 @@ class StorageLayout:
         self.cache = Path(cache_root) if cache_root else self.data / "cache"
         self.trash = Path(trash_root) if trash_root else self.data / "trash"
 
-    # ── Bootstrap ──
+    # -- Bootstrap --
 
     def bootstrap(self) -> None:
-        """一次性创建固定目录结构。
+        """One-time fixed directory layout creation.
 
-        与 electron/runtime_config.cjs ensureRuntimeDirectories 对齐。
-        不创建 workspaces/（老布局遗留：归属是 run.json 字段而非目录）。
-        不创建 system/（随应用发布的资产投影，非运行时 mkdir）。
+        Aligned with electron/runtime_config.cjs ensureRuntimeDirectories.
+        Does not create workspaces/ (legacy layout: ownership is a run.json
+        field, not a directory). Does not create system/ (a release asset
+        projection, not a runtime mkdir).
         """
         for d in [
             self.data / "database",
@@ -71,10 +81,10 @@ class StorageLayout:
         ]:
             d.mkdir(parents=True, exist_ok=True)
 
-    # ── Run directory ──
+    # -- Run directory --
 
     def allocate_run(self, run_id: str) -> Path:
-        """幂等创建 run 目录结构。API 和 worker 都可安全调用。"""
+        """Idempotently create the run directory layout. Safe for both API and worker."""
         self._validate_run_id(run_id)
         run_dir = self.data / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +105,7 @@ class StorageLayout:
             raise ValueError(f"run_id escapes data root: {run_id!r}")
 
     def resolve(self, run_id: str, *segments: str) -> Path:
-        """解析 run 内的路径。验证 run_id 和 containment。"""
+        """Resolve a path inside a run directory. Validates run_id and containment."""
         self._validate_run_id(run_id)
         base = self.data / "runs" / run_id
         p = base
@@ -110,13 +120,13 @@ class StorageLayout:
     def run_exists(self, run_id: str) -> bool:
         return (self.data / "runs" / run_id).is_dir()
 
-    # ── Atomic write ──
+    # -- Atomic write --
 
     def atomic_write(self, target: Path, content: str | bytes) -> None:
         """
-        原子写入规范文件。
+        Atomically write a canonical file.
 
-        同目录临时文件 → fsync → os.replace → fsync parent → cleanup。
+        Same-directory temp file -> fsync -> os.replace -> fsync parent -> cleanup.
         """
         target = Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -143,7 +153,7 @@ class StorageLayout:
             try: os.unlink(tmp)
             except OSError: pass
             raise
-        # Fsync parent directory for durability (Unix only — Windows rejects dir fsync)
+        # Fsync parent directory for durability (Unix only -- Windows rejects dir fsync)
         if os.name != "nt":
             dfd = os.open(str(target.parent), os.O_RDONLY)
             try:
@@ -180,13 +190,16 @@ class StorageLayout:
     def release_claim(self, run_id: str) -> None:
         self.resolve(run_id, ".runtime", "claimed").unlink(missing_ok=True)
 
-    # ── Events (JSONL append, single-writer) ──
+    def is_claimed(self, run_id: str) -> bool:
+        return self.resolve(run_id, ".runtime", "claimed").exists()
+
+    # -- Events (JSONL append, single-writer) --
 
     def events_path(self, run_id: str) -> Path:
         return self.resolve(run_id, "events.jsonl")
 
     def recover_seq(self, run_id: str) -> int:
-        """返回 events.jsonl 中已持久化的最大 seq。0 = 空。"""
+        """Return the highest persisted seq in events.jsonl. 0 = empty."""
         p = self.events_path(run_id)
         if not p.exists():
             return 0
@@ -205,8 +218,8 @@ class StorageLayout:
 
     def append_event(self, run_id: str, event: dict[str, Any]) -> int:
         """
-        追加一行事件。分配并返回 monotonic seq。
-        通过 recover_seq + 1 开始；调用方不应手动设置 seq。
+        Append one event line. Allocates and returns the monotonic seq.
+        Starts from recover_seq + 1; callers should not set seq manually.
         """
         current = self.recover_seq(run_id)
         event["seq"] = current + 1
@@ -231,11 +244,105 @@ class StorageLayout:
                     continue
         return events
 
-    # ── Logs (deep operations) ──
+    def repair_events_file(self, run_id: str) -> int:
+        """Truncate events.jsonl to its last complete, parseable line.
+
+        A crash mid-append (append_event's f.write interrupted between
+        open and fsync) can leave a partial trailing line: no trailing
+        newline, or JSON truncated mid-object. Left in place, that partial
+        line is not just unreadable -- the next append glues its own
+        well-formed line onto the tail of the garbage bytes with no
+        separating newline, corrupting the new line too.
+
+        The rule (CORE-ARCHITECTURE.md Sec 1.4/1.5 crash-point requirement):
+        a single writer, single-line-at-a-time log can only be corrupted at
+        its tail, so the first line that fails to parse ends the valid
+        prefix -- everything from there on is dropped. Idempotent: a clean
+        file is rewritten byte-for-byte and this returns 0.
+
+        Returns the number of bytes removed (0 if nothing needed repair).
+        """
+        p = self.events_path(run_id)
+        if not p.exists():
+            return 0
+        raw = p.read_bytes()
+        if not raw:
+            return 0
+        good_lines: list[bytes] = []
+        for chunk in raw.split(b"\n"):
+            if not chunk.strip():
+                continue
+            try:
+                json.loads(chunk)
+            except json.JSONDecodeError:
+                break  # first bad/partial line ends the valid prefix
+            good_lines.append(chunk)
+        repaired = b"".join(line + b"\n" for line in good_lines)
+        if repaired == raw:
+            return 0
+        self.atomic_write(p, repaired)
+        return len(raw) - len(repaired)
+
+    def sync_run_projection(self, run_id: str, *, claim_held: bool = True) -> RunProjection:
+        """Recompute run.json "status" from events.jsonl.
+
+        The only place run.json "status" field is written
+        (CORE-ARCHITECTURE.md Sec 1.4): a pure projection of the event log,
+        never an independent write. Callers (run_worker.py,
+        reconcile_orphaned_runs) call this after appending or observing
+        events instead of computing/writing a status themselves. Preserves
+        every other field already in run.json (commit data, pid
+        bookkeeping); only "status" and "projected_at_seq" are touched, and
+        "status" is left alone when there are no events yet (nothing to
+        project -- run.json may still hold its just-created QUEUED write).
+
+        `claim_held` (default True, matching every existing caller except
+        one) distinguishes a resync driven by a Run whose claim this
+        process actually found held -- run_worker.execute_run's own call
+        (its claim is held for the Run's entire execution), and
+        reconcile_orphaned_runs whenever it found the claim still held
+        before releasing it -- from a resync of a Run that was never
+        claimed at all since its most recent (re)queue.
+
+        Only in that unclaimed case can run.json's own QUEUED write (made
+        directly by create_run/rerun_run, still the only other status
+        writer per the invariant above) be more current than what the
+        event log alone can justify: REMAINING-DESIGNS.md Sec 1 requires
+        reopening execution to be represented by a fresh run.started,
+        which by design (run_projector.py's rule table; see
+        tests/fixtures/run-projection/trailing-queued-after-terminal-does-not-requeue)
+        a bare run.queued rerun/audit event never retroactively supplies --
+        so projecting the event log alone would silently revert a
+        just-requeued, not-yet-picked-up Run back to its previous terminal
+        status. Skipping the overwrite here -- only when this Run's claim
+        was not held and reconcile_orphaned_runs did not otherwise need to
+        intervene for it in this pass -- closes a real gap: a Backend
+        restart between "rerun requested" and "the worker dequeues it"
+        previously discarded the rerun with no error anywhere (`_dequeue`
+        never finding a QUEUED run again, because this function had just
+        reverted it back to its prior terminal status).
+        """
+        events = self.read_events(run_id)
+        projection = project_run(events)
+        run_json = self.resolve(run_id, "run.json")
+        current = self.read_json(run_json) or {"run_id": run_id}
+        updated = dict(current)
+        pending_requeue_not_yet_claimed = (
+            not claim_held
+            and current.get("status") == "QUEUED"
+            and projection.status not in (None, "QUEUED")
+        )
+        if projection.status is not None and not pending_requeue_not_yet_claimed:
+            updated["status"] = projection.status
+        updated["projected_at_seq"] = projection.projected_at_seq
+        self.atomic_write_json(run_json, updated)
+        return projection
+
+    # -- Logs (deep operations) --
 
     def append_runtime_record(self, run_id: str, level: str, message: str,
                                task_id: str | None = None, max_mb: int = 50) -> None:
-        """追加结构化诊断记录。自动处理轮转。"""
+        """Append a structured diagnostic record. Handles rotation automatically."""
         p = self._rotating_path(run_id, "logs", "runtime.jsonl", max_mb)
         rec = json.dumps({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -250,7 +357,7 @@ class StorageLayout:
 
     def append_task_output(self, run_id: str, task_id: str, stream: str,
                             text: str, max_kb: int = 1024) -> None:
-        """追加 task stdout/stderr。大小受限，超过上限时轮转。"""
+        """Append task stdout/stderr. Size-bounded; rotates past the cap."""
         task_dir = self.resolve(run_id, "logs", "tasks")
         task_dir.mkdir(parents=True, exist_ok=True)
         p = task_dir / f"{task_id}.{stream}.log"
@@ -272,7 +379,7 @@ class StorageLayout:
             p.rename(backup)
         return p
 
-    # ── Cancel signal ──
+    # -- Cancel signal --
 
     def cancel_path(self, run_id: str) -> Path:
         return self.resolve(run_id, ".runtime", "cancelled")
@@ -286,7 +393,7 @@ class StorageLayout:
     def check_cancelled(self, run_id: str) -> bool:
         return self.cancel_path(run_id).exists()
 
-    # ── Temp ──
+    # -- Temp --
 
     @contextmanager
     def temp_dir(self, scope: str, purpose: str) -> Iterator[Path]:
@@ -298,7 +405,7 @@ class StorageLayout:
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
-    # ── Blob store ──
+    # -- Blob store --
 
     def blob_put(self, data: bytes) -> str:
         h = hashlib.sha256(data).hexdigest()
@@ -372,9 +479,22 @@ class StorageLayout:
             self.atomic_write(target, self.blob_get(digest))
 
     def materialize_local_run_files(self, run_id: str, workspace_root: Path,
-                                    entries: list[Any]) -> None:
-        """Freeze controls and share large local inputs without network/CAS transfer."""
-        workspace_root = workspace_root.resolve()
+                                    entries: list[Any], *, user_id: str) -> None:
+        """Freeze controls and share large local inputs without network/CAS transfer.
+
+        workspace_root is validated against the Backend approved roots for
+        `user_id` (src.execution_runtime.workspace_containment), never
+        trusted merely because this request named it -- REMAINING-DESIGNS.md
+        Sec 1 "Workspace root registration". `user_id` is keyword-only and
+        required -- the caller (app/api/runs_v2.py) must pass
+        `RunCommit.user_id`, never omit it. Until Backend startup wires a
+        real checker in via set_approved_roots_checker, no root is approved
+        for anyone and every call here raises WORKSPACE_PATH_ESCAPE
+        (fail-closed default).
+        """
+        from src.execution_runtime.workspace_containment import validate_root_containment
+
+        workspace_root = validate_root_containment(Path(workspace_root), user_id)
         run_dir = self.allocate_run(run_id).resolve()
         shared: list[dict[str, Any]] = []
         for entry in entries:
@@ -420,51 +540,129 @@ class StorageLayout:
         self.atomic_write_json(target, {"schema_version": 1, "run_id": run_id, "files": entries})
         return target
 
-    def reconcile_orphaned_runs(self) -> list[str]:
-        """Return dead RUNNING runs to QUEUED using file truth, no extra state axis.
-
-        Checks engine_pid (the actual engine_runner subprocess) before falling back
-        to pid (the worker). Kills a surviving orphan engine before re-queueing to
-        prevent double-run.
-        """
+    def _engine_pid_alive(self, data: dict[str, Any]) -> bool:
+        """Whether the recorded engine_runner child (the actual computation
+        process, not the worker/uvicorn process that dequeued it) is still
+        alive. Only engine_pid is treated as authoritative evidence of a
+        live execution -- pid is the worker own bookkeeping and, being
+        just an OS pid number, is too easily a stale/reused value to trust
+        for "is this Run still really running"."""
         import psutil
+        engine_pid = data.get("engine_pid")
+        return bool(engine_pid) and psutil.pid_exists(int(engine_pid))
+
+    def _kill_engine_pid(self, data: dict[str, Any]) -> None:
+        import psutil
+        engine_pid = data.get("engine_pid")
+        if not engine_pid:
+            return
+        try:
+            proc = psutil.Process(int(engine_pid))
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass  # best-effort; reconciliation proceeds regardless
+
+    def reconcile_orphaned_runs(self) -> list[str]:
+        """Recover Runs whose worker died -- driven by events, not by trusting
+        run.json own "status" field, and always converging within this one
+        pass (CORE-ARCHITECTURE.md Sec 1.4, REMAINING-DESIGNS.md Sec 1
+        "Recovery convergence").
+
+        Four things happen for every Run directory, in order:
+
+        1. repair_events_file -- drop any partial trailing line left by a
+           crash mid-append, so the projection below reads a clean log and
+           future appends do not get glued onto garbage bytes (crash point
+           c: mid-append with a partial line).
+        2. Unconditional claim release. This loop runs once at startup,
+           before any live worker exists, so any ".runtime/claimed" file on
+           record belongs to a process that is no longer running -- there is
+           no in-progress dequeue for this reconciliation to respect.
+           Released regardless of projected status, and *before* branch 3
+           below decides whether a status change needs an event. Without
+           this, a crash between a Run's projection reaching a terminal
+           status and that worker's own release_claim call (crash point b:
+           "projection update and process exit") leaves a claim file that
+           silently blocks every future Continue/resume dequeue for that
+           run_id forever -- no error anywhere, just a Run stuck QUEUED
+           after a later rerun because claim_run's O_CREAT|O_EXCL keeps
+           failing against a lock nobody still holds.
+        3. Orphan handling, driven by the projected status:
+           - projection RUNNING with an open execution range whose
+             engine_pid is not alive: this range crashed mid-execution.
+             Kill any lingering process, then close the range with an
+             explicit run.failed event ("orphaned"). The Run converges to
+             FAILED and can be retried through Continue.
+           - projection QUEUED and a claim was held (released in step 2):
+             the worker died before ever appending run.started. Append a
+             run.action audit event. The projection was already QUEUED --
+             the event log never said otherwise -- so no status flip is
+             needed, only the claim release from step 2.
+           Both shapes append an event, matching "orphan kill and recovery
+           always emit an event" -- a silent run.json rewrite never does.
+        4. sync_run_projection -- every Run, orphaned or not, gets
+           run.json resynced from its (possibly just-updated) projection.
+           This is what closes the crash window between "event appended"
+           and "projection updated" (crash point a): a Run whose events
+           already carried a terminal fact when this process died, but
+           whose run.json never caught up, converges here with no new
+           event needed.
+        """
         recovered: list[str] = []
         runs = self.data / "runs"
         if not runs.is_dir():
             return recovered
-        for directory in runs.iterdir():
-            data = self.read_json(directory / "run.json") if directory.is_dir() else None
-            if not data or data.get("status") != "RUNNING":
+        for directory in sorted(runs.iterdir()):
+            if not directory.is_dir():
                 continue
-            # 优先查 engine_pid（engine_runner 子进程），其次 pid（worker）。
-            engine_pid = data.get("engine_pid")
-            worker_pid = data.get("pid")
-            run_id = data["run_id"]
-            orphan_alive = False
-            for pid_val in (engine_pid, worker_pid):
-                if pid_val and psutil.pid_exists(int(pid_val)):
-                    orphan_alive = True
-                    # 孤儿 engine 存活：先 kill 再重排，防双跑。
-                    if pid_val == engine_pid:
-                        try:
-                            p = psutil.Process(int(pid_val))
-                            p.terminate()
-                            p.wait(timeout=3)
-                        except Exception:
-                            try:
-                                p.kill()
-                            except Exception:
-                                pass
-                    break
-            if orphan_alive:
-                # 孤儿还在跑，不重排队——等下次 reconcile。
+            run_id = directory.name
+            try:
+                self._validate_run_id(run_id)
+            except ValueError:
                 continue
-            self.release_claim(run_id)
-            self.atomic_write_json(directory / "run.json", {**data, "status": "QUEUED", "pid": None, "engine_pid": None})
-            recovered.append(run_id)
+
+            self.repair_events_file(run_id)
+            projection = project_run(self.read_events(run_id))
+            data = self.read_json(directory / "run.json") or {}
+
+            was_claimed = self.is_claimed(run_id)
+            if was_claimed:
+                self.release_claim(run_id)
+
+            intervened = False
+            if projection.status == "RUNNING":
+                has_open_range = any(r.is_open for r in projection.ranges)
+                if has_open_range and not self._engine_pid_alive(data):
+                    self._kill_engine_pid(data)
+                    from src.execution_runtime.events import EventEmitter
+                    EventEmitter(run_id).run_failed(
+                        exit_code=None,
+                        run_time_seconds=0.0,
+                        error_message="orphaned: worker process not found (backend restarted)",
+                    )
+                    recovered.append(run_id)
+                    intervened = True
+            elif projection.status == "QUEUED" and was_claimed:
+                from src.execution_runtime.events import EventEmitter
+                EventEmitter(run_id).run_action("orphan_reclaimed", "system")
+                recovered.append(run_id)
+                intervened = True
+
+            # `claim_held` also folds in whether this pass just intervened
+            # for this Run (appended an orphan-recovery event above): a Run
+            # this reconciliation pass had to act on is never the "cleanly
+            # requeued, waiting for its first pickup" case sync_run_projection
+            # guards against, regardless of whether a claim survived to be
+            # released in step 2.
+            self.sync_run_projection(run_id, claim_held=was_claimed or intervened)
+
         return recovered
 
-    # ── Trash ──
+    # -- Trash --
 
     def move_to_trash(self, path: Path) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -505,7 +703,7 @@ class StorageLayout:
             return []
         return sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name)
 
-    # ── Result access ──
+    # -- Result access --
 
     def result_files(self, run_id: str) -> list[Path]:
         rd = self.resolve(run_id, "results")
@@ -514,18 +712,19 @@ class StorageLayout:
         return sorted(rd.rglob("*"))
 
 
-# ── Module singleton ──
+# -- Module singleton --
 
 _storage: Optional[StorageLayout] = None
 
 
 def get_storage() -> StorageLayout:
-    """唯一 backend data-root 解析入口。
+    """The single backend data-root resolution entry point.
 
-    优先级：TDEASE_DATA_ROOT 环境变量 > "server-data" 字面量（仅手工后端
-    开发兜底）。桌面 app 由 Electron backend_manager.cjs 注入
-    `<dataRoot>/backend/`；测试由 conftest/fixture 注入临时目录。
-    其它模块不得再独立读 TDEASE_DATA_ROOT —— 一律走本函数。
+    Priority: TDEASE_DATA_ROOT env var > "server-data" literal (manual
+    backend-dev fallback only). Desktop app has Electron backend_manager.cjs
+    inject <dataRoot>/backend/; tests inject a temp dir via conftest/fixture.
+    No other module may independently read TDEASE_DATA_ROOT -- always go
+    through this function.
     """
     global _storage
     if _storage is None:
@@ -534,11 +733,11 @@ def get_storage() -> StorageLayout:
 
 
 def get_system_root() -> Path:
-    """System 资产根目录。
+    """System asset root directory.
 
-    TDEASE_SYSTEM_ROOT 环境变量由 Electron backend_manager.cjs 注入
-    为 `<dataRoot>/system/`。仅手工后端开发（无 Electron 时）回退到
-    仓库 `data/system/`。
+    TDEASE_SYSTEM_ROOT env var is injected by Electron backend_manager.cjs
+    as <dataRoot>/system/. Manual backend dev (no Electron) falls back to
+    the repo data/system/.
     """
     from pathlib import Path as _Path
     return _Path(os.environ.get(
@@ -548,10 +747,10 @@ def get_system_root() -> Path:
 
 
 def get_tools_root() -> Path:
-    """计算工具根目录（topfd/toppic/msconvert 等本地可执行文件）。
+    """Compute tools root directory (topfd/toppic/msconvert etc local executables).
 
-    TDEASE_TOOLS_ROOT 环境变量由 Electron backend_manager.cjs 注入
-    为 `<dataRoot>/backend/nodes/`。
+    TDEASE_TOOLS_ROOT env var is injected by Electron backend_manager.cjs
+    as <dataRoot>/backend/nodes/.
     """
     from pathlib import Path as _Path
     return _Path(os.environ.get(

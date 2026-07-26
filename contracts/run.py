@@ -11,10 +11,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .enums import RunStatus
-from .tree import TreeEntry
+from .tree import TreeEntry, _validate_path_no_traversal
 
 
 class PackageLock(BaseModel):
@@ -38,6 +38,29 @@ class NodeBinding(BaseModel):
         pattern=r"^[a-f0-9]{64}$",
     )
     rules: list[str] = Field(default_factory=list, description="本 Run 使用的公开 rule 名")
+
+
+class ResultSpec(BaseModel):
+    """
+    一条声明的 Published Result — 冻结进 RunCommit.result_specs。
+
+    语义见 docs/design/CORE-ARCHITECTURE.md 3、docs/spec/WORKFLOW-RUN-CONTRACT.md 8.4：
+    Published Results 由这里声明，永不从路径推断。就绪状态是 output 与 Run 文件清单的 join
+    (3.1)，不是独立的状态机；未就绪不代表被吞掉，必须投影为 "declared"。
+    """
+
+    result_id: str = Field(
+        description="Result 在本 Run 内的稳定标识 (如 'feature-table:sample-a')",
+        pattern=r"^[a-zA-Z0-9_.:-]+$",
+    )
+    name: str = Field(description="展示名称")
+    kind: str = Field(description="Result 种类 (如 feature_table)，用于分组与选择器")
+    dimensions: dict[str, str] = Field(
+        default_factory=dict,
+        description="声明的维度取值 (如 {sample: sample-a})；键为稳定标识，值为字符串",
+    )
+    output: str = Field(description="Run-root-relative 的产物路径，用于与文件清单 join")
+    _validate_output = field_validator("output")(_validate_path_no_traversal)
 
 
 class RunCommit(BaseModel):
@@ -95,9 +118,29 @@ class RunCommit(BaseModel):
         description="锁定的节点二进制映射",
     )
 
+    # Published Results — 声明"答案"，见 docs/design/CORE-ARCHITECTURE.md 3
+    result_specs: list[ResultSpec] = Field(
+        default_factory=list,
+        description=(
+            "声明的 Published Result 列表；冻结进 commit，永不推断。"
+            "GET /api/v2/runs/{run_id}/results 将其与实际产物的文件清单 join 后投影。"
+        ),
+    )
+
     # 元信息
     user_id: str = Field(description="提交者 user_id")
-    mode: str = Field(default="local", description="执行模式: local | remote")
+    materialization_strategy: Optional[str] = Field(
+        default=None,
+        description=(
+            "服务端解析并记录的物化策略 (如 local_workspace_hardlink | blob_store)。"
+            "调用方不得声明部署模式——见 docs/spec/CAPABILITIES.md 7 与 "
+            "docs/design/REMAINING-DESIGNS.md 0.2；Backend 在 app/api/runs_v2.py "
+            "中根据 commit 形状 (是否携带 local_workspace_root) 匹配自身启动时解析的 "
+            "capabilities.materialization.strategies 来选定该值，并覆盖任何调用方提交的值。"
+            "此前的 mode 字段已从调用方可提交的 commit 面中移除；调用方若仍提交 "
+            "mode 会被显式拒绝 (RUN_MODE_MISMATCH)，而不是被静默忽略。"
+        ),
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="提交时间 (UTC)",
@@ -106,6 +149,14 @@ class RunCommit(BaseModel):
         default_factory=dict,
         description="用户自定义标签，用于搜索和分组",
     )
+
+    @property
+    def mode(self) -> str:
+        """已弃用的向后兼容派生属性，非 pydantic field（不出现在 model_dump()/序列化中，
+        调用方也无法通过它写入 commit）。REMAINING-DESIGNS.md 0.2 移除 mode 字段后，
+        仍以 commit.mode 读取模式的既有调用点 (如 src/services/run_worker.py) 无需
+        立即修改；新代码应改读 materialization_strategy。"""
+        return "local" if self.materialization_strategy in (None, "local_workspace_hardlink") else "remote"
 
 
 class RunCreateRequest(BaseModel):
@@ -129,6 +180,50 @@ class RunDryRunResponse(BaseModel):
     exit_code: int
     engine: Literal["tdease-workflow"] = "tdease-workflow"
     output: str
+
+
+class ResultRef(BaseModel):
+    """
+    Published Result 的寻址引用 (docs/design/CORE-ARCHITECTURE.md 3.2)。
+
+    digest 缺省 = 引用该 Result 的当前值 (未 pin，随 Recompute 自动更新)；
+    digest 存在 = 精确指向该字节内容 (pin，用于 Evidence/溯源)。两种读法都合法，
+    区别只在调用方是否携带 digest —— 本模型故不强制 digest 必填。
+    """
+
+    workspace_id: str
+    run_id: str
+    result_id: str
+    digest: Optional[str] = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class RunResultEntry(BaseModel):
+    """
+    单条 Published Result 投影 —— result_specs 中的一条声明与文件清单 join 后的结果。
+
+    status 是 join 的结果，不是独立状态机 (CORE-ARCHITECTURE.md 3.1)：
+    声明的 output 在文件清单中不存在 -> "declared"；存在 -> "ready"，携带当前 digest。
+    一个声明了但从未就绪的 Result 必须出现在这里 (status="declared")，不能被静默省略；
+    反过来，任何未被 result_specs 声明的文件都不会出现在这里 —— 它只是 Technical
+    Artifact，只能经由 GET /api/v2/runs/{run_id}/files 访问。
+    """
+
+    result_id: str
+    name: str
+    kind: str
+    dimensions: dict[str, str]
+    output: str
+    status: Literal["declared", "ready"]
+    digest: Optional[str] = None
+    size: Optional[int] = None
+    ref: ResultRef
+
+
+class RunResultsResponse(BaseModel):
+    """GET /api/v2/runs/{run_id}/results 的响应体。"""
+
+    run_id: str
+    results: list[RunResultEntry]
 
 
 class RunRerunRequest(BaseModel):
@@ -167,7 +262,17 @@ class RunStatusResponse(BaseModel):
     name: str = ""
     workspace_id: str
     status: RunStatus
-    mode: str
+    mode: str = Field(
+        default="local",
+        description=(
+            "已弃用的兼容字段：从 materialization_strategy 派生的 local|remote 简化标签，"
+            "仅保留一个发布周期供 Client 迁移。新代码应读取 materialization_strategy。"
+        ),
+    )
+    materialization_strategy: str = Field(
+        default="local_workspace_hardlink",
+        description="服务端记录的物化策略，见 RunCommit.materialization_strategy。",
+    )
     cores: int
     pid: Optional[int] = None
     exit_code: Optional[int] = None

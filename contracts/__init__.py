@@ -49,6 +49,8 @@ from .event import (
 from .run import (
     NodeBinding,
     PackageLock,
+    ResultRef,
+    ResultSpec,
     RunCommit,
     RunCreateRequest,
     RunCreateResponse,
@@ -57,6 +59,8 @@ from .run import (
     RunActionResponse,
     RunListResponse,
     RunRerunRequest,
+    RunResultEntry,
+    RunResultsResponse,
     RunStatusResponse,
     RunTrashEntry,
     RunTrashListResponse,
@@ -86,7 +90,7 @@ __all__ = [
     "RunCommit", "RunCreateRequest", "RunCreateResponse", "RunDryRunRequest", "RunDryRunResponse",
     "RunRerunRequest", "RunActionResponse", "RunStatusResponse", "RunListResponse",
     "RunTrashEntry", "RunTrashListResponse",
-    "PackageLock", "NodeBinding",
+    "PackageLock", "NodeBinding", "ResultSpec", "ResultRef", "RunResultEntry", "RunResultsResponse",
     # event
     "Event", "EventBatch", "RuntimeRef",
     "RunQueuedData", "RunStartedData", "RunTerminatedData",

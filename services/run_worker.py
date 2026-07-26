@@ -1,11 +1,16 @@
 """
-Run Worker — 文件扫描队列 → TDEase Execution Runtime → events.jsonl。
+Run Worker -- file-scan queue -> TDEase Execution Runtime -> events.jsonl.
 
-设计约束：
-- ~50 行业务逻辑。守护/重启/cgroup 交给 systemd。
-- 原子领取（O_CREAT | O_EXCL claim 文件）。
-- 调用 Execution Runtime execute()。
-- 状态更新全部通过 Storage Layout。
+Design constraints:
+- ~50 lines of business logic. Daemonizing/restart/cgroups belong to systemd.
+- Atomic claim (O_CREAT | O_EXCL claim file).
+- Calls Execution Runtime execute().
+- All status writes go through Storage Layout's sync_run_projection --
+  CORE-ARCHITECTURE.md Sec 1.4: "status" is a projection of events.jsonl,
+  never written independently here. The two former independent writers
+  (this file computing a SUCCEEDED/FAILED/CANCELLED ternary itself, and
+  storage.py's reconcile rewriting "status" by hand) are both gone; both
+  now call the same single projection path.
 """
 
 from __future__ import annotations
@@ -19,18 +24,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from src.contracts import ErrorCode, RunCommit
+from src.contracts import RunCommit, RunStatus
 from src.execution_runtime import execute, get_storage
+from src.execution_runtime.events import EventEmitter
+from src.execution_runtime.errors import runtime_internal
 from src.execution_runtime.storage import StorageLayout
 
 
 def _data_root() -> Path:
-    # 走唯一入口 get_storage()，避免散落的 os.environ.get(..., "server-data")。
+    # Single entry point get_storage() -- avoids scattered os.environ.get(..., "server-data").
     return get_storage().data
 
 
 def _dequeue() -> Optional[dict]:
-    """扫描 runs/，原子领取第一个 QUEUED run（O_CREAT|O_EXCL claim 文件）。"""
+    """Scan runs/, atomically claim the first QUEUED run (O_CREAT|O_EXCL claim file)."""
     runs_dir = _data_root() / "runs"
     if not runs_dir.exists():
         return None
@@ -56,12 +63,12 @@ def _dequeue() -> Optional[dict]:
 
 
 def execute_run(run_data: dict) -> None:
-    """执行一次 Run — 全部通过 Execution Runtime。"""
+    """Execute one Run -- entirely through the Execution Runtime."""
     run_id = run_data["run_id"]
     storage = get_storage()
     storage.bootstrap()
 
-    # Idempotent — API already created dir and wrote run.queued event
+    # Idempotent -- API already created dir and wrote run.queued event
     storage.allocate_run(run_id)
 
     commit = RunCommit(
@@ -83,12 +90,14 @@ def execute_run(run_data: dict) -> None:
         labels=run_data.get("labels", {}),
     )
 
-    # Update status to RUNNING via storage
+    # Record process bookkeeping (pid, started_at) only. Not "status" --
+    # that is derived from events by sync_run_projection below, the single
+    # writer of that field (CORE-ARCHITECTURE.md Sec 1.4).
+    run_json = _data_root() / "runs" / run_id / "run.json"
+    current = json.loads(run_json.read_text(encoding="utf-8")) if run_json.exists() else dict(run_data)
     storage.atomic_write_json(
-        _data_root() / "runs" / run_id / "run.json",
-        {**run_data, "status": "RUNNING",
-         "pid": os.getpid(),
-         "started_at": datetime.now(timezone.utc).isoformat()},
+        run_json,
+        {**current, "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
     )
 
     try:
@@ -99,25 +108,22 @@ def execute_run(run_data: dict) -> None:
             storage.verify_local_inputs(run_id)
     except Exception as exc:
         from src.execution_runtime.runtime import ExecutionResult
-        from src.execution_runtime.errors import runtime_internal
-        result = ExecutionResult(success=False, exit_code=-1, error=runtime_internal(str(exc)))
+        error = runtime_internal(str(exc))
+        result = ExecutionResult(success=False, exit_code=-1, error=error)
+        # execute() raises only from inside its own try/except, which
+        # always appends a terminal event first -- but the local-input
+        # verification calls above are outside execute() and can raise
+        # with no terminal event on record at all. Append one now so the
+        # projection (and sync_run_projection just below) has a terminal
+        # fact to converge to instead of being stuck RUNNING/QUEUED
+        # forever with only a run.json rewrite to show for it.
+        EventEmitter(run_id).run_failed(
+            exit_code=-1, run_time_seconds=0.0, error_message=str(error)
+        )
 
-    # Terminal status via storage
-    status = (
-        "SUCCEEDED" if result.success
-        else "CANCELLED" if result.error and result.error.code == ErrorCode.EXECUTION_CANCELLED
-        else "FAILED"
-    )
-    run_json = _data_root() / "runs" / run_id / "run.json"
-    current = json.loads(run_json.read_text(encoding="utf-8"))
-    storage.atomic_write_json(run_json, {
-        **current, "status": status,
-        "exit_code": result.exit_code,
-        "error": str(result.error) if result.error else None,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    })
+    projection = storage.sync_run_projection(run_id)
 
-    if status == "SUCCEEDED":
+    if projection.status == RunStatus.SUCCEEDED.value:
         storage.write_results_manifest(run_id)
 
     # Cleanup claim
@@ -129,7 +135,7 @@ def run_loop(
     once: bool = False,
     stop_event: Event | None = None,
 ) -> None:
-    """Worker 主循环。"""
+    """Worker main loop."""
     storage = get_storage()
     storage.bootstrap()
     storage.reconcile_orphaned_runs()

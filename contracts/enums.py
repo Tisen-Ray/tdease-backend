@@ -88,6 +88,10 @@ class ErrorCode(str, Enum):
     # --- Workspace ---
     WORKSPACE_NOT_FOUND = "WORKSPACE_NOT_FOUND"
     WORKSPACE_IDENTITY_INVALID = "WORKSPACE_IDENTITY_INVALID"
+    # 提交路径解析到已批准的 Workspace 根目录之外（REMAINING-DESIGNS.md §1
+    # "Workspace root registration"）。与 app/core/errors.py 的同名 code 对齐，
+    # 以便未来把 ExecutionError 翻译进那个信封时两边码值天然一致。
+    WORKSPACE_PATH_ESCAPE = "WORKSPACE_PATH_ESCAPE"
 
     # --- 文件 ---
     PATH_TRAVERSAL = "PATH_TRAVERSAL"
