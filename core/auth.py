@@ -1,12 +1,26 @@
-"""Process-local authentication for the bundled Desktop backend."""
+"""Process-local authentication for the bundled Desktop backend.
+
+Fails closed by construction (REMAINING-DESIGNS.md 0.1): there is no code path in
+which a request is treated as `local-owner` without a validated Bearer token. If no
+bootstrap secret was supplied at startup, no token can ever be minted and every
+protected request is rejected for the remaining life of the process -- silently
+granting access was the defect being fixed here, so there is deliberately no
+"convenience" branch that skips validation.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 import secrets
 from dataclasses import dataclass
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+
+from app.core.errors import ErrorCode, TDEaseError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -25,30 +39,126 @@ LOCAL_OWNER = Principal(
 )
 
 
+def _rejection(*, code: ErrorCode, message: str, remedy: str) -> HTTPException:
+    """Build an auth rejection carrying the one failure envelope.
+
+    domain and http_status come from code via pp/core/errors.py; neither is
+    a parameter here, because both were free strings at this raise site before and
+    that is how AUTH_TOKEN_INVALID came to be served with domain: "backend" -- an
+    invalid token is not a Backend fault.
+
+    Still an HTTPException rather than a bare TDEaseError: this is raised from
+    inside the desktop_auth middleware, which runs before FastAPI's exception
+    handlers can see anything, so the middleware must catch it itself. It carries
+    TDEaseError.to_envelope() as its detail, so the body on the wire is the
+    envelope and nothing else.
+
+    Never carries details/cause: an auth rejection has nothing secret-free and
+    useful to attach, and the secret itself must never be constructed into any
+    response or log.
+    """
+
+    error = TDEaseError(code=code, message=message, remedy=remedy, retryable=False)
+    return HTTPException(
+        status_code=error.http_status,
+        detail=error.to_envelope(),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
 class DesktopAuth:
+    """Mints and enforces the single process-lifetime Desktop Bearer token.
+
+    There is exactly one way to become authenticated: exchange the bootstrap
+    secret once for a token, then present that token as `Authorization: Bearer
+    <token>`. Everything else is rejected, including the case where no secret
+    was ever configured.
+    """
+
     def __init__(self, bootstrap_secret: str | None) -> None:
-        self._bootstrap_secret = bootstrap_secret
+        self._bootstrap_secret = bootstrap_secret or None
         self._token: str | None = None
+        if not self._bootstrap_secret:
+            # DESKTOP-FIRST-DEPLOYMENT.md section 7: "Backend ... requires the
+            # bootstrap token." A missing secret is a startup-time configuration
+            # error, not a state that implicitly grants access. We log it loudly
+            # here (never crash the process): crashing at import time would take
+            # every route, including public health checks, down with it, and
+            # would reproduce the exact "collection/import aborts everything"
+            # failure mode REMAINING-DESIGNS.md section 0.3 flags elsewhere.
+            # Instead `configured` below is permanently False, so
+            # `authenticate()` rejects every protected request for the rest of
+            # the process's life -- the Backend starts, but nothing protected
+            # is reachable until it is restarted with a secret.
+            logger.error(
+                "startup error: TDEASE_BOOTSTRAP_SECRET was not supplied; "
+                "authentication cannot succeed and every protected request will "
+                "be rejected until the Backend is restarted with a secret."
+            )
 
     @property
-    def enabled(self) -> bool:
+    def configured(self) -> bool:
+        """True while a still-usable bootstrap secret or minted token exists.
+
+        False forever once constructed without a secret -- there is no
+        transition back to a working state short of restarting the process.
+        """
+
         return bool(self._bootstrap_secret or self._token)
 
     def exchange(self, candidate: str) -> str:
         if not self._bootstrap_secret:
-            raise HTTPException(status_code=410, detail="desktop bootstrap is unavailable")
+            raise _rejection(
+                code=ErrorCode.AUTH_BOOTSTRAP_UNAVAILABLE,
+                message=(
+                    "The Desktop bootstrap secret was already exchanged for a token, "
+                    "or none was supplied when the Backend started."
+                ),
+                remedy=(
+                    "Restart the Backend through the Desktop app so a fresh bootstrap "
+                    "secret is minted. A bootstrap secret is single-use by design."
+                ),
+            )
         if not candidate or not secrets.compare_digest(candidate, self._bootstrap_secret):
-            raise HTTPException(status_code=401, detail="invalid desktop bootstrap secret")
+            raise _rejection(
+                code=ErrorCode.AUTH_BOOTSTRAP_SECRET_INVALID,
+                message="The supplied Desktop bootstrap secret does not match.",
+                remedy=(
+                    "Send the exact secret the Desktop app passed to the Backend at "
+                    "startup as the 'X-TDEase-Bootstrap' header."
+                ),
+            )
         self._token = secrets.token_urlsafe(32)
         self._bootstrap_secret = None
         return self._token
 
     def authenticate(self, authorization: str | None) -> Principal:
-        if not self.enabled:
-            return LOCAL_OWNER
+        if not self.configured:
+            raise _rejection(
+                code=ErrorCode.AUTH_BOOTSTRAP_SECRET_MISSING,
+                message=(
+                    "No Desktop bootstrap secret was supplied when the Backend "
+                    "started, so no request can be authenticated."
+                ),
+                remedy=(
+                    "Restart the Backend through the Desktop app so it receives "
+                    "a bootstrap secret, or set TDEASE_BOOTSTRAP_SECRET before "
+                    "starting it."
+                ),
+            )
         scheme, _, credential = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not self._token or not secrets.compare_digest(credential, self._token):
-            raise HTTPException(status_code=401, detail="authentication required")
+        token = self._token
+        if scheme.lower() != "bearer" or not token or not credential or not secrets.compare_digest(credential, token):
+            raise _rejection(
+                code=ErrorCode.AUTH_TOKEN_INVALID,
+                message=(
+                    "The Authorization header is missing, malformed, or does not "
+                    "match the active Bearer token."
+                ),
+                remedy=(
+                    "Exchange the bootstrap secret for a Bearer token and send "
+                    "it as 'Authorization: Bearer <token>'."
+                ),
+            )
         return LOCAL_OWNER
 
 
@@ -70,7 +180,26 @@ async def bootstrap(request: Request) -> dict[str, object]:
     }
 
 
-PUBLIC_PATHS = frozenset({"/", "/health", "/healthz", "/ready", "/api/auth/bootstrap"})
+PUBLIC_PATHS = frozenset({
+    "/",
+    "/health",
+    "/healthz",
+    "/ready",
+    "/api/auth/bootstrap",
+    # /api/capabilities must be reachable before a Bearer token exists --
+    # it is how the Client discovers the auth scheme in the first place
+    # (docs/spec/CAPABILITIES.md section 3, "unauthenticated"; A4's report
+    # flagged this exact gap). It carries no secret or user data.
+    "/api/capabilities",
+    # /openapi.json and /docs are FastAPI's own self-description; gating
+    # them behind the same Bearer token they would need to explain how to
+    # obtain is the identical bootstrap deadlock. Neither exposes secret or
+    # user data -- app.py already hides /docs entirely in production
+    # (docs_url=None if TDEASE_ENV=production), and /openapi.json is a
+    # static route/schema description, not Run or workspace data.
+    "/openapi.json",
+    "/docs",
+})
 
 
 async def authenticate_request(request: Request) -> Principal:

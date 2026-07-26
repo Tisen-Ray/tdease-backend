@@ -1,8 +1,9 @@
 """Read-only workflow template projection."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from src.execution_runtime.storage import get_system_root
 from src.services.template_catalog import scan_templates
+from app.core.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/templates", tags=["templates"])
 
@@ -25,4 +26,9 @@ async def get_template(template_id: str):
     for item in templates:
         if item["id"] == template_id:
             return item
-    raise HTTPException(status_code=404, detail="template not found")
+    raise TDEaseError(
+        code=ErrorCode.RUN_TEMPLATE_NOT_FOUND,
+        message=f"No workflow template {template_id} exists.",
+        remedy="List templates with GET /api/templates.",
+        retryable=False,
+    )

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import asyncio
+import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,11 +51,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 from app.api.runs_v2 import router as runs_v2_router
 from app.api.files import router as files_router
-from app.api.workflow_templates import router as workflow_templates_router
 from app.api.uploads import router as uploads_router
 from app.api.nodes import router as nodes_router
 from app.api.templates import router as templates_router
+from app.api.capabilities import router as capabilities_router
+from app.core.workspace_roots import router as workspace_roots_router, get_workspace_root_registry
 from app.core.auth import authenticate_request, router as auth_router
+from app.core.errors import ErrorCode, TDEaseError, register_error_handlers
 
 # ---------------------------------------------------------------------------
 # 生命周期
@@ -87,6 +90,21 @@ async def lifespan(app: FastAPI):
             asyncio.to_thread(run_loop, 1.0, False, worker_stop)
         )
         logger.info("Embedded run worker started")
+
+    # Workspace root containment: until this is wired, the fail-closed default in
+    # src/execution_runtime/workspace_containment.py approves no root for anyone and
+    # every local materialization raises WORKSPACE_PATH_ESCAPE. The registry is the
+    # only thing consulted -- never the local_workspace_root a Run commit asserts.
+    from src.execution_runtime.workspace_containment import set_approved_roots_checker
+
+    # Late-bound on purpose: the route handlers in app/core/workspace_roots.py read
+    # the module-level registry at call time, so capturing a bound method here would
+    # let the two diverge if the singleton is ever substituted.
+    set_approved_roots_checker(
+        lambda user_id, candidate_path: get_workspace_root_registry().is_within_approved_root(
+            user_id, candidate_path
+        )
+    )
 
     logger.info("TDEase-zero ready")
     yield
@@ -130,9 +148,13 @@ async def desktop_auth(request: Request, call_next):
     try:
         request.state.principal = await authenticate_request(request)
     except HTTPException as exc:
+        # `exc.detail` is already the failure envelope (app/core/auth.py builds it
+        # from TDEaseError). Wrapping it in {"detail": ...} produced a second,
+        # incompatible shape on the wire that no Client could parse with the same
+        # code path as every other error -- the envelope goes out as-is.
         return JSONResponse(
             status_code=exc.status_code,
-            content={"detail": exc.detail},
+            content=exc.detail,
             headers={"WWW-Authenticate": "Bearer"},
         )
     return await call_next(request)
@@ -151,11 +173,15 @@ async def request_log(request: Request, call_next):
 # Routes
 app.include_router(runs_v2_router)
 app.include_router(files_router)
-app.include_router(workflow_templates_router)
 app.include_router(uploads_router)
 app.include_router(nodes_router)
 app.include_router(templates_router)
+app.include_router(capabilities_router)
+app.include_router(workspace_roots_router)
 app.include_router(auth_router)
+
+# Failure contract — TDEaseError -> envelope response (docs/spec/FAILURE-CONTRACT.md)
+register_error_handlers(app)
 
 
 @app.get("/")
@@ -190,10 +216,90 @@ async def ready():
 
 @app.exception_handler(Exception)
 async def global_handler(request: Request, exc: Exception):
+    """The last resort still speaks the failure contract.
+
+    `str(exc)` is a developer string: it has no code a Client can branch on, no
+    remedy a user can act on, and it can carry an absolute path or a secret straight
+    out of an arbitrary library's exception message. BACKEND_INTERNAL carries the
+    same information a Client can actually use, and the real exception goes to the
+    log where it belongs.
+    """
+
     logger.exception("Unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"error": str(exc)})
+    internal = TDEaseError(
+        code=ErrorCode.BACKEND_INTERNAL,
+        message="The Backend failed to complete this request.",
+        remedy=(
+            "Retry the request. If it keeps failing, open the Backend log from the "
+            "Desktop app and report the entry with this request's X-Request-ID."
+        ),
+        retryable=True,
+    )
+    return JSONResponse(status_code=internal.http_status, content=internal.to_envelope())
 
 # ---------------------------------------------------------------------------
+# Standalone entrypoint (`python -m app.main`). The packaged Desktop app does not
+# use this path -- Electron spawns `uv run uvicorn app.main:app --host ... --port
+# ...` directly with a port it already chose (DESKTOP-FIRST-DEPLOYMENT.md §4.1:
+# "Electron starts Backend on 127.0.0.1 and a random available port"). This block
+# exists for local/manual runs and must honour the same contract: loopback only,
+# OS-assigned port by default, and a deterministic, parseable report of whatever
+# port was actually bound -- never a fixed 0.0.0.0:8000 that collides across
+# instances and is reachable from other local software.
+# ---------------------------------------------------------------------------
+def _resolve_backend_host() -> str:
+    """Loopback by default. Resolved once at process startup, never per-request."""
+    return os.getenv("TDEASE_BACKEND_HOST", "127.0.0.1")
+
+
+def _resolve_backend_port() -> int:
+    """0 means "let the OS assign a free port" -- the Desktop default. A caller
+    that wants a fixed port for local debugging may still set TDEASE_BACKEND_PORT.
+    """
+    raw = os.getenv("TDEASE_BACKEND_PORT", "0")
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _select_backend_port(host: str, port: int) -> int:
+    """Resolve the real port to bind, letting the OS assign a free one when
+    ``port == 0``.
+
+    Binds and immediately releases a probe socket so the real port is known
+    -- deterministically, in this process -- before uvicorn starts. uvicorn's
+    own ``fd=`` socket-handoff option is built around AF_UNIX socket
+    activation (see uvicorn.Config.bind_socket) and is not a portable fit for
+    a plain AF_INET port-0 bind on Windows, so this process hands uvicorn a
+    concrete, already-resolved ``--port`` instead of a live socket.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def _report_backend_port(port: int, port_file: str | None = None) -> None:
+    """Report the bound port deterministically.
+
+    A structured, stable-prefixed stdout line is always emitted; a parent process
+    should match on the `TDEASE_BACKEND_PORT=` prefix rather than parsing
+    arbitrary log output. If TDEASE_PORT_FILE is set, the port is also written to
+    that file so a parent that prefers file-based discovery can poll it instead.
+    """
+    print(f"TDEASE_BACKEND_PORT={port}", flush=True)
+    if port_file:
+        Path(port_file).write_text(str(port), encoding="utf-8")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+
+    _host = _resolve_backend_host()
+    _port = _select_backend_port(_host, _resolve_backend_port())
+    _report_backend_port(_port, os.getenv("TDEASE_PORT_FILE"))
+    uvicorn.run("app.main:app", host=_host, port=_port, reload=False)

@@ -6,9 +6,16 @@ GET  /api/v2/files?stat=1    File stat (exists, mtime, type, size)
 GET  /api/v2/files/list      List files matching glob
 PUT  /api/v2/files            Write file content
 
-Writes are restricted: canonical Run/event/log/result files and internal
-directories (runs/, database/, store/, .runtime/) are read-only through
-this API.  All writes go through Storage Layout atomic primitives.
+Reads AND writes are restricted: canonical Run/event/log/result files, the
+SQLite database, and the CAS blob store (runs/, database/, store/, blobs/,
+.runtime/, .tdease/, .snakemake/) are not reachable through this
+general-purpose, unauthenticated-per-Run endpoint at all -- it carries no
+run_id/principal context to enforce ownership with, so those paths are
+served exclusively through app/api/runs_v2.py's ownership-gated routes
+instead. Writes additionally reject nodes/ (TDEASE_TOOLS_ROOT): its
+rules.smk files are executed as Python by Snakemake, so an unrestricted
+write there is remote code execution. All writes go through Storage Layout
+atomic primitives.
 """
 
 from __future__ import annotations
@@ -21,23 +28,41 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Body
 from fastapi.responses import PlainTextResponse, JSONResponse
 
+from app.core.errors import ErrorCode, TDEaseError
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v2/files", tags=["files"])
 
-# ── Paths that the generic Files API must never write to ──
-# Canonical Run state, events, logs, and internal directories are owned by
-# the Execution Runtime / Storage Layout and must not be mutated via a
-# general-purpose file endpoint.
-_PROTECTED_WRITE_PREFIXES = (
+# ── Paths this generic, unauthenticated-per-Run Files API must never READ ──
+# `runs/` holds every Principal's Run data (results, logs, the materialized
+# workspace); `database/` and `store/` hold the SQLite DB and the CAS blob
+# store. This API takes no run_id / principal context at all -- unlike
+# app/api/runs_v2.py's `_owned_run`-gated routes, there is no ownership
+# check possible here, so the only safe answer is "not reachable through
+# this endpoint at all". Run files are served exclusively through
+# runs_v2.py's ownership-gated `GET /api/v2/runs/{run_id}/files/...`.
+# Confirmed unused by the Client today (TDEase-FrontEnd/src/services/views-fs.ts:
+# "The backend files API (api/v2/files) is NOT used by the frontend.").
+_PROTECTED_READ_PREFIXES = (
     "runs/",
     "database/",
     "store/",
+    "blobs/",
     ".runtime/",
     ".tdease/",
     ".snakemake/",
-    "blobs/",
 )
+
+# ── Paths that the generic Files API must never write to ──
+# Canonical Run state, events, logs, and internal directories are owned by
+# the Execution Runtime / Storage Layout and must not be mutated via a
+# general-purpose file endpoint. `nodes/` (TDEASE_TOOLS_ROOT) additionally
+# holds the Snakemake rule files (`rules.smk`) that every workflow node's
+# `shell:` directives live in -- Snakemake imports and executes them as
+# Python, so an unrestricted write here is arbitrary code execution in the
+# Backend process the next time any Run touches that node.
+_PROTECTED_WRITE_PREFIXES = _PROTECTED_READ_PREFIXES + ("nodes/",)
 
 # ── Helpers ──
 
@@ -66,9 +91,29 @@ def _safe_path(rel_path: str) -> Path:
         candidate = (root / cleaned.lstrip("/")).resolve(strict=False)
 
     try:
-        candidate.relative_to(root)
+        suffix = candidate.relative_to(root).as_posix()
     except ValueError:
-        raise HTTPException(status_code=403, detail=f"Path traversal denied: {rel_path}")
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+            message="The requested path resolves outside the Backend data root.",
+            remedy="Request a path relative to the data root, with no parent-directory segments.",
+            retryable=False,
+            details={"path": rel_path},
+        )
+
+    for prefix in _PROTECTED_READ_PREFIXES:
+        stripped = prefix.rstrip("/")
+        if suffix == stripped or suffix.startswith(prefix):
+            raise TDEaseError(
+                code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+                message="That path is in a protected area and cannot be read through this endpoint.",
+                remedy=(
+                    "Read Run data through GET /api/v2/runs/<run_id>/files, which enforces "
+                    "Run ownership."
+                ),
+                retryable=False,
+                details={"path": rel_path, "protected_prefix": prefix},
+            )
 
     return candidate
 
@@ -81,7 +126,13 @@ async def read_file(
     abs_path = _safe_path(path)
 
     if not abs_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_FILE_NOT_FOUND,
+            message="No file exists at that path.",
+            remedy="List the directory with GET /api/v2/files/list to see what is there.",
+            retryable=False,
+            details={"path": path},
+        )
 
     if stat:
         st = abs_path.stat()
@@ -152,19 +203,33 @@ async def list_files(
 
 
 def _writable_path(rel_path: str) -> Path:
-    """Like _safe_path but additionally rejects protected write targets."""
+    """Like _safe_path but additionally rejects protected write-only targets
+    (_safe_path itself already rejects every _PROTECTED_READ_PREFIXES entry,
+    which _PROTECTED_WRITE_PREFIXES is a superset of)."""
     candidate = _safe_path(rel_path)
     root = _data_root().resolve()
     try:
         suffix = str(candidate.relative_to(root)).replace("\\", "/")
     except ValueError:
-        raise HTTPException(status_code=403, detail=f"Path traversal denied: {rel_path}")
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+            message="The requested path resolves outside the Backend data root.",
+            remedy="Write to a path relative to the data root, with no parent-directory segments.",
+            retryable=False,
+            details={"path": rel_path},
+        )
 
     for prefix in _PROTECTED_WRITE_PREFIXES:
         if suffix == prefix.rstrip("/") or suffix.startswith(prefix):
-            raise HTTPException(
-                status_code=403,
-                detail=f"Write denied: {rel_path} is in protected area ({prefix})",
+            raise TDEaseError(
+                code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+                message="That path is in a protected area and cannot be written through this endpoint.",
+                remedy=(
+                    "Run data, the database, the blob store and the node packages are written "
+                    "only by the Backend itself. Submit a Run instead of writing its files."
+                ),
+                retryable=False,
+                details={"path": rel_path, "protected_prefix": prefix},
             )
     return candidate
 

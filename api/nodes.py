@@ -1,8 +1,9 @@
 """Read-only projection of executable node packages deployed on this server."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 from src.execution_runtime.storage import get_storage
 from src.services.node_catalog import scan_nodes
+from app.core.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
@@ -23,4 +24,9 @@ async def get_node(node_id: str):
     for node in result["nodes"]:
         if node["id"] == node_id:
             return node
-    raise HTTPException(status_code=404, detail="node not found")
+    raise TDEaseError(
+        code=ErrorCode.RUN_NODE_NOT_FOUND,
+        message=f"No Node package {node_id} is deployed.",
+        remedy="List deployed Nodes with GET /api/nodes.",
+        retryable=False,
+    )
