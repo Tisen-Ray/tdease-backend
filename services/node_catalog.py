@@ -16,6 +16,8 @@ submittable Profile stay in lockstep).
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -169,6 +171,170 @@ def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if len({node["id"] for node in nodes}) != len(nodes):
         errors.append({"path": root.as_posix(), "error": "duplicate node id"})
     return nodes, errors
+
+
+# ── Enum-parameter validation (submit-time guard) ────────────────────────────
+# A node package MAY ship a `node.json` declaring, per parameter, a closed set of
+# `choices`. When it does, a submitted value outside that set must be rejected at
+# run submission / preflight -- never forwarded to the binary. The motivating case
+# (docs/paper/ITERATION.md 11.1): toppic's `-R proteoform_type` was submitted as
+# `TERMIN`, which TopPIC accepts silently, matches nothing against, and exits 0 --
+# so an empty proteoform table was reported as a SUCCEEDED Run. The guard turns
+# that silent empty success into a distinguishable rejection at the door.
+
+_MISSING = object()
+
+
+def enum_constraints(package_dir: Path) -> list[dict[str, Any]]:
+    """Choice-constrained parameters declared in `<package_dir>/node.json`.
+
+    Returns [] when node.json is absent, unreadable, or declares no `choices`
+    (a node without node.json keeps today's behaviour: nothing to validate).
+    Each constraint: {param, config_path, choices, is_list, separator}.
+    """
+    node_json = package_dir / "node.json"
+    if not node_json.is_file():
+        return []
+    try:
+        document = json.loads(node_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    params = document.get("params")
+    if not isinstance(params, dict):
+        return []
+    constraints: list[dict[str, Any]] = []
+    for name, spec in params.items():
+        if not isinstance(spec, dict):
+            continue
+        choices = spec.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        config_path = spec.get("config_path")
+        if not (isinstance(config_path, list) and all(isinstance(part, str) for part in config_path)):
+            config_path = None
+        constraints.append({
+            "param": str(name),
+            "config_path": config_path,
+            "choices": [str(choice) for choice in choices],
+            "is_list": bool(spec.get("list", False)),
+            "separator": str(spec.get("separator", ",")),
+        })
+    return constraints
+
+
+def _lookup_config_value(config: dict, param: str, config_path: list[str] | None) -> Any:
+    """Locate a parameter's submitted value in a Snakemake `config` mapping.
+
+    An explicit `config_path` (e.g. ["toppic", "proteoform_type"]) is followed
+    exactly. Without one, the parameter name is matched at the top level, then one
+    level deep (config is keyed by rule section) -- so a node.json that lists a
+    bare param name still resolves against a section-keyed config.
+    """
+    if config_path:
+        cursor: Any = config
+        for key in config_path:
+            if not isinstance(cursor, dict) or key not in cursor:
+                return _MISSING
+            cursor = cursor[key]
+        return cursor
+    if isinstance(config, dict):
+        if param in config:
+            return config[param]
+        for value in config.values():
+            if isinstance(value, dict) and param in value:
+                return value[param]
+    return _MISSING
+
+
+def _invalid_tokens(value: Any, constraint: dict[str, Any]) -> list[str]:
+    choices = set(constraint["choices"])
+    if constraint["is_list"]:
+        if isinstance(value, (list, tuple)):
+            tokens = [str(token).strip() for token in value]
+        else:
+            tokens = [token.strip() for token in str(value).split(constraint["separator"])]
+        # An empty token (e.g. "" or a trailing comma) is itself invalid: an empty
+        # proteoform_type also matches nothing, the exact failure this guard exists
+        # to stop.
+        return [token for token in tokens if token not in choices]
+    return [] if str(value) in choices else [str(value)]
+
+
+def validate_config_choices(
+    config: dict | None, resolved: list[tuple[Any, dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Violations where a submitted `config` value is outside a bound node's
+    declared `choices`. `resolved` is `resolve_bindings()` output.
+
+    A parameter absent from `config` is never a violation -- the node/template
+    default applies, and the defaults ship valid.
+    """
+    config = config if isinstance(config, dict) else {}
+    violations: list[dict[str, Any]] = []
+    for _binding, node in resolved:
+        package_dir = node.get("package_dir")
+        if not isinstance(package_dir, Path):
+            continue
+        for constraint in enum_constraints(package_dir):
+            value = _lookup_config_value(config, constraint["param"], constraint["config_path"])
+            if value is _MISSING or value is None:
+                continue
+            invalid = _invalid_tokens(value, constraint)
+            if invalid:
+                violations.append({
+                    "node": node.get("id", ""),
+                    "param": constraint["param"],
+                    "config_path": constraint["config_path"] or [constraint["param"]],
+                    "submitted": value,
+                    "invalid": invalid,
+                    "choices": constraint["choices"],
+                })
+    return violations
+
+
+def scan_node_catalog(
+    root: Path, tools_root_env: str = "TDEASE_TOOLS_ROOT"
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Scan the deployed node catalog for the read-only `GET /api/nodes` surface.
+
+    Unlike `scan_nodes` (a pure best-effort projection used by run resolution,
+    which must stay silent about a missing root so a `nodes: []` commit still
+    resolves), this reports a **missing or unreadable tools root** as a structured
+    error. An empty catalog over a broken root and an empty catalog over a healthy
+    but genuinely-empty root are otherwise identical on the wire -- exactly the
+    "empty result indistinguishable from health" failure this project forbids
+    (docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6). The error carries the resolved
+    absolute path and the env var (`TDEASE_TOOLS_ROOT`) that sets it, so the
+    operator knows both what was looked at and what to fix.
+    """
+    resolved = Path(os.path.normpath(str(root)))
+    if not root.exists():
+        return [], [{
+            "path": str(resolved),
+            "error": (
+                f"tools root does not exist: {resolved} -- set {tools_root_env} to the "
+                "deployed nodes directory, or deploy node packages into it"
+            ),
+            "tools_root": str(resolved),
+            "env": tools_root_env,
+        }]
+    if not root.is_dir():
+        return [], [{
+            "path": str(resolved),
+            "error": f"tools root is not a directory: {resolved} (set {tools_root_env})",
+            "tools_root": str(resolved),
+            "env": tools_root_env,
+        }]
+    try:
+        next(iter(root.iterdir()), None)
+    except OSError as exc:
+        return [], [{
+            "path": str(resolved),
+            "error": f"tools root is not readable: {resolved} ({exc}); set {tools_root_env}",
+            "tools_root": str(resolved),
+            "env": tools_root_env,
+        }]
+    return scan_nodes(root)
 
 
 def platform_id() -> str:

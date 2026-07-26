@@ -530,12 +530,74 @@ class StorageLayout:
             if not path.is_file() or self.file_digest(path) != item["sha256"]:
                 raise ValueError(f"local shared input changed: {item['path']}")
 
+    def declared_output_files(self, run_id: str) -> list[str]:
+        """Run-root-relative paths the committed workflow *declared* it would produce.
+
+        Two sources, unioned in order: the commit's `result_specs[].output`
+        (explicit Published Results), then the concrete targets of the Snakefile's
+        `rule all` input (resolved against the Run's `config`). This is what makes a
+        flat-layout template -- whose outputs sit at the run root, not under
+        `results/` -- have a non-empty canonical result list, so a SUCCEEDED Run whose
+        declared table came back empty still lists that table and is distinguishable
+        from a Run that produced nothing (docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6).
+
+        Best-effort and never raising: an unparseable Snakefile yields the
+        result_specs alone (or []), and the caller falls back to the `results/**`
+        glob. Traversal segments and absolute paths are dropped.
+        """
+        data = self.read_json(self.resolve(run_id, "run.json")) or {}
+        candidates: list[str] = []
+        for spec in (data.get("result_specs") or []):
+            if isinstance(spec, dict):
+                output = spec.get("output")
+                if isinstance(output, str) and output:
+                    candidates.append(output)
+        snakefile = data.get("snakefile")
+        if isinstance(snakefile, str) and snakefile:
+            from src.execution_runtime.declared_outputs import rule_all_outputs
+            candidates.extend(rule_all_outputs(snakefile, data.get("config")))
+
+        seen: set[str] = set()
+        result: list[str] = []
+        for rel in candidates:
+            normalized = rel.replace("\\", "/").lstrip("/")
+            parts = normalized.split("/")
+            if not normalized or ".." in parts or (len(parts[0]) == 2 and parts[0][1] == ":"):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
     def write_results_manifest(self, run_id: str) -> Path:
-        entries = []
+        run_root = self.resolve(run_id)
+        entries: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(path: Path) -> None:
+            if not path.is_file():
+                return
+            try:
+                rel = path.resolve(strict=False).relative_to(run_root.resolve()).as_posix()
+            except ValueError:
+                return
+            if rel in seen:
+                return
+            seen.add(rel)
+            entries.append({"path": rel, "size": path.stat().st_size, "sha256": self.file_digest(path)})
+
+        # Declared outputs first (rule all / result_specs), then nested results/**
+        # for templates that use that layout -- so both a flat and a results/-rooted
+        # template surface their actual products.
+        for rel in self.declared_output_files(run_id):
+            try:
+                add(self.resolve(run_id, rel))
+            except ValueError:
+                continue  # a declared path that will not resolve is simply not listed
         for path in self.result_files(run_id):
-            if path.is_file():
-                entries.append({"path": path.relative_to(self.resolve(run_id)).as_posix(),
-                                "size": path.stat().st_size, "sha256": self.file_digest(path)})
+            add(path)
+
+        entries.sort(key=lambda entry: entry["path"])
         target = self.resolve(run_id, "results.manifest.json")
         self.atomic_write_json(target, {"schema_version": 1, "run_id": run_id, "files": entries})
         return target
