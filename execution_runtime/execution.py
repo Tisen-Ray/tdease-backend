@@ -15,7 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.storage import get_storage
@@ -25,11 +25,12 @@ def execute_task(
     run_id: str,
     task_id: str,
     step_label: str,
-    command: str,
+    command: str | Sequence[str],
     cwd: str,
     env: dict[str, str] | None = None,
     timeout: int = 600,
     emitter: Optional[EventEmitter] = None,
+    display_command: str | None = None,
 ) -> tuple[bool, int, float, str]:
     """
     执行单个 task。返回 (success, exit_code, duration_seconds, stderr_tail)。
@@ -44,7 +45,10 @@ def execute_task(
     storage = get_storage()
     run_dir = Path(cwd)
 
-    sanitized_cmd = _sanitize_command(command)
+    command_text = display_command or (
+        command if isinstance(command, str) else subprocess.list2cmdline(list(command))
+    )
+    sanitized_cmd = _sanitize_command(command_text)
     if emitter:
         emitter.task_started(task_id, step_label, sanitized_cmd)
 
@@ -54,7 +58,7 @@ def execute_task(
 
     try:
         popen_kwargs: dict = dict(
-            shell=True,
+            shell=isinstance(command, str),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -73,7 +77,8 @@ def execute_task(
             _record_engine_pid(run_id, proc.pid)
     except FileNotFoundError:
         elapsed = time.perf_counter() - start
-        msg = f"command not found: {command.split()[0]}"
+        executable = command.split()[0] if isinstance(command, str) else command[0]
+        msg = f"command not found: {executable}"
         if emitter:
             emitter.task_failed(task_id, -1, elapsed, msg)
         storage.append_task_output(run_id, task_id, "stderr", msg)
@@ -165,12 +170,15 @@ def _sanitize_command(cmd: str) -> str:
 
 def _brand_engine_output(text: str) -> str:
     """Keep the product log protocol TDEase-owned while retaining diagnostics."""
-    return (
+    import re
+
+    branded = (
         text.replace("SNAKEMAKE", "TDEASE WORKFLOW ENGINE")
         .replace("Snakemake version:", "Engine version:")
         .replace("snakemake --", "workflow-engine --")
         .replace(".snakemake", ".tdease/engine")
     )
+    return re.sub(r"(?m)^  Command:.*$", "  Command: TDEase Workflow Engine", branded)
 
 
 def _record_engine_pid(run_id: str, pid: int) -> None:

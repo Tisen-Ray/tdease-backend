@@ -92,20 +92,9 @@ def execute_run(run_data: dict) -> None:
     )
 
     try:
-        # §4.3 defense-in-depth: create_run is the load-bearing gate, but a
-        # hand-edited / replayed run.json could still reach the worker. Reject
-        # before the engine starts so the run fails with an explicit Profile
-        # error instead of producing a DAG the frontend cannot draw.
-        from src.execution_runtime.profile_validator import validate_snakefile_profile
-        profile = validate_snakefile_profile(commit.snakefile)
-        if not profile.valid:
-            raise ValueError(
-                "Snakefile violates the static-parseable Profile (§4.3): "
-                + "; ".join(profile.errors())
-            )
         if commit.mode == "local":
             storage.verify_local_inputs(run_id)
-        result = execute(commit)
+        result = execute(commit, rerun_mode=run_data.get("rerun_mode", "resume"))
         if commit.mode == "local":
             storage.verify_local_inputs(run_id)
     except Exception as exc:

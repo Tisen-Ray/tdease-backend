@@ -16,22 +16,58 @@ Internalization of Snakemake's `.snakemake/` directory:
 """
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
 from pathlib import Path
 
+from pydantic import ValidationError
+
+from src.execution_runtime.engine_contract import WorkflowEngineRequest
+from src.execution_runtime.engine_layout import (
+    cleanup_engine_alias,
+    create_engine_alias,
+    prepare_engine_layout,
+)
+
+
+ENGINE_REQUEST = Path(".tdease") / "engine-request.json"
+
 
 def main() -> int:
-    import snakemake.cli as engine_cli
+    from snakemake.api import SnakemakeApi
     import snakemake.shell as engine_shell
     import snakemake.workflow as engine_workflow
     from snakemake.persistence.file import FilePersistence as UpstreamFilePersistence
+    from snakemake.settings.types import (
+        ConfigSettings,
+        DAGSettings,
+        ExecutionSettings,
+        OutputSettings,
+        ResourceSettings,
+    )
+
+    root = Path.cwd().resolve()
+    request_path = root / ENGINE_REQUEST
+    try:
+        request = WorkflowEngineRequest.model_validate_json(
+            request_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValidationError) as exc:
+        print(f"Invalid TDEase engine request: {exc}", file=sys.stderr)
+        return 2
+
+    snakefile = (root / request.snakefile).resolve(strict=False)
+    try:
+        snakefile.relative_to(root)
+    except ValueError:
+        print("Engine Snakefile escapes the Run root", file=sys.stderr)
+        return 2
+    if not snakefile.is_file():
+        print(f"Engine Snakefile not found: {snakefile}", file=sys.stderr)
+        return 2
 
     # One hidden dir to rule them all: .tdease/engine/ holds everything
     # upstream would have put under .snakemake/.
-    engine_root = Path.cwd() / ".tdease" / "engine"
-    engine_root.mkdir(parents=True, exist_ok=True)
+    engine_root = prepare_engine_layout(root)
 
     # Persistence already honors its `path` arg — point it at the engine root.
     class TDEaseEnginePersistence(UpstreamFilePersistence):
@@ -45,38 +81,48 @@ def main() -> int:
     # the engine root so writes land inside .tdease/engine/ transparently.
     snakemake_dir = Path.cwd() / ".snakemake"
     if not snakemake_dir.exists():
-        _junction(engine_root, snakemake_dir)
+        try:
+            create_engine_alias(engine_root, snakemake_dir)
+        except OSError:
+            # Upstream may create a temporary real directory; it is removed below.
+            pass
 
     # TDEase writes long shell commands itself through the managed process
     # boundary; prevent the upstream helper from creating a branded breadcrumb.
     engine_shell.MAX_ARG_LEN = 2**31 - 1
 
-    original_output_settings = engine_cli.create_output_settings
-
-    def tdease_output_settings(args, log_handler_settings):
-        settings = original_output_settings(args, log_handler_settings)
-        settings.enable_file_logging = False
-        settings.skip_plugin_handlers = True
-        settings.nocolor = True
-        return settings
-
-    engine_cli.create_output_settings = tdease_output_settings
-    result = engine_cli.main()
-    return int(result or 0)
-
-
-def _junction(target: Path, link: Path) -> None:
-    """Create `link` as a directory junction (Windows) or symlink (POSIX) to
-    `target`. Raises OSError if unsupported/insufficient privileges — caller
-    decides whether to fall back to upstream's real .snakemake/ dir."""
-    if sys.platform == "win32":
-        # mklink /J — junction, no admin needed (unlike /D symlinks).
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            check=True, capture_output=True,
-        )
-    else:
-        os.symlink(str(target), str(link), target_is_directory=True)
+    output_settings = OutputSettings(
+        dryrun=request.mode == "dry-run",
+        printshellcmds=True,
+        nocolor=True,
+        skip_plugin_handlers=True,
+        enable_file_logging=False,
+    )
+    try:
+        with SnakemakeApi(output_settings) as api:
+            workflow = api.workflow(
+                resource_settings=ResourceSettings(cores=request.cores),
+                config_settings=ConfigSettings(config=request.config),
+                snakefile=snakefile,
+                workdir=root,
+            )
+            dag = workflow.dag(
+                DAGSettings(
+                    targets=frozenset(request.targets),
+                    forceall=request.rerun_mode == "overwrite",
+                    force_incomplete=request.rerun_incomplete,
+                )
+            )
+            dag.execute_workflow(
+                executor="dryrun" if request.mode == "dry-run" else "local",
+                execution_settings=ExecutionSettings(retries=request.retries),
+            )
+    except Exception as exc:
+        print(f"TDEase workflow engine failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        cleanup_engine_alias(root)
+    return 0
 
 
 if __name__ == "__main__":

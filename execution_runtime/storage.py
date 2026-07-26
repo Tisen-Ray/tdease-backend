@@ -67,6 +67,7 @@ class StorageLayout:
             self.data / "runs",
             self.cache,
             self.trash,
+            self.trash / "runs",
         ]:
             d.mkdir(parents=True, exist_ok=True)
 
@@ -279,6 +280,9 @@ class StorageLayout:
     def mark_cancelled(self, run_id: str) -> None:
         self.atomic_write(self.cancel_path(run_id), "")
 
+    def clear_cancelled(self, run_id: str) -> None:
+        self.cancel_path(run_id).unlink(missing_ok=True)
+
     def check_cancelled(self, run_id: str) -> bool:
         return self.cancel_path(run_id).exists()
 
@@ -467,6 +471,39 @@ class StorageLayout:
         dest = self.trash / f"{ts}_{path.name}"
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(dest))
+
+    def trash_run(self, run_id: str, metadata: dict[str, Any]) -> Path:
+        """Move one terminal Run to recoverable trash without adding a status."""
+        self._validate_run_id(run_id)
+        source = self.data / "runs" / run_id
+        destination = self.trash / "runs" / run_id
+        if not source.is_dir():
+            raise FileNotFoundError(run_id)
+        if destination.exists():
+            raise FileExistsError(f"trashed Run already exists: {run_id}")
+        self.atomic_write_json(source / ".tdease" / "trash.json", metadata)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        return destination
+
+    def restore_run(self, run_id: str) -> Path:
+        """Restore one trashed Run to the active runs directory."""
+        self._validate_run_id(run_id)
+        source = self.trash / "runs" / run_id
+        destination = self.data / "runs" / run_id
+        if not source.is_dir():
+            raise FileNotFoundError(run_id)
+        if destination.exists():
+            raise FileExistsError(f"active Run already exists: {run_id}")
+        shutil.move(str(source), str(destination))
+        (destination / ".tdease" / "trash.json").unlink(missing_ok=True)
+        return destination
+
+    def trashed_run_dirs(self) -> list[Path]:
+        root = self.trash / "runs"
+        if not root.is_dir():
+            return []
+        return sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name)
 
     # ── Result access ──
 

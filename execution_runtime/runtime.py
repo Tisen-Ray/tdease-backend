@@ -24,7 +24,8 @@ from typing import Any, Optional
 from src.contracts import RunCommit
 from src.execution_runtime.parser import parse_snakefile
 from src.execution_runtime.execution import execute_task
-from src.execution_runtime.profile_validator import validate_snakefile_profile
+from src.execution_runtime.engine_contract import WorkflowEngineRequest
+from src.execution_runtime.engine_layout import cleanup_engine_alias
 from src.execution_runtime.errors import (
     ExecutionError,
     invalid_workflow,
@@ -125,13 +126,6 @@ def preflight(commit: RunCommit) -> PreflightResult:
     if unsupported:
         errors.insert(0, f"unsupported directives: {', '.join(sorted(unsupported))}")
 
-    # ── Profile validation (§4.3): guarantee frontend DAG parity ──
-    profile = validate_snakefile_profile(commit.snakefile)
-    if not profile.valid:
-        errors.extend(profile.errors())
-    elif profile.rule_count > 0:
-        warnings.append(f"Profile valid: {profile.rule_count} rules, ~{profile.job_count} jobs")
-
     return PreflightResult(
         valid=len(errors) == 0,
         errors=errors,
@@ -142,7 +136,7 @@ def preflight(commit: RunCommit) -> PreflightResult:
     )
 
 
-def execute(commit: RunCommit) -> ExecutionResult:
+def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
     """
     执行 Run commit。
 
@@ -167,15 +161,30 @@ def execute(commit: RunCommit) -> ExecutionResult:
     total, succeeded, failed = 1, 0, 0
     run_dir = str(storage.resolve(run_id))
     snakefile_path = storage.resolve(run_id, "Snakefile")
-    command_parts = [sys.executable, "-m", "src.execution_runtime.engine_runner", "-s", str(snakefile_path),
-                     "--cores", str(commit.cores), "--rerun-incomplete", "--printshellcmds"]
-    command_parts.extend(commit.targets)
-    command = subprocess.list2cmdline(command_parts)
-    ok, ec, _elapsed, err_text = execute_task(
-        run_id=run_id, task_id="engine", step_label="Workflow engine",
-        command=command, cwd=run_dir, emitter=emitter,
-        timeout=7 * 24 * 60 * 60,
+    engine_request = WorkflowEngineRequest(
+        mode="execute",
+        snakefile=snakefile_path.relative_to(storage.resolve(run_id)).as_posix(),
+        config=commit.config,
+        cores=commit.cores,
+        targets=commit.targets,
+        rerun_mode=rerun_mode,
+        rerun_incomplete=True,
+        retries=0,
     )
+    storage.atomic_write_json(
+        storage.resolve(run_id, ".tdease", "engine-request.json"),
+        engine_request.model_dump(),
+    )
+    command_parts = [sys.executable, "-m", "src.execution_runtime.engine_runner"]
+    try:
+        ok, ec, _elapsed, err_text = execute_task(
+            run_id=run_id, task_id="engine", step_label="Workflow engine",
+            command=command_parts, cwd=run_dir, emitter=emitter,
+            display_command="TDEase Workflow Engine",
+            timeout=7 * 24 * 60 * 60,
+        )
+    finally:
+        cleanup_engine_alias(storage.resolve(run_id))
     if not ok and (err_text == "cancelled" or storage.check_cancelled(run_id)):
         emitter.run_cancelled(time.perf_counter() - start)
         return ExecutionResult(success=False, exit_code=ec, error=cancelled(run_id),

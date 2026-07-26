@@ -52,6 +52,7 @@ class EventType(str, Enum):
     RUN_SUCCEEDED = "run.succeeded"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
+    RUN_ACTION = "run.action"
 
     # Task 级产品事件
     TASK_STARTED = "task.started"

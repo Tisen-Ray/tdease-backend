@@ -9,7 +9,7 @@ workspace 状态锁定、Snakefile、配置、packages、节点映射。
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -119,6 +119,44 @@ class RunCreateRequest(BaseModel):
     commit: RunCommit
 
 
+class RunDryRunRequest(BaseModel):
+    commit: RunCommit
+    inline_blobs: dict[str, str] = Field(default_factory=dict)
+
+
+class RunDryRunResponse(BaseModel):
+    valid: bool
+    exit_code: int
+    engine: Literal["tdease-workflow"] = "tdease-workflow"
+    output: str
+
+
+class RunRerunRequest(BaseModel):
+    mode: Literal["resume", "overwrite"] = "resume"
+
+
+class RunActionResponse(BaseModel):
+    run_id: str
+    status: RunStatus
+    action: Literal["cancel", "rerun"]
+    accepted: bool = True
+    mode: Optional[Literal["resume", "overwrite"]] = None
+
+
+class RunTrashEntry(BaseModel):
+    run_id: str
+    name: str = ""
+    workspace_id: str
+    previous_status: RunStatus
+    deleted_at: datetime
+    deleted_by: str
+
+
+class RunTrashListResponse(BaseModel):
+    runs: list[RunTrashEntry]
+    total: int
+
+
 class RunStatusResponse(BaseModel):
     """
     Run 状态查询响应 — 从 run.json + events.jsonl 衍生的投影。
@@ -126,6 +164,7 @@ class RunStatusResponse(BaseModel):
     """
 
     run_id: str
+    name: str = ""
     workspace_id: str
     status: RunStatus
     mode: str
@@ -133,6 +172,9 @@ class RunStatusResponse(BaseModel):
     pid: Optional[int] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    rerun_mode: Literal["resume", "overwrite"] = "resume"
+    labels: dict[str, str] = Field(default_factory=dict)
+    result_file_count: int = 0
     created_at: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -149,3 +191,8 @@ class RunListResponse(BaseModel):
     total: int
     offset: int
     limit: int
+    has_more: bool = False
+
+
+class RunCreateResponse(RunStatusResponse):
+    idempotent: bool = False

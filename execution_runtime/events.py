@@ -53,6 +53,14 @@ class EventEmitter:
         return self._emit(EventType.RUN_CANCELLED, "Run cancelled", "info",
             {"run_time_seconds": run_time_seconds})
 
+    def run_action(self, action: str, actor: str, **data: Any) -> int:
+        return self._emit(
+            EventType.RUN_ACTION,
+            f"Run action: {action}",
+            "info",
+            {"action": action, "actor": actor, **data},
+        )
+
     # ── Task events ──
 
     def task_started(self, task_id: str, step: str, command: str = "") -> int:
