@@ -44,7 +44,11 @@ from src.contracts import (
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.storage import get_storage
-from src.services.node_catalog import materialize_bindings, resolve_bindings
+from src.services.node_catalog import (
+    materialize_bindings,
+    resolve_bindings,
+    validate_config_choices,
+)
 
 # Reuses the Backend's own startup-resolved capability document (frozen at import
 # time in app/api/capabilities.py) to select a materialization strategy instead of
@@ -113,6 +117,37 @@ def _select_materialization_strategy(commit) -> str:
             retryable=False,
         )
     return requested
+
+
+def _reject_unknown_enum_params(commit, resolved_nodes) -> None:
+    """Reject a submitted parameter value outside a bound Node's declared `choices`
+    before the value can reach the binary (docs/paper/ITERATION.md 11.1). TopPIC's
+    `-R proteoform_type=TERMIN` is the motivating case: the binary accepts an unknown
+    enum silently, matches nothing, and exits 0, so an empty proteoform table is
+    reported as a SUCCEEDED Run. A distinguishable 422 at the door replaces that
+    silent empty success -- the guiding principle of EVIDENCE-AND-KNOWLEDGE.md 2.6.
+
+    Raises RUN_PARAM_INVALID (422). Applied at both create and dry-run so a plan that
+    would be rejected on submit is never reported valid by a preflight.
+    """
+    violations = validate_config_choices(commit.config, resolved_nodes)
+    if not violations:
+        return
+    summary = "; ".join(
+        f"{v['node']}.{'.'.join(v['config_path'])}={v['submitted']!r} "
+        f"(invalid: {v['invalid']}; allowed: {v['choices']})"
+        for v in violations
+    )
+    raise TDEaseError(
+        code=ErrorCode.RUN_PARAM_INVALID,
+        message=f"Run parameter value(s) outside the Node's declared choices: {summary}",
+        remedy=(
+            "Set each listed parameter to one of the allowed choices (a comma-separated "
+            "subset is allowed where the Node declares a list) and resubmit."
+        ),
+        retryable=False,
+        details={"violations": violations},
+    )
 
 
 def _is_owner(data: dict, request: Request) -> bool:
@@ -245,6 +280,7 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
             remedy="Correct the node bindings on the commit, or install the missing node package.",
             retryable=False,
         ) from exc
+    _reject_unknown_enum_params(commit, resolved_nodes)
     with storage.temp_dir("dry-run", commit.run_id) as root:
         materialize_bindings(root, resolved_nodes, storage.atomic_write)
         if strategy == LOCAL_WORKSPACE_HARDLINK:
@@ -390,6 +426,11 @@ async def create_run(body: RunCreateRequest, request: Request):
     commit = commit.model_copy(update={"materialization_strategy": strategy})
     try:
         resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        # Reject an unknown enum value before any filesystem materialization and
+        # before the Run is ever queued -- a TDEaseError (422) here is not caught by
+        # the (FileNotFoundError, ValueError) handler below, so it surfaces as the
+        # structured RUN_PARAM_INVALID envelope rather than a generic RUN_PLAN_INVALID.
+        _reject_unknown_enum_params(commit, resolved_nodes)
         if strategy == LOCAL_WORKSPACE_HARDLINK:
             if not commit.local_workspace_root:
                 raise ValueError("local_workspace_root is required for the local_workspace_hardlink strategy")
@@ -676,19 +717,43 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned
             retryable=False,
         )
     resolved_root = root.resolve()
+    storage = get_storage()
     files = []
-    for path in sorted(root.glob(pattern)):
-        if not path.is_file():
-            continue
-        resolved = path.resolve(strict=False)
+    seen: set[str] = set()
+
+    def add(resolved: Path) -> None:
         try:
             rel = resolved.relative_to(resolved_root).as_posix()
         except ValueError:
+            return
+        if rel.startswith((".runtime/", ".tdease/", ".snakemake/")) or rel in seen:
+            return
+        seen.add(rel)
+        files.append({"path": rel, "size": resolved.stat().st_size, "sha256": storage.file_digest(resolved)})
+
+    for path in sorted(root.glob(pattern)):
+        if not path.is_file():
             continue
-        if rel.startswith((".runtime/", ".tdease/", ".snakemake/")):
-            continue
-        digest = get_storage().file_digest(resolved)
-        files.append({"path": rel, "size": resolved.stat().st_size, "sha256": digest})
+        add(path.resolve(strict=False))
+
+    # A flat-layout template names its outputs in `rule all`, at the run root rather
+    # than under results/. The default discovery pattern would then report files:[]
+    # for a run whose declared outputs all sit at the root -- a SUCCEEDED run
+    # indistinguishable from one that produced nothing (docs/paper/ITERATION.md 11.9;
+    # EVIDENCE-AND-KNOWLEDGE.md 2.6). Only under the default pattern (an explicit
+    # caller pattern is honoured verbatim), also surface the declared outputs that
+    # actually materialized so the default view is never silently empty over real
+    # products.
+    if pattern == "results/**":
+        for rel in storage.declared_output_files(run_id):
+            try:
+                declared = _run_file(run_id, rel)
+            except TDEaseError:
+                continue  # a declared path that will not resolve is simply not listed
+            if declared.is_file():
+                add(declared.resolve(strict=False))
+
+    files.sort(key=lambda entry: entry["path"])
     return {"run_id": run_id, "files": files}
 
 
