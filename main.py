@@ -20,7 +20,7 @@ import sys
 import uuid
 from time import perf_counter
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -54,6 +54,7 @@ from app.api.workflow_templates import router as workflow_templates_router
 from app.api.uploads import router as uploads_router
 from app.api.nodes import router as nodes_router
 from app.api.templates import router as templates_router
+from app.core.auth import authenticate_request, router as auth_router
 
 # ---------------------------------------------------------------------------
 # 生命周期
@@ -125,6 +126,19 @@ async def security_headers(request: Request, call_next):
 
 
 @app.middleware("http")
+async def desktop_auth(request: Request, call_next):
+    try:
+        request.state.principal = await authenticate_request(request)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def request_log(request: Request, call_next):
     rid = uuid.uuid4().hex[:12]
     start = perf_counter()
@@ -141,6 +155,7 @@ app.include_router(workflow_templates_router)
 app.include_router(uploads_router)
 app.include_router(nodes_router)
 app.include_router(templates_router)
+app.include_router(auth_router)
 
 
 @app.get("/")
