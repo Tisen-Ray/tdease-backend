@@ -43,7 +43,9 @@ from src.contracts import (
     run_idempotency_conflict,
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
+from src.execution_runtime.errors import ExecutionError
 from src.execution_runtime.storage import get_storage, get_tools_root
+from src.execution_runtime.workspace_containment import validate_root_containment
 from src.services.node_catalog import (
     materialize_bindings,
     resolve_bindings,
@@ -61,6 +63,16 @@ router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
 
 LOCAL_WORKSPACE_HARDLINK = "local_workspace_hardlink"
 BLOB_STORE = "blob_store"
+
+
+def _workspace_execution_error(exc: ExecutionError) -> TDEaseError:
+    return TDEaseError(
+        code=ErrorCode(exc.code.value),
+        message=exc.message,
+        remedy="Reattach the Workspace so the Client registers its root with this Backend, then retry.",
+        retryable=False,
+        details=exc.details,
+    )
 
 
 async def _reject_legacy_mode_field(request: Request) -> None:
@@ -260,7 +272,7 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
 async def dry_run(payload: RunDryRunRequest, request: Request):
     """Validate an immutable client snapshot with the real workflow engine."""
     await _reject_legacy_mode_field(request)
-    commit = payload.commit
+    commit = payload.commit.model_copy(update={"user_id": request.state.principal.user_id})
     inline_blobs = payload.inline_blobs
     storage = get_storage()
     if not commit.workspace_files:
@@ -282,7 +294,6 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
         ) from exc
     _reject_unknown_enum_params(commit, resolved_nodes)
     with storage.temp_dir("dry-run", commit.run_id) as root:
-        materialize_bindings(root, resolved_nodes, storage.atomic_write)
         if strategy == LOCAL_WORKSPACE_HARDLINK:
             if not commit.local_workspace_root:
                 raise TDEaseError(
@@ -291,7 +302,10 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
                     remedy="Submit local_workspace_root, or resubmit a commit shaped for the blob_store strategy.",
                     retryable=False,
                 )
-            workspace = Path(commit.local_workspace_root).resolve()
+            try:
+                workspace = validate_root_containment(commit.local_workspace_root, commit.user_id)
+            except ExecutionError as exc:
+                raise _workspace_execution_error(exc) from exc
             for entry in commit.workspace_files:
                 source = (workspace / entry.path).resolve(strict=True)
                 try:
@@ -359,17 +373,27 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
                             retryable=False,
                         )
                 storage.atomic_write(target, content)
-        snake = next((entry.path for entry in commit.workspace_files if entry.path in {"Snakefile", "workflow.smk"}), None)
-        if snake is None:
+        snake_entry = next((entry for entry in commit.workspace_files if entry.path == "Snakefile"), None)
+        if snake_entry is None:
             raise TDEaseError(
                 code=ErrorCode.RUN_PLAN_INVALID,
-                message="The workspace mapping contains no Snakefile or workflow.smk.",
-                remedy="Include a Snakefile (or workflow.smk) in workspace_files.",
+                message="The Run mapping does not contain its root Snakefile.",
+                remedy="Create or complete runs/<run>/Snakefile, then prepare the Run again.",
                 retryable=False,
             )
+        snake_target = (root / snake_entry.path).resolve()
+        snake_text = snake_target.read_text(encoding="utf-8")
+        if commit.snakefile != snake_text:
+            raise TDEaseError(
+                code=ErrorCode.RUN_PLAN_STALE,
+                message="The commit embedded snakefile differs from the mapped Run file.",
+                remedy="Refreeze the Run so both Snakefile views agree, then retry dry-run.",
+                retryable=False,
+            )
+        materialize_bindings(root, resolved_nodes, storage.atomic_write)
         engine_request = WorkflowEngineRequest(
             mode="dry-run",
-            snakefile=snake,
+            snakefile="Snakefile",
             config=commit.config,
             cores=commit.cores,
             targets=commit.targets,
@@ -449,7 +473,8 @@ async def create_run(body: RunCreateRequest, request: Request):
             if commit.local_workspace_root:
                 raise ValueError("local_workspace_root is forbidden for the blob_store strategy")
             storage.materialize_run_files(commit.run_id, commit.workspace_files)
-        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_write)
+    except ExecutionError as exc:
+        raise _workspace_execution_error(exc) from exc
     except (FileNotFoundError, ValueError) as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
@@ -458,27 +483,32 @@ async def create_run(body: RunCreateRequest, request: Request):
             retryable=False,
         ) from exc
 
-    snake_entry = next((item for item in commit.workspace_files if item.path in {"Snakefile", "workflow.smk"}), None)
-    if snake_entry is None:
+    try:
+        snake_entry = next((item for item in commit.workspace_files if item.path == "Snakefile"), None)
+        if snake_entry is None:
+            raise ValueError("The Run mapping does not contain its root Snakefile")
+        snake_text = storage.resolve(commit.run_id, "Snakefile").read_text(encoding="utf-8")
+        if commit.snakefile and commit.snakefile != snake_text:
+            raise TDEaseError(
+                code=ErrorCode.RUN_PLAN_STALE,
+                message="The commit embedded Snakefile differs from the mapped Run file.",
+                remedy="Prepare the Run again so both Snakefile views agree, then resubmit.",
+                retryable=False,
+            )
+        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_write)
+    except TDEaseError:
+        raise
+    except (FileNotFoundError, ValueError) as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
-            message="The workspace mapping contains no Snakefile or workflow.smk.",
-            remedy="Include a Snakefile (or workflow.smk) in workspace_files.",
+            message=f"The Run workflow could not be prepared: {exc}",
+            remedy="Create or complete runs/<run>/Snakefile, then prepare the Run again.",
             retryable=False,
-        )
-    snake_text = storage.resolve(commit.run_id, snake_entry.path).read_text(encoding="utf-8")
-    if commit.snakefile and commit.snakefile != snake_text:
-        raise TDEaseError(
-            code=ErrorCode.RUN_PLAN_STALE,
-            message="The commit embedded snakefile differs from the mapped Workspace file.",
-            remedy="Refreeze the Workspace so both views agree, then resubmit the commit.",
-            retryable=False,
-        )
+        ) from exc
 
     # Atomically write run.json (status QUEUED)
     run_data = commit.model_dump()
     run_data["snakefile"] = snake_text
-    run_data["snakefile_path"] = snake_entry.path
     run_data["status"] = "QUEUED"
     run_data["rerun_mode"] = "resume"
     storage.atomic_write_json(run_json, run_data)

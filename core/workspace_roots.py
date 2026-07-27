@@ -40,11 +40,12 @@ Decisions stated here, not left implicit:
   case-preserving), but the stored/displayed path keeps the resolved casing so
   registration output stays readable; only the *comparison key* is case-folded.
 
-Storage is process-lifetime and in-memory. Electron re-registers the root on every
-Desktop launch (`DESKTOP-FIRST-DEPLOYMENT.md` section 5 step 2), so no on-disk
-persistence is required for the current single-process Desktop release; a future
-Server would replace this in-memory dict with a per-tenant persistent store without
-changing the public interface below.
+Storage is process-lifetime and in-memory. The Client registers known roots after a
+Desktop Backend launch and idempotently re-registers the active root before every
+local dry-run or submit, so a Backend reload cannot strand an open Workspace. No
+on-disk Backend copy is required for the current single-process Desktop release; a
+future Server would replace this in-memory dict with a per-tenant persistent store
+without changing the public interface below.
 """
 
 from __future__ import annotations
