@@ -13,9 +13,14 @@ from typing import Any
 from src.contracts.enums import ErrorCode
 
 
-@dataclass(frozen=True)
+@dataclass
 class ExecutionError(Exception):
-    """Execution Runtime 错误基类 — 直接映射到 TDEase ErrorCode。"""
+    """Execution Runtime 错误基类 — 直接映射到 TDEase ErrorCode。
+
+    Exceptions cannot be frozen: Python and ASGI middleware assign traceback
+    metadata while propagating them. A frozen dataclass turns that normal
+    operation into FrozenInstanceError and masks the actual failure.
+    """
 
     code: ErrorCode
     message: str

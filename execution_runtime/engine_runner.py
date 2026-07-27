@@ -16,6 +16,7 @@ Internalization of Snakemake's `.snakemake/` directory:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from src.execution_runtime.engine_layout import (
     create_engine_alias,
     prepare_engine_layout,
 )
+from src.execution_runtime.storage import get_tools_root
 
 
 ENGINE_REQUEST = Path(".tdease") / "engine-request.json"
@@ -64,6 +66,12 @@ def main() -> int:
     if not snakefile.is_file():
         print(f"Engine Snakefile not found: {snakefile}", file=sys.stderr)
         return 2
+
+    # Rules are copied into the isolated Run, but executables and other runtime
+    # assets remain Backend-managed Node packages. Every engine process receives
+    # the same resolved Backend root in Desktop and Server deployments.
+    tools_root = get_tools_root().resolve()
+    os.environ["TDEASE_TOOLS_ROOT"] = str(tools_root)
 
     # One hidden dir to rule them all: .tdease/engine/ holds everything
     # upstream would have put under .snakemake/.

@@ -24,10 +24,11 @@ P2 fixes:
 - append_runtime_record / append_task_output: deep log operations
 
 CORE-ARCHITECTURE.md Sec 1.4:
-- run.json "status" field is a projection, derived from events.jsonl by
+- run.json lifecycle fields are projections, derived from events.jsonl by
   src.execution_runtime.run_projector.project_run through
-  sync_run_projection -- the only place this module writes that field.
-  Nothing else may write "status" independently; run_worker.py and
+  sync_run_projection -- the only place this module writes terminal status,
+  exit_code, error, and finished_at. Nothing else may write terminal lifecycle
+  state independently; run_worker.py and
   reconcile_orphaned_runs below both go through it now.
 """
 
@@ -46,6 +47,42 @@ from typing import Any, Iterator, Optional
 from src.execution_runtime.run_projector import RunProjection, project_run
 
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+_TERMINAL_EVENT_BY_STATUS = {
+    "SUCCEEDED": "run.succeeded",
+    "FAILED": "run.failed",
+    "CANCELLED": "run.cancelled",
+}
+
+
+def _project_lifecycle_metadata(events: list[dict[str, Any]], status: object) -> dict[str, Any]:
+    """Project public lifecycle metadata from the same event prefix as status."""
+    status_text = str(status) if status is not None else ""
+    if status_text == "QUEUED":
+        return {"started_at": None, "finished_at": None, "exit_code": None, "error": None}
+
+    started = next((event for event in reversed(events) if event.get("type") == "run.started"), None)
+    projected = {
+        "started_at": started.get("timestamp") if started else None,
+        "finished_at": None,
+        "exit_code": None,
+        "error": None,
+    }
+    terminal_type = _TERMINAL_EVENT_BY_STATUS.get(status_text)
+    if terminal_type is None:
+        return projected
+
+    terminal = next((event for event in reversed(events) if event.get("type") == terminal_type), None)
+    if terminal is None:
+        return projected
+    data = terminal.get("data") if isinstance(terminal.get("data"), dict) else {}
+    projected["finished_at"] = terminal.get("timestamp")
+    if status_text == "SUCCEEDED":
+        projected["exit_code"] = 0
+    elif status_text == "FAILED":
+        projected["exit_code"] = data.get("exit_code")
+        projected["error"] = data.get("error_message") or terminal.get("message")
+    return projected
 
 
 class StorageLayout:
@@ -284,7 +321,7 @@ class StorageLayout:
         return len(raw) - len(repaired)
 
     def sync_run_projection(self, run_id: str, *, claim_held: bool = True) -> RunProjection:
-        """Recompute run.json "status" from events.jsonl.
+        """Recompute run.json lifecycle fields from events.jsonl.
 
         The only place run.json "status" field is written
         (CORE-ARCHITECTURE.md Sec 1.4): a pure projection of the event log,
@@ -292,9 +329,10 @@ class StorageLayout:
         reconcile_orphaned_runs) call this after appending or observing
         events instead of computing/writing a status themselves. Preserves
         every other field already in run.json (commit data, pid
-        bookkeeping); only "status" and "projected_at_seq" are touched, and
-        "status" is left alone when there are no events yet (nothing to
-        project -- run.json may still hold its just-created QUEUED write).
+        bookkeeping). Status, timestamps, exit code, and error are disposable
+        projections of lifecycle events; commit data remains untouched. Status
+        is left alone when there are no events yet (run.json may still hold its
+        just-created QUEUED write), while stale terminal metadata is cleared.
 
         `claim_held` (default True, matching every existing caller except
         one) distinguishes a resync driven by a Run whose claim this
@@ -334,6 +372,7 @@ class StorageLayout:
         )
         if projection.status is not None and not pending_requeue_not_yet_claimed:
             updated["status"] = projection.status
+        updated.update(_project_lifecycle_metadata(events, updated.get("status")))
         updated["projected_at_seq"] = projection.projected_at_seq
         self.atomic_write_json(run_json, updated)
         return projection

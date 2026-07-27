@@ -154,16 +154,17 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
 
     start = time.perf_counter()
     emitter.run_started(pid=os.getpid(), worker_id=platform.node())
-    storage.atomic_write(storage.resolve(run_id, "Snakefile"), commit.snakefile)
+    snakefile_path = storage.resolve(run_id, "Snakefile")
+    storage.atomic_write(snakefile_path, commit.snakefile)
 
     # Snakemake is the DAG/runtime authority. TDEase supervises one process;
     # it must not reinterpret the Snakefile or execute rules itself.
     total, succeeded, failed = 1, 0, 0
-    run_dir = str(storage.resolve(run_id))
-    snakefile_path = storage.resolve(run_id, "Snakefile")
+    execution_root = storage.resolve(run_id)
+    run_dir = str(execution_root)
     engine_request = WorkflowEngineRequest(
         mode="execute",
-        snakefile=snakefile_path.relative_to(storage.resolve(run_id)).as_posix(),
+        snakefile="Snakefile",
         config=commit.config,
         cores=commit.cores,
         targets=commit.targets,
@@ -172,7 +173,7 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
         retries=0,
     )
     storage.atomic_write_json(
-        storage.resolve(run_id, ".tdease", "engine-request.json"),
+        execution_root / ".tdease" / "engine-request.json",
         engine_request.model_dump(),
     )
     command_parts = [sys.executable, "-m", "src.execution_runtime.engine_runner"]
@@ -184,7 +185,7 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
             timeout=7 * 24 * 60 * 60,
         )
     finally:
-        cleanup_engine_alias(storage.resolve(run_id))
+        cleanup_engine_alias(execution_root)
     if not ok and (err_text == "cancelled" or storage.check_cancelled(run_id)):
         emitter.run_cancelled(time.perf_counter() - start)
         return ExecutionResult(success=False, exit_code=ec, error=cancelled(run_id),
