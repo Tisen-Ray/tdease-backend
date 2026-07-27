@@ -1,11 +1,8 @@
-"""Process-local authentication for the bundled Desktop backend.
+"""Authentication boundary for local and remote Backend deployments.
 
-Fails closed by construction (REMAINING-DESIGNS.md 0.1): there is no code path in
-which a request is treated as `local-owner` without a validated Bearer token. If no
-bootstrap secret was supplied at startup, no token can ever be minted and every
-protected request is rejected for the remaining life of the process -- silently
-granting access was the defect being fixed here, so there is deliberately no
-"convenience" branch that skips validation.
+Local Desktop and development Backends are loopback services owned by the current
+user. They use the local-owner principal directly. A remote Server must opt into
+Bearer authentication explicitly with ``TDEASE_AUTH_MODE=bearer``.
 """
 
 from __future__ import annotations
@@ -74,10 +71,10 @@ class DesktopAuth:
     was ever configured.
     """
 
-    def __init__(self, bootstrap_secret: str | None) -> None:
+    def __init__(self, bootstrap_secret: str | None, *, required: bool = True) -> None:
         self._bootstrap_secret = bootstrap_secret or None
         self._token: str | None = None
-        if not self._bootstrap_secret:
+        if required and not self._bootstrap_secret:
             # DESKTOP-FIRST-DEPLOYMENT.md section 7: "Backend ... requires the
             # bootstrap token." A missing secret is a startup-time configuration
             # error, not a state that implicitly grants access. We log it loudly
@@ -162,7 +159,13 @@ class DesktopAuth:
         return LOCAL_OWNER
 
 
-desktop_auth = DesktopAuth(os.environ.pop("TDEASE_BOOTSTRAP_SECRET", None))
+AUTH_MODE = os.environ.get("TDEASE_AUTH_MODE", "local").strip().lower()
+if AUTH_MODE not in {"local", "bearer"}:
+    raise RuntimeError("TDEASE_AUTH_MODE must be 'local' or 'bearer'")
+desktop_auth = DesktopAuth(
+    os.environ.pop("TDEASE_BOOTSTRAP_SECRET", None),
+    required=AUTH_MODE == "bearer",
+)
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
@@ -203,6 +206,8 @@ PUBLIC_PATHS = frozenset({
 
 
 async def authenticate_request(request: Request) -> Principal:
+    if AUTH_MODE == "local":
+        return LOCAL_OWNER
     # A CORS preflight is never authenticated: the browser sends OPTIONS with
     # no Authorization header by specification, and refuses to send the real
     # request until it is answered. Because `desktop_auth` is registered after

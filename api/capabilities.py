@@ -36,7 +36,7 @@ MaterializationStrategy = Literal["local_workspace_hardlink", "blob_store"]
 class AuthCapability(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    scheme: Literal["bearer"]
+    scheme: Literal["none", "bearer"]
     bootstrap: Literal["desktop"] | None
 
 
@@ -153,9 +153,13 @@ def _has_native_dry_run_projection() -> bool:
 
 
 def _build_capabilities() -> CapabilitiesResponse:
+    auth_mode = os.environ.get("TDEASE_AUTH_MODE", "local").strip().lower()
     return CapabilitiesResponse(
         protocol_version=PROTOCOL_VERSION,
-        auth=AuthCapability(scheme="bearer", bootstrap="desktop"),
+        auth=AuthCapability(
+            scheme="bearer" if auth_mode == "bearer" else "none",
+            bootstrap="desktop" if auth_mode == "bearer" else None,
+        ),
         materialization=MaterializationCapability(
             strategies=_resolve_materialization_strategies(),
         ),
