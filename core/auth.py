@@ -203,6 +203,20 @@ PUBLIC_PATHS = frozenset({
 
 
 async def authenticate_request(request: Request) -> Principal:
+    # A CORS preflight is never authenticated: the browser sends OPTIONS with
+    # no Authorization header by specification, and refuses to send the real
+    # request until it is answered. Because `desktop_auth` is registered after
+    # CORSMiddleware -- and Starlette runs middleware outermost-last-added --
+    # auth saw the preflight first and rejected it with 401, so CORSMiddleware
+    # never got to answer it. The browser then reported "blocked by CORS
+    # policy: no Access-Control-Allow-Origin header", naming a cause that was
+    # not the problem, and EVERY authenticated call from the Client failed:
+    # attaching the Authorization header is itself what triggers the preflight.
+    #
+    # Letting OPTIONS through grants nothing. A preflight returns only CORS
+    # headers; it never reaches a route handler, so no data can leave here.
+    if request.method == "OPTIONS":
+        return LOCAL_OWNER
     if request.url.path in PUBLIC_PATHS:
         return LOCAL_OWNER
     return desktop_auth.authenticate(request.headers.get("Authorization"))
