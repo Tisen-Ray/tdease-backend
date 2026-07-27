@@ -32,7 +32,7 @@ from src.execution_runtime.storage import StorageLayout
 
 
 def _data_root() -> Path:
-    # Single entry point get_storage() -- avoids scattered os.environ.get(..., "server-data").
+    # Single entry point get_storage() -- keeps runtime-root resolution centralized.
     return get_storage().data
 
 

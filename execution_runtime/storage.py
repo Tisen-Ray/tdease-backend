@@ -780,45 +780,65 @@ _storage: Optional[StorageLayout] = None
 
 
 def get_storage() -> StorageLayout:
-    """The single backend data-root resolution entry point.
+    """Return the single resolved Backend runtime root.
 
-    Priority: TDEASE_DATA_ROOT env var > "server-data" literal (manual
-    backend-dev fallback only). Desktop app has Electron backend_manager.cjs
-    inject <dataRoot>/backend/; tests inject a temp dir via conftest/fixture.
-    No other module may independently read TDEASE_DATA_ROOT -- always go
-    through this function.
+    An explicit ``TDEASE_DATA_ROOT`` is an installation/deployment override.
+    Without it, resolve from the running Backend package or repository layout;
+    there is no process-cwd-dependent ``server-data`` default.
     """
     global _storage
     if _storage is None:
-        _storage = StorageLayout(os.environ.get("TDEASE_DATA_ROOT", "server-data"))
+        _storage = StorageLayout(_resolve_backend_root())
     return _storage
+
+
+def _resolve_backend_root() -> Path:
+    configured = os.environ.get("TDEASE_DATA_ROOT")
+    if configured and configured.strip():
+        return Path(configured).expanduser().resolve()
+
+    # Installed layout: <resources>/backend/src/execution_runtime/storage.py.
+    module_backend = Path(__file__).resolve().parents[2]
+    if (module_backend / "pyproject.toml").is_file() and (module_backend / "nodes").is_dir():
+        return module_backend
+
+    # Repository layout: <repo>/data/backend/ is the Backend runtime root.
+    repo_root = Path(__file__).resolve().parents[2]
+    repo_backend = repo_root / "data" / "backend"
+    if (repo_backend / "nodes").is_dir() or (repo_backend / "pyproject.toml").is_file():
+        return repo_backend
+
+    # A relocatable source checkout may not have runtime assets materialized yet.
+    # Keep the root beside the Backend package so bootstrap can create it.
+    return module_backend
 
 
 def get_system_root() -> Path:
     """System asset root directory.
 
-    TDEASE_SYSTEM_ROOT env var is injected by Electron backend_manager.cjs
-    as <dataRoot>/system/. Manual backend dev (no Electron) falls back to
-    the repo data/system/.
+    TDEASE_SYSTEM_ROOT is an optional deployment override. Otherwise the
+    installed sibling or repository system asset root is used.
     """
     from pathlib import Path as _Path
-    return _Path(os.environ.get(
-        "TDEASE_SYSTEM_ROOT",
-        str(_Path(__file__).resolve().parent.parent.parent / "data" / "system")
-    ))
+    configured = os.environ.get("TDEASE_SYSTEM_ROOT")
+    if configured and configured.strip():
+        return _Path(configured).expanduser().resolve()
+    backend_root = get_storage().data
+    sibling = backend_root.parent / "system"
+    if sibling.is_dir():
+        return sibling
+    return _Path(__file__).resolve().parents[2] / "data" / "system"
 
 
 def get_tools_root() -> Path:
     """Compute tools root directory (topfd/toppic/msconvert etc local executables).
 
-    TDEASE_TOOLS_ROOT env var is injected by Electron backend_manager.cjs
-    as <dataRoot>/backend/nodes/.
+    Node packages are part of the resolved Backend deployment and live at its
+    sibling ``nodes/`` directory. There is one path calculation for execution
+    and enumeration; no separate tools-root deployment variable is required.
     """
     from pathlib import Path as _Path
-    return _Path(os.environ.get(
-        "TDEASE_TOOLS_ROOT",
-        str(get_storage().data / "nodes"),
-    ))
+    return get_storage().data / "nodes"
 
 
 def set_storage(s: StorageLayout) -> None:
