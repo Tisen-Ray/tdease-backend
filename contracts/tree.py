@@ -9,7 +9,7 @@ Blob 是内容寻址的字节，Tree manifest 是 path→blob 的映射。
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -65,7 +65,7 @@ class TreeManifest(BaseModel):
     )
     workspace_id: str = Field(description="所属 workspace")
     created_at: datetime = Field(
-        default_factory=lambda: datetime.utcnow(),
+        default_factory=lambda: datetime.now(UTC),
     )
     entries: list[TreeEntry] = Field(
         description="排序后的条目列表",

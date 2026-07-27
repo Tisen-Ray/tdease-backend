@@ -9,6 +9,14 @@ from typing import Any
 import yaml
 
 
+_TEXT_ASSET_ROOTS = ("scripts/", "views/")
+_TEXT_ASSET_FILES = {"Snakefile", "config.yaml", "workflow.json"}
+
+
+def _is_projected_asset(relative: str) -> bool:
+    return relative in _TEXT_ASSET_FILES or relative.startswith(_TEXT_ASSET_ROOTS)
+
+
 def project_template(root: Path) -> dict[str, Any]:
     # Manifest: template.json preferred (JSON-first), template.yaml accepted for compat.
     json_manifest = root / "template.json"
@@ -34,7 +42,7 @@ def project_template(root: Path) -> dict[str, Any]:
         content = path.read_bytes()
         digest.update(relative.encode("utf-8"))
         digest.update(content)
-        if relative == "Snakefile" or relative == "config.yaml" or relative.startswith("scripts/"):
+        if _is_projected_asset(relative):
             files[relative] = content.decode("utf-8")
     return {
         "id": template_id,
@@ -42,6 +50,7 @@ def project_template(root: Path) -> dict[str, Any]:
         "name": str(manifest.get("name", template_id)),
         "description": str(manifest.get("description", "")),
         "nodes": manifest.get("nodes", []),
+        "entrypoints": manifest.get("entrypoints", {}),
         "digest": digest.hexdigest(),
         "files": files,
         "readme": (root / "README.md").read_text(encoding="utf-8") if (root / "README.md").is_file() else "",

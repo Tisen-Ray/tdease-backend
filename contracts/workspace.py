@@ -7,7 +7,7 @@ workspace_id 不变，attach 时按 workspace.json 恢复。
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -37,7 +37,7 @@ class WorkspaceIdentity(BaseModel):
         description="所有者 user_id",
     )
     created_at: datetime = Field(
-        default_factory=lambda: datetime.utcnow(),
+        default_factory=lambda: datetime.now(UTC),
         description="创建时间（UTC）",
     )
     description: str = Field(
@@ -59,7 +59,7 @@ class WorkspaceRegistration(BaseModel):
     local_path: str = Field(description="本地绝对路径（仅用户端存储）")
     name: str = Field(description="快照名称，与 workspace.json 同步")
     last_seen: datetime = Field(
-        default_factory=lambda: datetime.utcnow(),
+        default_factory=lambda: datetime.now(UTC),
         description="最后一次 attach 时间",
     )
     server_url: Optional[str] = Field(
