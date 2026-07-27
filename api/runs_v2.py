@@ -43,7 +43,7 @@ from src.contracts import (
     run_idempotency_conflict,
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
-from src.execution_runtime.storage import get_storage
+from src.execution_runtime.storage import get_storage, get_tools_root
 from src.services.node_catalog import (
     materialize_bindings,
     resolve_bindings,
@@ -272,7 +272,7 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
         )
     strategy = _select_materialization_strategy(commit)
     try:
-        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(get_tools_root(), commit.nodes)
     except ValueError as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
@@ -425,7 +425,7 @@ async def create_run(body: RunCreateRequest, request: Request):
     strategy = _select_materialization_strategy(commit)
     commit = commit.model_copy(update={"materialization_strategy": strategy})
     try:
-        resolved_nodes = resolve_bindings(storage.data / "nodes", commit.nodes)
+        resolved_nodes = resolve_bindings(get_tools_root(), commit.nodes)
         # Reject an unknown enum value before any filesystem materialization and
         # before the Run is ever queued -- a TDEaseError (422) here is not caught by
         # the (FileNotFoundError, ValueError) handler below, so it surfaces as the

@@ -11,7 +11,7 @@ router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 @router.get("")
 async def list_nodes():
     # Resolve the tools root per request (never frozen at import) so the catalog
-    # reflects the current TDEASE_TOOLS_ROOT, and a missing/unreadable root is
+    # reflects the resolved Backend nodes directory, and a missing/unreadable root is
     # reported in `errors` rather than masquerading as a healthy empty catalog.
     nodes, errors = scan_node_catalog(get_tools_root())
     public = [{key: value for key, value in node.items() if key != "package_dir"} for node in nodes]

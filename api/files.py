@@ -12,7 +12,7 @@ SQLite database, and the CAS blob store (runs/, database/, store/, blobs/,
 general-purpose, unauthenticated-per-Run endpoint at all -- it carries no
 run_id/principal context to enforce ownership with, so those paths are
 served exclusively through app/api/runs_v2.py's ownership-gated routes
-instead. Writes additionally reject nodes/ (TDEASE_TOOLS_ROOT): its
+instead. Writes additionally reject the Backend nodes/ directory: its
 rules.smk files are executed as Python by Snakemake, so an unrestricted
 write there is remote code execution. All writes go through Storage Layout
 atomic primitives.
@@ -57,7 +57,7 @@ _PROTECTED_READ_PREFIXES = (
 # ── Paths that the generic Files API must never write to ──
 # Canonical Run state, events, logs, and internal directories are owned by
 # the Execution Runtime / Storage Layout and must not be mutated via a
-# general-purpose file endpoint. `nodes/` (TDEASE_TOOLS_ROOT) additionally
+# general-purpose file endpoint. The resolved `nodes/` directory additionally
 # holds the Snakemake rule files (`rules.smk`) that every workflow node's
 # `shell:` directives live in -- Snakemake imports and executes them as
 # Python, so an unrestricted write here is arbitrary code execution in the
@@ -67,7 +67,7 @@ _PROTECTED_WRITE_PREFIXES = _PROTECTED_READ_PREFIXES + ("nodes/",)
 # ── Helpers ──
 
 # Root directory for file operations — 单一解析点 get_storage()
-# （src/execution_runtime/storage.py），不再散落 os.environ.get(..., "server-data")。
+# （src/execution_runtime/storage.py），不再散落运行时根目录解析逻辑。
 def _data_root() -> Path:
     from src.execution_runtime.storage import get_storage
     return get_storage().data
