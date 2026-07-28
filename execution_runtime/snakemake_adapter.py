@@ -71,6 +71,28 @@ class SnakemakeAdapter:
         memory_limit_mb: int | None,
     ) -> SnakemakeExecutionResult:
         inspection_start = time.perf_counter()
+        projection, _snapshot = self.storage.project_run_snapshot(self.run_id)
+        queue_seq = projection.queued_at_seq
+        if (
+            queue_seq is None
+            or projection.current_revision_id != revision_id
+            or projection.queued_mode != execution_mode
+        ):
+            return SnakemakeExecutionResult(
+                success=False,
+                exit_code=-1,
+                duration_seconds=time.perf_counter() - inspection_start,
+                stderr_tail="workflow engine attempt does not match the queued Journal range",
+            )
+        try:
+            self.storage.begin_task_log_attempt(self.run_id, self.TASK_ID, queue_seq)
+        except OSError as exc:
+            return SnakemakeExecutionResult(
+                success=False,
+                exit_code=-1,
+                duration_seconds=time.perf_counter() - inspection_start,
+                stderr_tail=f"workflow engine log attempt could not be initialized: {exc}",
+            )
         try:
             recover_stale_locks = (
                 execution_mode == "continue"

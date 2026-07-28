@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -44,6 +45,8 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from src.execution_runtime.run_projector import RunProjection, project_run
+
+logger = logging.getLogger(__name__)
 
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
@@ -511,6 +514,54 @@ class StorageLayout:
 
     # -- Logs (deep operations) --
 
+    def begin_task_log_attempt(
+        self,
+        run_id: str,
+        task_id: str,
+        queue_seq: int,
+    ) -> None:
+        """Bind the fixed task log names to one Journal execution attempt.
+
+        The queue event sequence is the attempt identity. Completed live logs
+        move under ``logs/attempts`` before the next process starts. Existing
+        mixed logs without a marker are archived as ``legacy-through-*`` so we
+        preserve them without claiming a false per-attempt boundary.
+        """
+        if queue_seq < 1:
+            raise ValueError("Task log attempt requires a positive queue sequence")
+        task_dir = self.resolve(run_id, "logs", "tasks")
+        task_dir.mkdir(parents=True, exist_ok=True)
+        marker_path = task_dir / f"{task_id}.attempt.json"
+        marker = self.read_json(marker_path) or {}
+        current_queue_seq = marker.get("queue_seq")
+        if current_queue_seq == queue_seq:
+            return
+
+        current_paths = [
+            task_dir / f"{task_id}.stdout.log",
+            task_dir / f"{task_id}.stderr.log",
+        ]
+        if any(path.exists() for path in current_paths):
+            if isinstance(current_queue_seq, int) and current_queue_seq > 0:
+                archive_name = f"q{current_queue_seq}"
+            else:
+                ranges = self.project_run_snapshot(run_id)[0].ranges
+                through_seq = ranges[-1].queue_seq if ranges else queue_seq
+                archive_name = f"legacy-through-q{through_seq}"
+            archive_dir = self.resolve(run_id, "logs", "attempts", archive_name)
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for path in current_paths:
+                if not path.exists():
+                    continue
+                destination = archive_dir / path.name
+                destination.unlink(missing_ok=True)
+                path.replace(destination)
+
+        self.atomic_write_json(marker_path, {
+            "schema_version": 1,
+            "queue_seq": queue_seq,
+        })
+
     def append_runtime_record(self, run_id: str, level: str, message: str,
                                task_id: str | None = None, max_mb: int = 50) -> None:
         """Append a structured diagnostic record. Handles rotation automatically."""
@@ -932,11 +983,19 @@ class StorageLayout:
             except ValueError:
                 continue
 
-            self.repair_events_file(run_id)
-            projection = project_run(self.read_events(run_id))
             was_claimed = self.is_claimed(run_id)
             if was_claimed:
                 self.release_claim(run_id)
+            try:
+                self.repair_events_file(run_id)
+                projection = project_run(self.read_events(run_id))
+            except Exception:
+                logger.exception(
+                    "Run journal could not be projected during startup reconciliation: run_id=%s path=%s",
+                    run_id,
+                    self.events_path(run_id),
+                )
+                continue
 
             if projection.status == "RUNNING":
                 has_open_range = any(r.is_open for r in projection.ranges)

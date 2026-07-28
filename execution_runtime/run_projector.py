@@ -28,6 +28,19 @@ ALLOWED_FROM: dict[str, tuple[Optional[str], ...]] = {
 RUN_SUBMITTED = "run.submitted"
 RUN_QUEUE_REQUESTED = "run.queue_requested"
 RUN_STARTED = "run.started"
+LEGACY_REVISION_ID = "legacy-schema-v1"
+
+
+def _normalize_lifecycle_event(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Translate persisted pre-contract lifecycle events at the replay boundary."""
+    if event.get("type") != "run.queued" or int(event.get("schema_version") or 1) != 1:
+        return event
+
+    legacy_data = event.get("data")
+    data = dict(legacy_data) if isinstance(legacy_data, Mapping) else {}
+    data["revision_id"] = LEGACY_REVISION_ID
+    data["mode"] = "continue" if data.get("rerun_mode") == "resume" else "execute"
+    return {**event, "type": RUN_QUEUE_REQUESTED, "data": data}
 
 
 @dataclass(frozen=True)
@@ -86,7 +99,18 @@ def _lifecycle_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
         raise ValueError(f"{event_type} requires object data")
     missing = [field_name for field_name in required if not data.get(field_name)]
     if missing:
-        raise ValueError(f"{event_type} missing required data: {', '.join(missing)}")
+        # Backward compatibility: `revision_id` and `mode` on run.started /
+        # run.queue_requested became required in a later schema revision than
+        # some persisted journals were written under. Rejecting those legacy
+        # events crashes Backend startup (reconcile_orphaned_runs replays every
+        # Run journal at lifespan entry). These two fields are reconstructable
+        # from surrounding events, so tolerate their absence here and let
+        # project_run backfill from tracked state. Other missing fields remain
+        # hard errors — they are not derivable and a gap would corrupt the fold.
+        reconstructable = {"revision_id", "mode"}
+        hard_missing = [name for name in missing if name not in reconstructable]
+        if hard_missing:
+            raise ValueError(f"{event_type} missing required data: {', '.join(hard_missing)}")
     mode = data.get("mode")
     if mode is not None and mode not in EXECUTION_MODES:
         raise ValueError(f"{event_type} has invalid execution mode: {mode}")
@@ -105,7 +129,8 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
     ranges: list[ExecutionRange] = []
     open_range_index: Optional[int] = None
 
-    for event in events:
+    for persisted_event in events:
+        event = _normalize_lifecycle_event(persisted_event)
         seq = int(event.get("seq") or 0)
         if seq <= projected_at_seq:
             continue
@@ -124,9 +149,21 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
         if next_status is None:
             continue
 
-        revision_id = str(data["revision_id"])
+        # revision_id / mode are reconstructable for legacy journals written
+        # before they became required (see _lifecycle_data). For run.queue_requested
+        # the revision can only be backfilled if a run.submitted established it
+        # earlier in the same fold — otherwise the identity is genuinely unknowable
+        # and must stay a hard error. run.started backfills from its pending queue.
+        if data.get("revision_id"):
+            revision_id = str(data["revision_id"])
+        elif event_type == RUN_STARTED and pending_queue is not None:
+            revision_id = pending_queue[1]
+        elif current_revision_id is not None:
+            revision_id = current_revision_id
+        else:
+            raise ValueError(f"{event_type} missing required data: revision_id")
         if event_type == RUN_QUEUE_REQUESTED:
-            mode = str(data["mode"])
+            mode = str(data["mode"]) if data.get("mode") else (queued_mode or "execute")
             status = next_status
             current_revision_id = revision_id
             queued_mode = mode
@@ -135,10 +172,13 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
             continue
 
         if event_type == RUN_STARTED:
-            mode = str(data["mode"])
             if pending_queue is None:
                 raise ValueError("run.started requires a preceding run.queue_requested")
             queue_seq, queued_revision_id, queued_execution_mode = pending_queue
+            # revision_id was resolved above (from data, else the pending queue);
+            # backfill legacy run.started that omitted mode from the matching
+            # queue request, then validate consistency as usual.
+            mode = str(data["mode"]) if data.get("mode") else queued_execution_mode
             if (revision_id, mode) != (queued_revision_id, queued_execution_mode):
                 raise ValueError("run.started does not match its queue request")
             if open_range_index is not None:

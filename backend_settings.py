@@ -28,7 +28,6 @@ class BackendSettings:
     deployment_mode: DeploymentMode
     auth_mode: AuthMode
     bootstrap_secret: str | None = field(repr=False)
-    embedded_worker: bool
     bind_host: str
     bind_port: int
     port_file: str | None
@@ -102,7 +101,6 @@ def load_backend_settings(
         deployment_mode=cast(DeploymentMode, deployment_mode),
         auth_mode=cast(AuthMode, auth_mode),
         bootstrap_secret=source.pop("TDEASE_BOOTSTRAP_SECRET", None) or None,
-        embedded_worker=source.get("TDEASE_EMBEDDED_WORKER", "1") == "1",
         bind_host=source.get("TDEASE_BACKEND_HOST", "127.0.0.1"),
         bind_port=_port_setting(source.get("TDEASE_BACKEND_PORT")),
         port_file=source.get("TDEASE_PORT_FILE") or None,
