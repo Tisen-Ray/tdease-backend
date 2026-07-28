@@ -168,7 +168,7 @@ def main() -> int:
             workflow = api.workflow(
                 resource_settings=ResourceSettings(
                     cores=request.cores,
-                    resources={"toppic_slots": 1},
+                    resources={"mem_mb": request.memory_mb, "toppic_slots": 1},
                 ),
                 config_settings=ConfigSettings(config=request.config),
                 snakefile=snakefile,

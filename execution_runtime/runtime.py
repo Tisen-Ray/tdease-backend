@@ -180,6 +180,7 @@ def execute(
         snakefile="Snakefile",
         config=commit.config,
         cores=effective_cores,
+        memory_mb=RESOURCE_BUDGET.compute_memory_mb,
         targets=commit.targets,
         rerun_mode=effective_rerun_mode,
         rerun_incomplete=True,

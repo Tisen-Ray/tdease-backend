@@ -45,8 +45,10 @@ class ResultSpec(BaseModel):
     一条声明的 Published Result — 冻结进 RunCommit.result_specs。
 
     语义见 docs/design/CORE-ARCHITECTURE.md 3、docs/spec/WORKFLOW-RUN-CONTRACT.md 8.4：
-    Published Results 由这里声明，永不从路径推断。就绪状态是 output 与 Run 文件清单的 join
-    (3.1)，不是独立的状态机；未就绪不代表被吞掉，必须投影为 "declared"。
+    这是可选的 Published Result 语义元数据。未提供时，Backend 从 Snakemake 的默认
+    target 声明生成中性的 workflow_output 条目；模型不会从文件名猜测语义。就绪状态是
+    output 与 Run 文件清单 join (3.1)，不是独立的状态机；未就绪不代表被吞掉，必须投影为
+    "declared"。
     """
 
     result_id: str = Field(
@@ -153,8 +155,8 @@ class RunCommit(BaseModel):
     result_specs: list[ResultSpec] = Field(
         default_factory=list,
         description=(
-            "声明的 Published Result 列表；冻结进 commit，永不推断。"
-            "GET /api/v2/runs/{run_id}/results 将其与实际产物的文件清单 join 后投影。"
+            "可选的 Published Result 语义元数据；为空时由 Snakemake 默认 target 声明"
+            "生成中性结果。GET /api/v2/runs/{run_id}/results 将其与实际产物清单 join 后投影。"
         ),
     )
 

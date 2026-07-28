@@ -52,9 +52,13 @@ def resolve_resource_budget(
         else RUNTIME_INVENTORY.total_memory_mb,
     )
     raw_memory_override = reserved_memory_override
-    minimum_compute_memory = min(memory_total, 512)
+    # Desktop runs share a machine with Electron, the API and the operating
+    # system. Reserve 10 GiB by default, but never starve a smaller machine of
+    # a 4 GiB workflow working set. Operators may still set an explicit
+    # TDEASE_RESERVED_MEMORY_MB policy at deployment time.
+    minimum_compute_memory = min(memory_total, 4096)
     if raw_memory_override is None or not raw_memory_override.strip():
-        reserved_memory = max(2048, math.ceil(memory_total / 8))
+        reserved_memory = 10 * 1024
     else:
         try:
             reserved_memory = int(raw_memory_override)

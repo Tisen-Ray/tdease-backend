@@ -13,6 +13,7 @@ class WorkflowEngineRequest(BaseModel):
     snakefile: str = "Snakefile"
     config: dict = Field(default_factory=dict)
     cores: int = Field(default=1, ge=1, le=256)
+    memory_mb: int = Field(default=4096, ge=1)
     targets: list[str] = Field(default_factory=list)
     rerun_mode: Literal["resume", "overwrite"] = "resume"
     rerun_incomplete: bool = True

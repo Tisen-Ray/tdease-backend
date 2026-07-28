@@ -113,6 +113,31 @@ def _dequeue() -> Optional[dict]:
     return None
 
 
+def _has_queued_run() -> bool:
+    """Return whether work is available without claiming the execution slot."""
+    runs_dir = _data_root() / "runs"
+    if not runs_dir.exists():
+        return False
+
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        if index.is_dirty():
+            index.reconcile(get_storage())
+        return bool(index.queued_run_ids(limit=1))
+    except Exception:
+        logger.exception("Run queue index unavailable; scanning filesystem truth")
+
+    for rd in runs_dir.iterdir():
+        if not rd.is_dir() or not (rd / "run.json").exists():
+            continue
+        projection, _snapshot = get_storage().project_run_snapshot(rd.name)
+        if projection.status == RunStatus.QUEUED.value:
+            return True
+    return False
+
+
 def execute_run(run_data: dict) -> None:
     """Execute one Run -- entirely through the Execution Runtime."""
     run_id = run_data["run_id"]
@@ -234,6 +259,16 @@ def run_loop(
         if stop_event and stop_event.is_set():
             return
         try:
+            # An idle worker must not monopolize the Backend-wide execution
+            # slot: dry-runs share it with queued Run execution.
+            if not _has_queued_run():
+                if once:
+                    break
+                if stop_event:
+                    stop_event.wait(poll_interval)
+                else:
+                    time.sleep(poll_interval)
+                continue
             if not storage.claim_execution_slot():
                 if once:
                     break
@@ -249,13 +284,6 @@ def run_loop(
                         execute_run(run_data)
                     finally:
                         storage.release_claim(run_data["run_id"])
-                elif once:
-                    break
-                else:
-                    if stop_event:
-                        stop_event.wait(poll_interval)
-                    else:
-                        time.sleep(poll_interval)
             finally:
                 storage.release_execution_slot()
         except KeyboardInterrupt:
