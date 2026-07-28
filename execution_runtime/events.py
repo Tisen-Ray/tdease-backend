@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.contracts import EventType
+from src.contracts.lifecycle_declaration import LIFECYCLE_SCHEMA_VERSION
 from src.execution_runtime.storage import get_storage
 
 
@@ -20,7 +21,7 @@ class EventEmitter:
     def __init__(self, run_id: str):
         self.run_id = run_id
         self._storage = get_storage()
-        # Recover from persisted seq (API may have written run.queued already)
+        # Recover from persisted seq (API writes submitted/queue events first).
         self._last_seq = self._storage.recover_seq(run_id)
 
     @property
@@ -29,29 +30,54 @@ class EventEmitter:
 
     # ── Run events ──
 
-    def run_queued(self, **data: Any) -> int:
-        return self._emit(EventType.RUN_QUEUED, "Run queued", "info", data)
+    def run_submitted(self, revision_id: str, **data: Any) -> int:
+        return self._emit(
+            EventType.RUN_SUBMITTED,
+            "Run submitted",
+            "info",
+            {"revision_id": revision_id, **data},
+        )
 
-    def run_started(self, pid: int, worker_id: str) -> int:
+    def run_queue_requested(
+        self,
+        revision_id: str,
+        mode: str,
+        **data: Any,
+    ) -> int:
+        return self._emit(
+            EventType.RUN_QUEUE_REQUESTED,
+            "Run queued",
+            "info",
+            {"revision_id": revision_id, "mode": mode, **data},
+        )
+
+    def run_started(self, revision_id: str, mode: str, pid: int, worker_id: str) -> int:
         return self._emit(EventType.RUN_STARTED,
             f"Worker {worker_id} started (pid={pid})", "info",
-            {"pid": pid, "worker_id": worker_id})
+            {"revision_id": revision_id, "mode": mode, "pid": pid, "worker_id": worker_id})
 
-    def run_succeeded(self, run_time_seconds: float, total_tasks: int = 0) -> int:
+    def run_succeeded(
+        self,
+        revision_id: str,
+        run_time_seconds: float,
+        total_tasks: int = 0,
+    ) -> int:
         return self._emit(EventType.RUN_SUCCEEDED,
             f"Run succeeded in {run_time_seconds:.1f}s", "info",
-            {"run_time_seconds": run_time_seconds, "total_tasks": total_tasks})
+            {"revision_id": revision_id, "run_time_seconds": run_time_seconds,
+             "total_tasks": total_tasks})
 
-    def run_failed(self, exit_code: int | None, run_time_seconds: float,
+    def run_failed(self, revision_id: str, exit_code: int | None, run_time_seconds: float,
                     error_message: str = "") -> int:
         return self._emit(EventType.RUN_FAILED,
             error_message or f"Run failed (exit {exit_code})", "error",
-            {"exit_code": exit_code, "run_time_seconds": run_time_seconds,
+            {"revision_id": revision_id, "exit_code": exit_code,
+             "run_time_seconds": run_time_seconds,
              "error_message": error_message})
 
-    def run_cancelled(self, run_time_seconds: float = 0.0) -> int:
+    def run_cancelled(self, revision_id: str, run_time_seconds: float = 0.0) -> int:
         return self._emit(EventType.RUN_CANCELLED, "Run cancelled", "info",
-            {"run_time_seconds": run_time_seconds})
+            {"revision_id": revision_id, "run_time_seconds": run_time_seconds})
 
     def run_action(self, action: str, actor: str, **data: Any) -> int:
         return self._emit(
@@ -109,7 +135,7 @@ class EventEmitter:
     def _emit(self, event_type: EventType, message: str, level: str,
               data: dict[str, Any]) -> int:
         event = {
-            "schema_version": 1,
+            "schema_version": LIFECYCLE_SCHEMA_VERSION,
             "run_id": self.run_id,
             "seq": 0,  # storage will overwrite with correct monotonic seq
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -120,4 +146,17 @@ class EventEmitter:
             "data": data,
         }
         self._last_seq = self._storage.append_event(self.run_id, event)
+        try:
+            from src.services.run_event_projector import enqueue_event_projection
+
+            enqueue_event_projection(self.run_id, event)
+        except Exception:
+            # events.jsonl is already durable. Projection failure is repaired
+            # from its sequence checkpoint and must not fail the execution.
+            try:
+                from src.services.run_index import get_run_index
+
+                get_run_index().mark_dirty()
+            except Exception:
+                pass
         return self._last_seq

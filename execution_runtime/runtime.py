@@ -13,19 +13,15 @@ execute 在 task 之间检查 storage.check_cancelled(run_id)。
 
 from __future__ import annotations
 
-import os
-import platform
-import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from src.contracts import RunCommit
 from src.execution_runtime.parser import parse_snakefile
-from src.execution_runtime.execution import execute_task
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.engine_layout import cleanup_engine_alias
+from src.execution_runtime.snakemake_adapter import SnakemakeAdapter
 from src.execution_runtime.errors import (
     ExecutionError,
     invalid_workflow,
@@ -137,7 +133,13 @@ def preflight(commit: RunCommit) -> PreflightResult:
     )
 
 
-def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
+def execute(
+    commit: RunCommit,
+    *,
+    revision_id: str,
+    execution_mode: str,
+    rerun_mode: str = "resume",
+) -> ExecutionResult:
     """
     执行 Run commit。
 
@@ -154,10 +156,6 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
     emitter = EventEmitter(run_id)
 
     start = time.perf_counter()
-    emitter.run_started(pid=os.getpid(), worker_id=platform.node())
-    # Long workflows must become publicly RUNNING as soon as their worker starts,
-    # rather than remaining QUEUED until the terminal projection after execute().
-    storage.sync_run_projection(commit.run_id)
     snakefile_path = storage.resolve(run_id, "Snakefile")
     storage.atomic_write(snakefile_path, commit.snakefile)
 
@@ -165,7 +163,6 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
     # it must not reinterpret the Snakefile or execute rules itself.
     total, succeeded, failed = 1, 0, 0
     execution_root = storage.resolve(run_id)
-    run_dir = str(execution_root)
     effective_cores = min(commit.cores, RESOURCE_BUDGET.compute_cpus)
     if effective_cores != commit.cores:
         storage.append_runtime_record(
@@ -177,59 +174,52 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
             ),
             "engine",
         )
+    effective_rerun_mode = "overwrite" if rerun_mode == "overwrite" else "resume"
     engine_request = WorkflowEngineRequest(
         mode="execute",
         snakefile="Snakefile",
         config=commit.config,
         cores=effective_cores,
         targets=commit.targets,
-        rerun_mode=rerun_mode,
+        rerun_mode=effective_rerun_mode,
         rerun_incomplete=True,
         retries=0,
         job_event_path=".tdease/job-events.jsonl",
     )
-    storage.atomic_write_json(
-        execution_root / ".tdease" / "engine-request.json",
-        engine_request.model_dump(),
-    )
-    command_parts = [sys.executable, "-m", "src.execution_runtime.engine_runner"]
+    adapter = SnakemakeAdapter(run_id, execution_root, storage, emitter)
     try:
-        ok, ec, _elapsed, err_text = execute_task(
-            run_id=run_id, task_id="engine", step_label="Workflow engine",
-            command=command_parts, cwd=run_dir, emitter=emitter,
-            display_command="TDEase Workflow Engine",
-            timeout=7 * 24 * 60 * 60,
+        engine_result = adapter.execute(
+            engine_request,
+            revision_id=revision_id,
+            execution_mode=execution_mode,
+            timeout_seconds=7 * 24 * 60 * 60,
+            memory_limit_mb=commit.memory_mb or RESOURCE_BUDGET.compute_memory_mb,
         )
     finally:
         cleanup_engine_alias(execution_root)
-    if not ok and (err_text == "cancelled" or storage.check_cancelled(run_id)):
-        emitter.run_cancelled(time.perf_counter() - start)
-        return ExecutionResult(success=False, exit_code=ec, error=cancelled(run_id),
+    if engine_result.cancelled or storage.check_cancelled(run_id):
+        emitter.run_cancelled(revision_id, time.perf_counter() - start)
+        return ExecutionResult(success=False, exit_code=engine_result.exit_code, error=cancelled(run_id),
             run_time_seconds=time.perf_counter() - start, total_tasks=1,
             final_seq=emitter.last_seq)
-    if ok:
+    if engine_result.success:
         succeeded = 1
     else:
         failed = 1
         total_elapsed = time.perf_counter() - start
-        error = task_failed("engine", ec, err_text)
-        emitter.run_failed(ec, total_elapsed, str(error))
-        return ExecutionResult(success=False, exit_code=ec, error=error,
+        error = task_failed("engine", engine_result.exit_code, engine_result.stderr_tail)
+        emitter.run_failed(revision_id, engine_result.exit_code, total_elapsed, str(error))
+        return ExecutionResult(success=False, exit_code=engine_result.exit_code, error=error,
             run_time_seconds=total_elapsed, total_tasks=1, failed_tasks=1,
             final_seq=emitter.last_seq)
 
-    # ── 3. Terminal event ──
+    # Success is finalized by the Worker only after local-input verification
+    # and atomic Result Manifest publication. Emitting run.succeeded here would
+    # create a terminal fact before the published outputs exist.
     total_elapsed = time.perf_counter() - start
-    final_exit = 0 if failed == 0 else 1
-
-    if final_exit == 0:
-        emitter.run_succeeded(total_elapsed, total)
-    else:
-        emitter.run_failed(final_exit, total_elapsed, f"{failed}/{total} tasks failed")
-
     return ExecutionResult(
-        success=final_exit == 0,
-        exit_code=final_exit,
+        success=True,
+        exit_code=0,
         run_time_seconds=total_elapsed,
         total_tasks=total,
         succeeded_tasks=succeeded,

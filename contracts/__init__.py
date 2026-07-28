@@ -5,6 +5,7 @@ from .enums import (
     TERMINAL_STATUSES,
     ErrorCode,
     EventType,
+    RunExecutionMode,
     RunStatus,
 )
 from .errors import (
@@ -36,7 +37,8 @@ from .errors import (
 from .event import (
     Event,
     EventBatch,
-    RunQueuedData,
+    RunQueueRequestedData,
+    RunSubmittedData,
     RunStartedData,
     RunTerminatedData,
     RuntimeMessageData,
@@ -72,7 +74,7 @@ from .workspace import WorkspaceAttachRequest, WorkspaceIdentity, WorkspaceRegis
 
 __all__ = [
     # enums
-    "RunStatus", "EventType", "ErrorCode",
+    "RunStatus", "RunExecutionMode", "EventType", "ErrorCode",
     "TERMINAL_STATUSES", "CANCELLABLE_STATUSES",
     # errors
     "AppError", "internal", "not_found", "invalid_request",
@@ -96,7 +98,7 @@ __all__ = [
     "PackageLock", "NodeBinding", "ResultSpec", "ResultRef", "RunResultEntry", "RunResultsResponse",
     # event
     "Event", "EventBatch", "RuntimeRef",
-    "RunQueuedData", "RunStartedData", "RunTerminatedData",
+    "RunSubmittedData", "RunQueueRequestedData", "RunStartedData", "RunTerminatedData",
     "TaskStartedData", "TaskProgressData", "TaskSucceededData", "TaskFailedData",
     "RuntimeMessageData",
 ]

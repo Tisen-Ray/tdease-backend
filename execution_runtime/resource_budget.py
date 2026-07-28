@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import math
 from dataclasses import dataclass
+from typing import Literal
+
+from src.backend_settings import BACKEND_SETTINGS, RUNTIME_INVENTORY
 
 
 @dataclass(frozen=True)
@@ -12,18 +15,23 @@ class ResourceBudget:
     reserved_service_cpus: int
     compute_cpus: int
     compute_cpu_ids: tuple[int, ...]
+    total_memory_mb: int
+    reserved_service_memory_mb: int
+    compute_memory_mb: int
+    max_concurrent_runs: Literal[1] = 1
 
 
 def resolve_resource_budget(
     logical_cpus: int | None = None,
     reserved_override: str | None = None,
+    total_memory_mb: int | None = None,
+    reserved_memory_override: str | None = None,
 ) -> ResourceBudget:
-    total = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
-    raw_override = (
-        reserved_override
-        if reserved_override is not None
-        else os.environ.get("TDEASE_RESERVED_LOGICAL_CPUS")
+    total = max(
+        1,
+        logical_cpus if logical_cpus is not None else RUNTIME_INVENTORY.logical_cpus,
     )
+    raw_override = reserved_override
     if raw_override is None or not raw_override.strip():
         reserved = min(4, total - 1) if total > 1 else 0
     else:
@@ -36,13 +44,43 @@ def resolve_resource_budget(
 
     reserved = min(reserved, total - 1) if total > 1 else 0
     compute = total - reserved
+
+    memory_total = max(
+        1,
+        total_memory_mb
+        if total_memory_mb is not None
+        else RUNTIME_INVENTORY.total_memory_mb,
+    )
+    raw_memory_override = reserved_memory_override
+    minimum_compute_memory = min(memory_total, 512)
+    if raw_memory_override is None or not raw_memory_override.strip():
+        reserved_memory = max(2048, math.ceil(memory_total / 8))
+    else:
+        try:
+            reserved_memory = int(raw_memory_override)
+        except ValueError as exc:
+            raise RuntimeError("TDEASE_RESERVED_MEMORY_MB must be an integer") from exc
+        if reserved_memory < 0:
+            raise RuntimeError("TDEASE_RESERVED_MEMORY_MB must be non-negative")
+    reserved_memory = min(reserved_memory, max(0, memory_total - minimum_compute_memory))
+    compute_memory = memory_total - reserved_memory
+
     return ResourceBudget(
         logical_cpus=total,
         reserved_service_cpus=reserved,
         compute_cpus=compute,
         compute_cpu_ids=tuple(range(compute)),
+        total_memory_mb=memory_total,
+        reserved_service_memory_mb=reserved_memory,
+        compute_memory_mb=compute_memory,
     )
 
 
-# Environment and host topology are deployment settings. Freeze both at startup.
-RESOURCE_BUDGET = resolve_resource_budget()
+# Both the enforcement wall and public capability document derive from the same
+# startup snapshot. No consumer resolves environment or host topology itself.
+RESOURCE_BUDGET = resolve_resource_budget(
+    logical_cpus=RUNTIME_INVENTORY.logical_cpus,
+    reserved_override=BACKEND_SETTINGS.reserved_logical_cpus,
+    total_memory_mb=RUNTIME_INVENTORY.total_memory_mb,
+    reserved_memory_override=BACKEND_SETTINGS.reserved_memory_mb,
+)

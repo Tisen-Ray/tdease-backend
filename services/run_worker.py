@@ -1,21 +1,18 @@
 """
-Run Worker -- file-scan queue -> TDEase Execution Runtime -> events.jsonl.
+Run Worker -- global SQLite queue -> TDEase Execution Runtime -> events.jsonl.
 
 Design constraints:
 - ~50 lines of business logic. Daemonizing/restart/cgroups belong to systemd.
 - Atomic claim (O_CREAT | O_EXCL claim file).
 - Calls Execution Runtime execute().
-- All status writes go through Storage Layout's sync_run_projection --
-  CORE-ARCHITECTURE.md Sec 1.4: "status" is a projection of events.jsonl,
-  never written independently here. The two former independent writers
-  (this file computing a SUCCEEDED/FAILED/CANCELLED ternary itself, and
-  storage.py's reconcile rewriting "status" by hand) are both gone; both
-  now call the same single projection path.
+- events.jsonl is the lifecycle truth. SQLite is a rebuildable queue/read
+  projection and run.json remains an immutable execution definition.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -31,27 +28,81 @@ from src.execution_runtime.errors import runtime_internal
 from src.execution_runtime.storage import StorageLayout
 
 
+logger = logging.getLogger(__name__)
+
+
+def _index_run(data: dict, storage: StorageLayout) -> None:
+    index = None
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        run_id = str(data.get("run_id", ""))
+        index.upsert_run(data, storage.recover_seq(run_id))
+        index.catch_up_run(storage, run_id)
+    except Exception:
+        if index is not None:
+            index.mark_dirty()
+        logger.exception("Worker Run index update failed for %s", data.get("run_id"))
+
+
 def _data_root() -> Path:
     # Single entry point get_storage() -- keeps runtime-root resolution centralized.
     return get_storage().data
 
 
+def _prepare_worker(storage: StorageLayout) -> None:
+    """Prepare persistent queue state without depending on API startup."""
+    from app.database.lifecycle import migrate_database
+
+    migrate_database(str(storage.data / "database" / "db.sqlite3"))
+    from src.services.run_index import get_run_index
+
+    get_run_index().reconcile(storage)
+
+
 def _dequeue() -> Optional[dict]:
-    """Scan runs/, atomically claim the first QUEUED run (O_CREAT|O_EXCL claim file)."""
+    """Claim the oldest queued Run globally, independent of tenant identity."""
     runs_dir = _data_root() / "runs"
     if not runs_dir.exists():
         return None
 
-    for rd in sorted(runs_dir.iterdir()):
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        if index.is_dirty():
+            index.reconcile(get_storage())
+        for run_id in index.queued_run_ids():
+            data = get_storage().read_json(runs_dir / run_id / "run.json")
+            if not data:
+                continue
+            if get_storage().claim_run(run_id):
+                return data
+        return None
+    except Exception:
+        logger.exception("Run queue index unavailable; scanning filesystem truth")
+
+    candidates: list[tuple[float, str, dict]] = []
+    for rd in runs_dir.iterdir():
         if not rd.is_dir():
             continue
         rj = rd / "run.json"
         if not rj.exists():
             continue
         data = json.loads(rj.read_text(encoding="utf-8"))
-        if data.get("status") != "QUEUED":
+        projection, _snapshot = get_storage().project_run_snapshot(str(data.get("run_id", rd.name)))
+        if projection.status != "QUEUED":
             continue
 
+        created_at = data.get("created_at")
+        try:
+            queued_at = datetime.fromisoformat(str(created_at)).timestamp()
+        except (TypeError, ValueError, OSError):
+            queued_at = rj.stat().st_mtime
+        candidates.append((queued_at, str(data.get("run_id", rd.name)), data))
+
+    for _queued_at, _run_id, data in sorted(candidates, key=lambda item: (item[0], item[1])):
         try:
             if get_storage().claim_run(data["run_id"]):
                 return data
@@ -68,7 +119,7 @@ def execute_run(run_data: dict) -> None:
     storage = get_storage()
     storage.bootstrap()
 
-    # Idempotent -- API already created dir and wrote run.queued event
+    # Idempotent -- API already created the directory and queued via Journal.
     storage.allocate_run(run_id)
 
     commit = RunCommit(
@@ -84,7 +135,7 @@ def execute_run(run_data: dict) -> None:
         config=run_data.get("config", {}),
         cores=run_data.get("cores", 4),
         user_id=run_data.get("user_id", "worker"),
-        mode=run_data.get("mode", "local"),
+        materialization_strategy=run_data.get("materialization_strategy"),
         packages=run_data.get("packages", []),
         nodes=run_data.get("nodes", []),
         targets=run_data.get("targets", []),
@@ -92,20 +143,29 @@ def execute_run(run_data: dict) -> None:
         labels=run_data.get("labels", {}),
     )
 
-    # Record process bookkeeping (pid, started_at) only. Not "status" --
-    # that is derived from events by sync_run_projection below, the single
-    # writer of that field (CORE-ARCHITECTURE.md Sec 1.4).
-    run_json = _data_root() / "runs" / run_id / "run.json"
-    current = json.loads(run_json.read_text(encoding="utf-8")) if run_json.exists() else dict(run_data)
-    storage.atomic_write_json(
-        run_json,
-        {**current, "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
+    projection, _snapshot = storage.project_run_snapshot(run_id)
+    if projection.status != RunStatus.QUEUED.value or not projection.current_revision_id:
+        raise RuntimeError(f"Run {run_id} is not backed by a queued Journal revision")
+    queue_event = next(
+        event for event in reversed(storage.read_events(run_id))
+        if event.get("type") == "run.queue_requested"
     )
+    raw_queue_data = queue_event.get("data")
+    queue_data: dict = raw_queue_data if isinstance(raw_queue_data, dict) else {}
+    execution_mode = projection.queued_mode or "execute"
+    rerun_mode = str(queue_data.get("rerun_mode", "resume"))
+    revision_id = projection.current_revision_id
+    _index_run(run_data, storage)
     try:
-        if commit.mode == "local":
+        if commit.materialization_strategy == "local_workspace_hardlink":
             storage.verify_local_inputs(run_id)
-        result = execute(commit, rerun_mode=run_data.get("rerun_mode", "resume"))
-        if commit.mode == "local":
+        result = execute(
+            commit,
+            revision_id=revision_id,
+            execution_mode=execution_mode,
+            rerun_mode=rerun_mode,
+        )
+        if commit.materialization_strategy == "local_workspace_hardlink":
             storage.verify_local_inputs(run_id)
     except Exception as exc:
         from src.execution_runtime.runtime import ExecutionResult
@@ -115,17 +175,45 @@ def execute_run(run_data: dict) -> None:
         # always appends a terminal event first -- but the local-input
         # verification calls above are outside execute() and can raise
         # with no terminal event on record at all. Append one now so the
-        # projection (and sync_run_projection just below) has a terminal
-        # fact to converge to instead of being stuck RUNNING/QUEUED
-        # forever with only a run.json rewrite to show for it.
+        # projection has a terminal fact instead of remaining RUNNING/QUEUED.
         EventEmitter(run_id).run_failed(
+            revision_id=revision_id,
             exit_code=-1, run_time_seconds=0.0, error_message=str(error)
         )
 
-    projection = storage.sync_run_projection(run_id)
+    manifest_path = None
+    if result.success:
+        try:
+            manifest_path = storage.write_results_manifest(run_id, revision_id)
+            EventEmitter(run_id).run_succeeded(
+                revision_id=revision_id,
+                run_time_seconds=result.run_time_seconds,
+                total_tasks=result.total_tasks,
+            )
+        except Exception as exc:
+            EventEmitter(run_id).run_failed(
+                revision_id=revision_id,
+                exit_code=-1,
+                run_time_seconds=0.0,
+                error_message=f"result manifest finalization failed: {exc}",
+            )
 
-    if projection.status == RunStatus.SUCCEEDED.value:
-        storage.write_results_manifest(run_id)
+    projection, _snapshot = storage.project_run_snapshot(run_id)
+    _index_run(run_data, storage)
+
+    if projection.status == RunStatus.SUCCEEDED.value and manifest_path is not None:
+        index = None
+        try:
+            from src.services.run_index import get_run_index
+
+            index = get_run_index()
+            manifest = storage.read_json(manifest_path)
+            if isinstance(manifest, dict):
+                index.replace_manifest(run_id, manifest)
+        except Exception:
+            if index is not None:
+                index.mark_dirty()
+            logger.exception("Worker Run file index update failed for %s", run_id)
 
     # Cleanup claim
     storage.release_claim(run_id)
@@ -139,6 +227,7 @@ def run_loop(
     """Worker main loop."""
     storage = get_storage()
     storage.bootstrap()
+    _prepare_worker(storage)
     storage.reconcile_orphaned_runs()
 
     while True:
@@ -156,7 +245,10 @@ def run_loop(
             try:
                 run_data = _dequeue()
                 if run_data:
-                    execute_run(run_data)
+                    try:
+                        execute_run(run_data)
+                    finally:
+                        storage.release_claim(run_data["run_id"])
                 elif once:
                     break
                 else:

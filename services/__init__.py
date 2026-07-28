@@ -7,9 +7,17 @@ implementations production reaches. A second, unreachable copy of both used to
 sit in `src/services/files.py` (deleted -- REMAINING-DESIGNS.md Sec 14.2).
 """
 
-from src.services.run_worker import execute, run_loop
-
 __all__ = [
     "run_loop",
     "execute",
 ]
+
+
+def __getattr__(name: str):
+    """Keep the package API without pre-importing the ``-m`` entry module."""
+    if name in __all__:
+        from importlib import import_module
+
+        run_worker = import_module("src.services.run_worker")
+        return getattr(run_worker, name)
+    raise AttributeError(name)

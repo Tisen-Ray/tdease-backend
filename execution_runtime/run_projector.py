@@ -1,42 +1,8 @@
-"""
-Run projection — the one rule table, implemented once.
+"""Pure lifecycle projection from the canonical Run journal.
 
-CORE-ARCHITECTURE.md §1.2-§1.3: `events.jsonl` is the only truth for a Run's
-lifecycle. This module derives status and execution ranges from an event
-prefix with **no I/O** — it is a pure function of a list of event dicts —
-which is what makes it shareable between the Backend (this file) and the
-Client (a TypeScript port of the same rule table) against one fixture
-corpus: `tests/fixtures/run-projection/`.
-
-Rule table (applied to the event prefix in sequence order — a lookup over
-the whole prefix, not a state machine where the last event always wins):
-
-| Condition                                         | Projected status |
-|----------------------------------------------------|------------------|
-| A terminal event follows the last `run.started`     | that terminal status |
-| A `run.started` has no terminal event after it      | RUNNING          |
-| A `run.queued` has no `run.started` after it        | QUEUED           |
-| No events                                           | not a Run (None) |
-
-Terminal events are `run.succeeded`, `run.failed`, `run.cancelled`. There is
-no other lifecycle axis. Non-lifecycle events (`task.*`, `runtime.message`,
-`run.action`) never change `status` — this is what makes cancellation and
-diagnostic noise safe: a late-arriving job event after `run.cancelled` does
-not resurrect the Run, and it does not queue-flip a completed Run either.
-
-Because rows 1-2 are keyed off "the last `run.started`", once a
-`run.started` has ever appeared only a terminal event *after that same
-`run.started`* can change status again. A bare `run.queued` appended later
-(an audit event, or a mis-issued requeue with no accompanying
-`run.started`) does not flip a terminal Run back to QUEUED and does not
-resurrect a cancelled or completed Run — reopening execution always means a
-new `run.started`, i.e. a new execution range (Continue).
-
-Execution ranges (§1.3): the half-open interval from a `run.started` event
-to its terminal event. A range with no terminal yet is open. There is
-deliberately no Invocation entity — "which process produced this job event"
-is answered by "which range contains its sequence number", which is what
-lets Continue and Recompute work without an attempt counter.
+The transition vocabulary lives in ``src/contracts/run_lifecycle.json``.
+Both Backend and Client load that declaration, so lifecycle ownership does
+not drift into two hand-maintained state machines.
 """
 
 from __future__ import annotations
@@ -44,34 +10,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
 
-RUN_QUEUED = "run.queued"
-RUN_STARTED = "run.started"
-RUN_SUCCEEDED = "run.succeeded"
-RUN_FAILED = "run.failed"
-RUN_CANCELLED = "run.cancelled"
+from src.contracts.lifecycle_declaration import LIFECYCLE_DECLARATION
 
-TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(
-    {RUN_SUCCEEDED, RUN_FAILED, RUN_CANCELLED}
-)
-
-_TERMINAL_STATUS_BY_EVENT: dict[str, str] = {
-    RUN_SUCCEEDED: "SUCCEEDED",
-    RUN_FAILED: "FAILED",
-    RUN_CANCELLED: "CANCELLED",
+_RULES = LIFECYCLE_DECLARATION
+STATUS_BY_EVENT: dict[str, str] = dict(_RULES["statuses"])
+TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(_RULES["terminal_events"])
+EXECUTION_MODES: frozenset[str] = frozenset(_RULES["execution_modes"])
+REQUIRED_DATA: dict[str, tuple[str, ...]] = {
+    event_type: tuple(fields)
+    for event_type, fields in _RULES["required_data"].items()
 }
+ALLOWED_FROM: dict[str, tuple[Optional[str], ...]] = {
+    event_type: tuple(statuses)
+    for event_type, statuses in _RULES["allowed_from"].items()
+}
+
+RUN_SUBMITTED = "run.submitted"
+RUN_QUEUE_REQUESTED = "run.queue_requested"
+RUN_STARTED = "run.started"
 
 
 @dataclass(frozen=True)
 class ExecutionRange:
-    """The half-open interval [start_seq, terminal_seq) for one execution attempt.
-
-    `terminal_seq` and `terminal_type` are `None` while the range is open
-    (a live process). At most one range may be open per Run — that
-    invariant is enforced by the writers (one claim, one worker), not by
-    this pure function, which only reports what the log says happened.
-    """
+    """One process execution and the queue request that authorized it."""
 
     start_seq: int
+    queue_seq: int
+    revision_id: str
+    mode: str
     terminal_seq: Optional[int] = None
     terminal_type: Optional[str] = None
 
@@ -81,7 +47,10 @@ class ExecutionRange:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "queue_seq": self.queue_seq,
             "start_seq": self.start_seq,
+            "revision_id": self.revision_id,
+            "mode": self.mode,
             "terminal_seq": self.terminal_seq,
             "terminal_type": self.terminal_type,
         }
@@ -89,95 +58,123 @@ class ExecutionRange:
 
 @dataclass(frozen=True)
 class RunProjection:
-    """The pure projection of a Run's event prefix.
-
-    `status` is `None` only when there are no events at all ("not a Run" in
-    the rule table — nothing has been written for this run_id yet).
-    `projected_at_seq` is the highest sequence number folded into this
-    projection; a caller comparing it against the tail of `events.jsonl`
-    can tell, by inspection, whether a cached projection is stale
-    (CORE-ARCHITECTURE.md §1.4).
-    """
-
     status: Optional[str]
     projected_at_seq: int = 0
+    current_revision_id: Optional[str] = None
+    queued_mode: Optional[str] = None
+    queued_at_seq: Optional[int] = None
     ranges: tuple[ExecutionRange, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "projected_at_seq": self.projected_at_seq,
-            "ranges": [r.to_dict() for r in self.ranges],
+            "current_revision_id": self.current_revision_id,
+            "queued_mode": self.queued_mode,
+            "queued_at_seq": self.queued_at_seq,
+            "ranges": [execution_range.to_dict() for execution_range in self.ranges],
         }
 
 
+def _lifecycle_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
+    event_type = event.get("type")
+    required = REQUIRED_DATA.get(str(event_type))
+    if required is None:
+        return {}
+    data = event.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{event_type} requires object data")
+    missing = [field_name for field_name in required if not data.get(field_name)]
+    if missing:
+        raise ValueError(f"{event_type} missing required data: {', '.join(missing)}")
+    mode = data.get("mode")
+    if mode is not None and mode not in EXECUTION_MODES:
+        raise ValueError(f"{event_type} has invalid execution mode: {mode}")
+    return data
+
+
 def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
-    """Derive a Run's status and execution ranges from its event prefix.
+    """Fold a journal prefix without consulting mutable Run metadata."""
 
-    Pure, no I/O, no clock. Safe to call with the full contents of
-    `events.jsonl` on every read; cheap to recompute, disposable, never a
-    second truth (CORE-ARCHITECTURE.md §1.1 invariant 2).
-    """
+    status: Optional[str] = None
     projected_at_seq = 0
+    current_revision_id: Optional[str] = None
+    queued_mode: Optional[str] = None
+    queued_at_seq: Optional[int] = None
+    pending_queue: Optional[tuple[int, str, str]] = None
     ranges: list[ExecutionRange] = []
-    open_range: Optional[ExecutionRange] = None
-
-    last_started_seq: Optional[int] = None
-    terminal_since_last_started: Optional[str] = None
-    last_terminal_type: Optional[str] = None
-    saw_queued = False
+    open_range_index: Optional[int] = None
 
     for event in events:
-        event_type = event.get("type")
-        seq = event.get("seq") or 0
-        if seq > projected_at_seq:
-            projected_at_seq = seq
+        seq = int(event.get("seq") or 0)
+        if seq <= projected_at_seq:
+            continue
+        projected_at_seq = seq
+        event_type = str(event.get("type") or "")
+        data = _lifecycle_data(event)
+        allowed_from = ALLOWED_FROM.get(event_type)
+        if allowed_from is not None and status not in allowed_from:
+            raise ValueError(f"{event_type} is invalid from status {status}")
 
-        if event_type == RUN_QUEUED:
-            saw_queued = True
-        elif event_type == RUN_STARTED:
-            last_started_seq = seq
-            terminal_since_last_started = None
-            open_range = ExecutionRange(start_seq=seq)
-            ranges.append(open_range)
-        elif event_type in TERMINAL_EVENT_TYPES:
-            last_terminal_type = event_type
-            if last_started_seq is not None:
-                terminal_since_last_started = event_type
-            if open_range is not None:
-                ranges[-1] = ExecutionRange(
-                    start_seq=open_range.start_seq,
-                    terminal_seq=seq,
-                    terminal_type=event_type,
-                )
-                open_range = None
-            # A terminal event with no open range (no run.started preceded
-            # it, or the range it would close was already closed by an
-            # earlier terminal) still updates the status tracking above —
-            # the log recorded a fact — but contributes no range: a range
-            # is defined only as run.started -> terminal.
-        # Everything else (task.*, runtime.message, run.action, ...) is
-        # diagnostic or auxiliary and never changes `status`.
+        if event_type == RUN_SUBMITTED:
+            current_revision_id = str(data["revision_id"])
+            continue
 
-    if last_started_seq is not None:
-        status = (
-            _TERMINAL_STATUS_BY_EVENT[terminal_since_last_started]
-            if terminal_since_last_started is not None
-            else "RUNNING"
-        )
-    elif last_terminal_type is not None:
-        # No run.started was ever recorded, yet a terminal event exists —
-        # not a case the table names explicitly (it presumes execution
-        # began), but the most defensible reading of "the log recorded a
-        # fact": the terminal outcome, not a bare run.queued, governs.
-        status = _TERMINAL_STATUS_BY_EVENT[last_terminal_type]
-    elif saw_queued:
-        status = "QUEUED"
-    else:
-        status = None
+        next_status = STATUS_BY_EVENT.get(event_type)
+        if next_status is None:
+            continue
+
+        revision_id = str(data["revision_id"])
+        if event_type == RUN_QUEUE_REQUESTED:
+            mode = str(data["mode"])
+            status = next_status
+            current_revision_id = revision_id
+            queued_mode = mode
+            queued_at_seq = seq
+            pending_queue = (seq, revision_id, mode)
+            continue
+
+        if event_type == RUN_STARTED:
+            mode = str(data["mode"])
+            if pending_queue is None:
+                raise ValueError("run.started requires a preceding run.queue_requested")
+            queue_seq, queued_revision_id, queued_execution_mode = pending_queue
+            if (revision_id, mode) != (queued_revision_id, queued_execution_mode):
+                raise ValueError("run.started does not match its queue request")
+            if open_range_index is not None:
+                raise ValueError("run.started cannot overlap an open execution range")
+            ranges.append(ExecutionRange(seq, queue_seq, revision_id, mode))
+            open_range_index = len(ranges) - 1
+            pending_queue = None
+            status = next_status
+            current_revision_id = revision_id
+            queued_mode = None
+            queued_at_seq = None
+            continue
+
+        if current_revision_id is not None and revision_id != current_revision_id:
+            raise ValueError(f"{event_type} revision does not match the active revision")
+        status = next_status
+        queued_mode = None
+        queued_at_seq = None
+        pending_queue = None
+        if open_range_index is not None:
+            active = ranges[open_range_index]
+            ranges[open_range_index] = ExecutionRange(
+                start_seq=active.start_seq,
+                queue_seq=active.queue_seq,
+                revision_id=active.revision_id,
+                mode=active.mode,
+                terminal_seq=seq,
+                terminal_type=event_type,
+            )
+            open_range_index = None
 
     return RunProjection(
         status=status,
         projected_at_seq=projected_at_seq,
+        current_revision_id=current_revision_id,
+        queued_mode=queued_mode,
+        queued_at_seq=queued_at_seq,
         ranges=tuple(ranges),
     )

@@ -18,7 +18,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from .enums import EventType
+from .enums import EventType, RunExecutionMode
+from .lifecycle_declaration import LIFECYCLE_SCHEMA_VERSION
 
 
 class RuntimeRef(BaseModel):
@@ -44,7 +45,12 @@ class Event(BaseModel):
       data: 按 type 不同的负载
     """
 
-    schema_version: int = Field(default=1, description="Event schema version")
+    schema_version: int = Field(
+        default=LIFECYCLE_SCHEMA_VERSION,
+        ge=LIFECYCLE_SCHEMA_VERSION,
+        le=LIFECYCLE_SCHEMA_VERSION,
+        description="Event schema version",
+    )
     run_id: str = Field(description="所属 Run")
     seq: int = Field(description="事件序号，从 1 开始，单调递增", ge=1)
     timestamp: datetime = Field(
@@ -68,7 +74,10 @@ class EventBatch(BaseModel):
 
 # --- 各产品事件 data schema ---
 
-class RunQueuedData(BaseModel):
+class RunSubmittedData(BaseModel):
+    """Records the creation of a Run identity and its initial revision."""
+
+    revision_id: str
     idempotency_key: str
     workspace_tree_hash: str
     user_id: str
@@ -76,7 +85,16 @@ class RunQueuedData(BaseModel):
     workflow_steps: int = Field(default=0)
 
 
+class RunQueueRequestedData(BaseModel):
+    """Requests one serialized execution of an immutable revision."""
+
+    revision_id: str
+    mode: RunExecutionMode
+
+
 class RunStartedData(BaseModel):
+    revision_id: str
+    mode: RunExecutionMode
     pid: int
     worker_id: str
 
@@ -108,6 +126,7 @@ class TaskFailedData(BaseModel):
 
 
 class RunTerminatedData(BaseModel):
+    revision_id: str
     exit_code: Optional[int] = Field(default=None)
     run_time_seconds: float
     total_tasks: int = Field(default=0)

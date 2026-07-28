@@ -131,7 +131,8 @@ class RunCommit(BaseModel):
     cores: int = Field(default=4, description="CPU 核心数", ge=1, le=256)
     memory_mb: Optional[int] = Field(
         default=None,
-        description="内存上限 (MB)，null = 不限制",
+        ge=128,
+        description="Snakemake 进程树内存上限 (MB)；null 由 Backend 收紧为当前计算预算",
     )
     targets: list[str] = Field(
         default_factory=list,
@@ -179,15 +180,6 @@ class RunCommit(BaseModel):
         default_factory=dict,
         description="用户自定义标签，用于搜索和分组",
     )
-
-    @property
-    def mode(self) -> str:
-        """已弃用的向后兼容派生属性，非 pydantic field（不出现在 model_dump()/序列化中，
-        调用方也无法通过它写入 commit）。REMAINING-DESIGNS.md 0.2 移除 mode 字段后，
-        仍以 commit.mode 读取模式的既有调用点 (如 src/services/run_worker.py) 无需
-        立即修改；新代码应改读 materialization_strategy。"""
-        return "local" if self.materialization_strategy in (None, "local_workspace_hardlink") else "remote"
-
 
 class RunCreateRequest(BaseModel):
     """
@@ -306,13 +298,6 @@ class RunStatusResponse(BaseModel):
     workspace_run_path: Optional[str] = None
     current_revision: Optional[str] = None
     status: RunStatus
-    mode: str = Field(
-        default="local",
-        description=(
-            "已弃用的兼容字段：从 materialization_strategy 派生的 local|remote 简化标签，"
-            "仅保留一个发布周期供 Client 迁移。新代码应读取 materialization_strategy。"
-        ),
-    )
     materialization_strategy: str = Field(
         default="local_workspace_hardlink",
         description="服务端记录的物化策略，见 RunCommit.materialization_strategy。",

@@ -24,12 +24,10 @@ P2 fixes:
 - append_runtime_record / append_task_output: deep log operations
 
 CORE-ARCHITECTURE.md Sec 1.4:
-- run.json lifecycle fields are projections, derived from events.jsonl by
-  src.execution_runtime.run_projector.project_run through
-  sync_run_projection -- the only place this module writes terminal status,
-  exit_code, error, and finished_at. Nothing else may write terminal lifecycle
-  state independently; run_worker.py and
-  reconcile_orphaned_runs below both go through it now.
+- run.json is the frozen execution definition.
+- events.jsonl is the lifecycle truth and is projected in memory or into the
+  rebuildable SQLite read model. Storage never writes lifecycle state back into
+  the definition.
 """
 
 from __future__ import annotations
@@ -39,6 +37,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,7 +74,8 @@ def _project_lifecycle_metadata(events: list[dict[str, Any]], status: object) ->
     terminal = next((event for event in reversed(events) if event.get("type") == terminal_type), None)
     if terminal is None:
         return projected
-    data = terminal.get("data") if isinstance(terminal.get("data"), dict) else {}
+    raw_data = terminal.get("data")
+    data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
     projected["finished_at"] = terminal.get("timestamp")
     if status_text == "SUCCEEDED":
         projected["exit_code"] = 0
@@ -167,14 +167,13 @@ class StorageLayout:
         """
         target = Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        encoding = "utf-8" if isinstance(content, str) else None
         fd, tmp = tempfile.mkstemp(
             dir=str(target.parent),
             prefix="." + target.name + ".",
         )
         try:
-            if encoding:
-                os.write(fd, content.encode(encoding))
+            if isinstance(content, str):
+                os.write(fd, content.encode("utf-8"))
             else:
                 os.write(fd, content)
             os.fsync(fd)
@@ -275,37 +274,106 @@ class StorageLayout:
         return self.resolve(run_id, "events.jsonl")
 
     def recover_seq(self, run_id: str) -> int:
-        """Return the highest persisted seq in events.jsonl. 0 = empty."""
+        """Return the last persisted seq without scanning the whole event log."""
         p = self.events_path(run_id)
         if not p.exists():
             return 0
-        last = 0
-        for line in p.read_text(encoding="utf-8").strip().splitlines():
-            if not line.strip():
-                continue
-            try:
-                evt = json.loads(line)
-                s = evt.get("seq", 0)
-                if s > last:
-                    last = s
-            except json.JSONDecodeError:
-                continue
-        return last
+        with open(p, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            end = stream.tell()
+            pending = b""
+            while end > 0:
+                size = min(64 * 1024, end)
+                end -= size
+                stream.seek(end)
+                pending = stream.read(size) + pending
+                lines = pending.splitlines()
+                if end > 0 and lines:
+                    pending = lines.pop(0)
+                else:
+                    pending = b""
+                for line in reversed(lines):
+                    if not line.strip():
+                        continue
+                    try:
+                        return int(json.loads(line).get("seq", 0))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        continue
+            if pending.strip():
+                try:
+                    return int(json.loads(pending).get("seq", 0))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+        return 0
 
     def append_event(self, run_id: str, event: dict[str, Any]) -> int:
         """
         Append one event line. Allocates and returns the monotonic seq.
         Starts from recover_seq + 1; callers should not set seq manually.
         """
-        current = self.recover_seq(run_id)
-        event["seq"] = current + 1
-        line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
-        p = self.events_path(run_id)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
+        with self._event_write_lock(run_id):
+            current = self.recover_seq(run_id)
+            event["seq"] = current + 1
+            line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
+            p = self.events_path(run_id)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
         return event["seq"]
+
+    @contextmanager
+    def _event_write_lock(self, run_id: str) -> Iterator[None]:
+        """Serialize one Run's sequence allocation across API/Worker processes."""
+        lock = self.resolve(run_id, ".runtime", "events.lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                break
+            except (FileExistsError, PermissionError):
+                stale = False
+                try:
+                    age = time.time() - lock.stat().st_mtime
+                    if age > 1.0:
+                        owner = int(lock.read_text(encoding="ascii").strip())
+                        import psutil
+
+                        stale = not psutil.pid_exists(owner) or age > 30.0
+                except FileNotFoundError:
+                    continue
+                except (OSError, TypeError, ValueError):
+                    try:
+                        stale = time.time() - lock.stat().st_mtime > 30.0
+                    except FileNotFoundError:
+                        continue
+                if stale:
+                    self._unlink_event_lock(lock)
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out acquiring event writer for {run_id}")
+                time.sleep(0.005)
+        try:
+            yield
+        finally:
+            self._unlink_event_lock(lock)
+
+    @staticmethod
+    def _unlink_event_lock(lock: Path) -> None:
+        """Release a tiny lease despite transient Windows reader handles."""
+        for _ in range(200):
+            try:
+                lock.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                time.sleep(0.005)
+        lock.unlink(missing_ok=True)
 
     def read_events(self, run_id: str) -> list[dict[str, Any]]:
         p = self.events_path(run_id)
@@ -319,6 +387,77 @@ class StorageLayout:
                 except json.JSONDecodeError:
                     continue
         return events
+
+    def read_event_lines_from(
+        self,
+        run_id: str,
+        offset: int = 0,
+    ) -> tuple[list[tuple[dict[str, Any], str]], int]:
+        """Read only complete event lines appended after a byte cursor.
+
+        The returned cursor stops before an incomplete trailing line, so a
+        concurrent writer can finish that line and the next read will see it.
+        """
+        path = self.events_path(run_id)
+        if not path.exists():
+            return [], 0
+        size = path.stat().st_size
+        cursor = min(max(offset, 0), size)
+        with open(path, "rb") as stream:
+            stream.seek(cursor)
+            payload = stream.read()
+        if not payload:
+            return [], cursor
+        last_newline = payload.rfind(b"\n")
+        if last_newline < 0:
+            return [], cursor
+        complete = payload[: last_newline + 1]
+        next_cursor = cursor + len(complete)
+        events: list[tuple[dict[str, Any], str]] = []
+        for raw_line in complete.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                line = raw_line.decode("utf-8")
+                events.append((json.loads(line), line))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return events, next_cursor
+
+    def event_offset_after_seq(self, run_id: str, seq: int) -> int:
+        """Locate the byte cursor immediately after ``seq`` for SSE resume."""
+        if seq <= 0:
+            return 0
+        offset = 0
+        while True:
+            events, next_offset = self.read_event_lines_from(run_id, offset)
+            for event, line in events:
+                line_end = offset + len((line + "\n").encode("utf-8"))
+                offset = line_end
+                if int(event.get("seq", 0)) >= seq:
+                    return offset
+            if next_offset <= offset or not events:
+                return next_offset
+            offset = next_offset
+
+    @staticmethod
+    def tail_text_lines(path: Path, limit: int, chunk_size: int = 64 * 1024) -> list[str]:
+        """Return a bounded line tail by seeking backward from file end."""
+        if limit <= 0 or not path.is_file():
+            return []
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            position = stream.tell()
+            chunks: list[bytes] = []
+            newline_count = 0
+            while position > 0 and newline_count <= limit:
+                size = min(chunk_size, position)
+                position -= size
+                stream.seek(position)
+                chunk = stream.read(size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+        return b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-limit:]
 
     def repair_events_file(self, run_id: str) -> int:
         """Truncate events.jsonl to its last complete, parseable line.
@@ -359,62 +498,16 @@ class StorageLayout:
         self.atomic_write(p, repaired)
         return len(raw) - len(repaired)
 
-    def sync_run_projection(self, run_id: str, *, claim_held: bool = True) -> RunProjection:
-        """Recompute run.json lifecycle fields from events.jsonl.
-
-        The only place run.json "status" field is written
-        (CORE-ARCHITECTURE.md Sec 1.4): a pure projection of the event log,
-        never an independent write. Callers (run_worker.py,
-        reconcile_orphaned_runs) call this after appending or observing
-        events instead of computing/writing a status themselves. Preserves
-        every other field already in run.json (commit data, pid
-        bookkeeping). Status, timestamps, exit code, and error are disposable
-        projections of lifecycle events; commit data remains untouched. Status
-        is left alone when there are no events yet (run.json may still hold its
-        just-created QUEUED write), while stale terminal metadata is cleared.
-
-        `claim_held` (default True, matching every existing caller except
-        one) distinguishes a resync driven by a Run whose claim this
-        process actually found held -- run_worker.execute_run's own call
-        (its claim is held for the Run's entire execution), and
-        reconcile_orphaned_runs whenever it found the claim still held
-        before releasing it -- from a resync of a Run that was never
-        claimed at all since its most recent (re)queue.
-
-        Only in that unclaimed case can run.json's own QUEUED write (made
-        directly by create_run/rerun_run, still the only other status
-        writer per the invariant above) be more current than what the
-        event log alone can justify: REMAINING-DESIGNS.md Sec 1 requires
-        reopening execution to be represented by a fresh run.started,
-        which by design (run_projector.py's rule table; see
-        tests/fixtures/run-projection/trailing-queued-after-terminal-does-not-requeue)
-        a bare run.queued rerun/audit event never retroactively supplies --
-        so projecting the event log alone would silently revert a
-        just-requeued, not-yet-picked-up Run back to its previous terminal
-        status. Skipping the overwrite here -- only when this Run's claim
-        was not held and reconcile_orphaned_runs did not otherwise need to
-        intervene for it in this pass -- closes a real gap: a Backend
-        restart between "rerun requested" and "the worker dequeues it"
-        previously discarded the rerun with no error anywhere (`_dequeue`
-        never finding a QUEUED run again, because this function had just
-        reverted it back to its prior terminal status).
-        """
+    def project_run_snapshot(self, run_id: str) -> tuple[RunProjection, dict[str, Any]]:
+        """Project lifecycle state from the Journal without writing a second truth."""
         events = self.read_events(run_id)
         projection = project_run(events)
-        run_json = self.resolve(run_id, "run.json")
-        current = self.read_json(run_json) or {"run_id": run_id}
-        updated = dict(current)
-        pending_requeue_not_yet_claimed = (
-            not claim_held
-            and current.get("status") == "QUEUED"
-            and projection.status not in (None, "QUEUED")
-        )
-        if projection.status is not None and not pending_requeue_not_yet_claimed:
-            updated["status"] = projection.status
-        updated.update(_project_lifecycle_metadata(events, updated.get("status")))
-        updated["projected_at_seq"] = projection.projected_at_seq
-        self.atomic_write_json(run_json, updated)
-        return projection
+        lifecycle = _project_lifecycle_metadata(events, projection.status)
+        lifecycle.update({
+            "status": projection.status,
+            "projected_at_seq": projection.projected_at_seq,
+        })
+        return projection, lifecycle
 
     # -- Logs (deep operations) --
 
@@ -647,7 +740,7 @@ class StorageLayout:
                 result.append(normalized)
         return result
 
-    def write_results_manifest(self, run_id: str) -> Path:
+    def write_results_manifest(self, run_id: str, definition_revision_id: str) -> Path:
         run_root = self.resolve(run_id)
         run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
         submitted_inputs = {
@@ -716,20 +809,23 @@ class StorageLayout:
             workflow_entries.append({"path": rel, "size": source.stat().st_size, "sha256": digest})
 
         entries.sort(key=lambda entry: entry["path"])
-        revision_id = f"rev-{self.recover_seq(run_id):08d}"
+        journal_seq = self.recover_seq(run_id)
+        revision_id = f"rev-{journal_seq:08d}"
+        previous_manifest = self.read_json(self.resolve(run_id, "results.manifest.json")) or {}
         manifest = {
             "schema_version": 2,
             "run_id": run_id,
             "revision_id": revision_id,
-            "parent_revision_id": run_data.get("current_revision"),
+            "definition_revision_id": definition_revision_id,
+            "journal_seq": journal_seq,
+            "parent_revision_id": previous_manifest.get("revision_id"),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "files": entries,
             "workflow_files": sorted(workflow_entries, key=lambda entry: entry["path"]),
         }
         target = self.resolve(run_id, "results.manifest.json")
-        self.atomic_write_json(target, manifest)
         self.atomic_write_json(self.resolve(run_id, "revisions", f"{revision_id}.json"), manifest)
-        self.atomic_write_json(self.resolve(run_id, "run.json"), {**run_data, "current_revision": revision_id})
+        self.atomic_write_json(target, manifest)
         return target
 
     @staticmethod
@@ -762,20 +858,17 @@ class StorageLayout:
             raise ValueError("invalid blob digest")
         return self.data / "store" / digest[:2] / digest
 
-    def _engine_pid_alive(self, data: dict[str, Any]) -> bool:
-        """Whether the recorded engine_runner child (the actual computation
-        process, not the worker/uvicorn process that dequeued it) is still
-        alive. Only engine_pid is treated as authoritative evidence of a
-        live execution -- pid is the worker own bookkeeping and, being
-        just an OS pid number, is too easily a stale/reused value to trust
-        for "is this Run still really running"."""
+    def _engine_pid_alive(self, run_id: str) -> bool:
+        """Whether the disposable Snakemake process record is still alive."""
         import psutil
-        engine_pid = data.get("engine_pid")
+        process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
+        engine_pid = process.get("engine_pid")
         return bool(engine_pid) and psutil.pid_exists(int(engine_pid))
 
-    def _kill_engine_pid(self, data: dict[str, Any]) -> None:
+    def _kill_engine_pid(self, run_id: str) -> None:
         import psutil
-        engine_pid = data.get("engine_pid")
+        process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
+        engine_pid = process.get("engine_pid")
         if not engine_pid:
             return
         try:
@@ -789,10 +882,7 @@ class StorageLayout:
             pass  # best-effort; reconciliation proceeds regardless
 
     def reconcile_orphaned_runs(self) -> list[str]:
-        """Recover Runs whose worker died -- driven by events, not by trusting
-        run.json own "status" field, and always converging within this one
-        pass (CORE-ARCHITECTURE.md Sec 1.4, REMAINING-DESIGNS.md Sec 1
-        "Recovery convergence").
+        """Recover Runs whose worker died from Journal and runtime facts.
 
         Four things happen for every Run directory, in order:
 
@@ -826,13 +916,8 @@ class StorageLayout:
              needed, only the claim release from step 2.
            Both shapes append an event, matching "orphan kill and recovery
            always emit an event" -- a silent run.json rewrite never does.
-        4. sync_run_projection -- every Run, orphaned or not, gets
-           run.json resynced from its (possibly just-updated) projection.
-           This is what closes the crash window between "event appended"
-           and "projection updated" (crash point a): a Run whose events
-           already carried a terminal fact when this process died, but
-           whose run.json never caught up, converges here with no new
-           event needed.
+        The immutable definition is never rewritten. SQLite and API snapshots
+        catch up by replaying the repaired Journal.
         """
         recovered: list[str] = []
         runs = self.data / "runs"
@@ -849,38 +934,37 @@ class StorageLayout:
 
             self.repair_events_file(run_id)
             projection = project_run(self.read_events(run_id))
-            data = self.read_json(directory / "run.json") or {}
-
             was_claimed = self.is_claimed(run_id)
             if was_claimed:
                 self.release_claim(run_id)
 
-            intervened = False
             if projection.status == "RUNNING":
                 has_open_range = any(r.is_open for r in projection.ranges)
-                if has_open_range and not self._engine_pid_alive(data):
-                    self._kill_engine_pid(data)
+                if has_open_range and not self._engine_pid_alive(run_id):
+                    self._kill_engine_pid(run_id)
                     from src.execution_runtime.events import EventEmitter
-                    EventEmitter(run_id).run_failed(
-                        exit_code=None,
-                        run_time_seconds=0.0,
-                        error_message="orphaned: worker process not found (backend restarted)",
-                    )
+                    active_range = next(r for r in reversed(projection.ranges) if r.is_open)
+                    manifest = self.read_json(self.resolve(run_id, "results.manifest.json")) or {}
+                    if (
+                        manifest.get("definition_revision_id") == active_range.revision_id
+                        and int(manifest.get("journal_seq", 0)) >= active_range.start_seq
+                    ):
+                        EventEmitter(run_id).run_succeeded(
+                            revision_id=active_range.revision_id,
+                            run_time_seconds=0.0,
+                        )
+                    else:
+                        EventEmitter(run_id).run_failed(
+                            revision_id=active_range.revision_id,
+                            exit_code=None,
+                            run_time_seconds=0.0,
+                            error_message="orphaned: worker process not found (backend restarted)",
+                        )
                     recovered.append(run_id)
-                    intervened = True
             elif projection.status == "QUEUED" and was_claimed:
                 from src.execution_runtime.events import EventEmitter
                 EventEmitter(run_id).run_action("orphan_reclaimed", "system")
                 recovered.append(run_id)
-                intervened = True
-
-            # `claim_held` also folds in whether this pass just intervened
-            # for this Run (appended an orphan-recovery event above): a Run
-            # this reconciliation pass had to act on is never the "cleanly
-            # requeued, waiting for its first pickup" case sync_run_projection
-            # guards against, regardless of whether a claim survived to be
-            # released in step 2.
-            self.sync_run_projection(run_id, claim_held=was_claimed or intervened)
 
         return recovered
 
@@ -979,23 +1063,6 @@ def _resolve_backend_root() -> Path:
     # A relocatable source checkout may not have runtime assets materialized yet.
     # Keep the root beside the Backend package so bootstrap can create it.
     return module_backend
-
-
-def get_system_root() -> Path:
-    """System asset root directory.
-
-    TDEASE_SYSTEM_ROOT is an optional deployment override. Otherwise the
-    installed sibling or repository system asset root is used.
-    """
-    from pathlib import Path as _Path
-    configured = os.environ.get("TDEASE_SYSTEM_ROOT")
-    if configured and configured.strip():
-        return _Path(configured).expanduser().resolve()
-    backend_root = get_storage().data
-    sibling = backend_root.parent / "system"
-    if sibling.is_dir():
-        return sibling
-    return _Path(__file__).resolve().parents[2] / "data" / "system"
 
 
 def get_tools_root() -> Path:

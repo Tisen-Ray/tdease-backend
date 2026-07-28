@@ -32,6 +32,13 @@ class RunStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class RunExecutionMode(str, Enum):
+    """How one immutable Run revision is requested for execution."""
+
+    EXECUTE = "execute"
+    CONTINUE = "continue"
+
+
 class EventType(str, Enum):
     """
     事件类型 — events.jsonl 中每行的 type 字段。
@@ -39,7 +46,8 @@ class EventType(str, Enum):
     事件只增不删，按 seq 单调递增。客户端通过 Last-Event-ID 断点续传。
 
     产品事件（稳定 schema，UI/SSE/Agent 消费）:
-      run.queued, run.started, run.succeeded, run.failed, run.cancelled
+      run.submitted, run.queue_requested, run.started,
+      run.succeeded, run.failed, run.cancelled
       task.started, task.progress, task.succeeded, task.failed
 
     诊断事件（仅 human/tool 调试，不驱动状态）:
@@ -47,7 +55,8 @@ class EventType(str, Enum):
     """
 
     # Run 级产品事件
-    RUN_QUEUED = "run.queued"
+    RUN_SUBMITTED = "run.submitted"
+    RUN_QUEUE_REQUESTED = "run.queue_requested"
     RUN_STARTED = "run.started"
     RUN_SUCCEEDED = "run.succeeded"
     RUN_FAILED = "run.failed"

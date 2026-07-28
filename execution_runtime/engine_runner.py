@@ -70,7 +70,7 @@ class _JobEventHandler(logging.Handler):
             LogEvent.JOB_FINISHED: "job.succeeded",
             LogEvent.JOB_ERROR: "job.failed",
         }
-        event_type = mapping.get(event)
+        event_type = mapping.get(event) if event is not None else None
         job_id = getattr(record, "jobid", getattr(record, "job_id", None))
         rule = getattr(record, "rule_name", None)
         if event == LogEvent.JOB_INFO and job_id is not None and rule:
@@ -181,6 +181,8 @@ def main() -> int:
                     force_incomplete=request.rerun_incomplete,
                 )
             )
+            if request.unlock_before_execute:
+                dag.unlock()
             needs_graph = bool(request.projection_path or (request.mode == "execute" and request.job_event_path))
             projection = None
             if needs_graph:

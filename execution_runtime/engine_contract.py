@@ -17,5 +17,6 @@ class WorkflowEngineRequest(BaseModel):
     rerun_mode: Literal["resume", "overwrite"] = "resume"
     rerun_incomplete: bool = True
     retries: int = Field(default=0, ge=0)
+    unlock_before_execute: bool = False
     projection_path: str | None = None
     job_event_path: str | None = None
