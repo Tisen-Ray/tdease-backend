@@ -11,7 +11,6 @@ TDEase-zero API Server — 极简 FastAPI 后端。
 from __future__ import annotations
 
 import logging
-import asyncio
 import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -82,18 +81,6 @@ async def lifespan(app: FastAPI):
         logger.exception("Run index rebuild failed; filesystem fallbacks remain available")
     logger.info("Database ready: %s", db_path)
 
-    worker_stop = None
-    worker_task = None
-    if BACKEND_SETTINGS.embedded_worker:
-        from threading import Event
-        from src.services.run_worker import run_loop
-
-        worker_stop = Event()
-        worker_task = asyncio.create_task(
-            asyncio.to_thread(run_loop, 1.0, False, worker_stop)
-        )
-        logger.info("Embedded run worker started")
-
     # Workspace root containment: until this is wired, the fail-closed default in
     # src/execution_runtime/workspace_containment.py approves no root for anyone and
     # every local materialization raises WORKSPACE_PATH_ESCAPE. The registry is the
@@ -111,10 +98,6 @@ async def lifespan(app: FastAPI):
 
     logger.info("TDEase-zero ready")
     yield
-    if worker_stop:
-        worker_stop.set()
-    if worker_task:
-        await worker_task
     logger.info("TDEase-zero shutting down")
 
 # ---------------------------------------------------------------------------
