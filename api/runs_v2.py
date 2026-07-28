@@ -144,6 +144,20 @@ def _resolve_memory_budget(memory_mb: int | None) -> int:
     return requested
 
 
+def _schedule_commit(commit, user_id: str):
+    """Apply the Backend-owned scheduling envelope to an accepted definition.
+
+    Callers may describe a workflow, but they do not control process memory or
+    the engine's parallelism ceiling. Snakemake schedules rule-level threads
+    and resources inside this fixed Backend budget.
+    """
+    return commit.model_copy(update={
+        "user_id": user_id,
+        "cores": RESOURCE_BUDGET.compute_cpus,
+        "memory_mb": RESOURCE_BUDGET.compute_memory_mb,
+    })
+
+
 def _workspace_execution_error(exc: ExecutionError) -> TDEaseError:
     return TDEaseError(
         code=ErrorCode(exc.code.value),
@@ -215,6 +229,22 @@ def _select_materialization_strategy(commit) -> str:
             retryable=False,
         )
     return requested
+
+
+def _is_same_workspace_run(existing: dict, commit) -> bool:
+    """A Run id is the durable execution identity of one Workspace Run.
+
+    Reusing that id is allowed only for a new immutable definition of the same
+    Workspace directory. It must never turn an arbitrary id collision into a
+    cross-workspace overwrite.
+    """
+    existing_path = existing.get("workspace_run_path") or existing.get("local_run_path")
+    submitted_path = commit.workspace_run_path or commit.local_run_path
+    return (
+        existing.get("workspace_id") == commit.workspace_id
+        and isinstance(existing_path, str)
+        and existing_path == submitted_path
+    )
 
 
 def _is_owner(data: dict, request: Request) -> bool:
@@ -310,7 +340,7 @@ def _run_status_value(run_id: str, storage) -> RunStatus:
 
 def _run_status_response(data: dict, storage) -> RunStatusResponse:
     run_id = data.get("run_id", "")
-    _projection, lifecycle = storage.project_run_snapshot(run_id)
+    projection, lifecycle = storage.project_run_snapshot(run_id)
     status_value = lifecycle.get("status")
     if status_value is None:
         raise TDEaseError(
@@ -343,7 +373,14 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
         name=str(labels.get("name") or run_id),
         workspace_id=data.get("workspace_id", ""),
         workspace_run_path=data.get("workspace_run_path") or data.get("local_run_path"),
-        current_revision=manifest.get("revision_id"),
+        # The execution definition exists from run.submitted onward. A results
+        # manifest is only a terminal-success artifact, so it cannot be the
+        # source for the live Run header's revision identity.
+        current_revision=(
+            manifest.get("revision_id")
+            if status_value == RunStatus.SUCCEEDED.value and manifest.get("revision_id")
+            else projection.current_revision_id
+        ),
         status=RunStatus(status_value),
         materialization_strategy=strategy,
         cores=data.get("cores", 4),
@@ -364,11 +401,7 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
 async def dry_run(payload: RunDryRunRequest, request: Request):
     """Validate an immutable client snapshot with the real workflow engine."""
     await _reject_legacy_mode_field(request)
-    commit = payload.commit.model_copy(update={
-        "user_id": request.state.principal.user_id,
-        "memory_mb": _resolve_memory_budget(payload.commit.memory_mb),
-    })
-    _validate_compute_budget(commit.cores)
+    commit = _schedule_commit(payload.commit, request.state.principal.user_id)
     inline_blobs = payload.inline_blobs
     storage = get_storage()
     if not storage.claim_execution_slot():
@@ -514,6 +547,7 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
             snakefile="Snakefile",
             config=commit.config,
             cores=commit.cores,
+            memory_mb=commit.memory_mb,
             targets=commit.targets,
             rerun_mode="resume",
             projection_path=".tdease/workflow-projection.json",
@@ -550,11 +584,7 @@ def _create_run(body: RunCreateRequest, request: Request):
 
     使用 Storage Layout 原子写入 run.json + 初始事件。
     """
-    commit = body.commit.model_copy(update={
-        "user_id": request.state.principal.user_id,
-        "memory_mb": _resolve_memory_budget(body.commit.memory_mb),
-    })
-    _validate_compute_budget(commit.cores)
+    commit = _schedule_commit(body.commit, request.state.principal.user_id)
     storage = get_storage()
 
     # Idempotent allocation (creates dir if not exists)
@@ -562,19 +592,29 @@ def _create_run(body: RunCreateRequest, request: Request):
 
     run_json = storage.resolve(commit.run_id, "run.json")
 
-    # Check idempotency first
+    # Check idempotency first. A fresh idempotency key for the same Workspace
+    # Run is a new definition revision, not a second anonymous Backend Run.
     existing = storage.read_json(run_json)
     if existing and existing.get("idempotency_key") == commit.idempotency_key:
         _index_run(existing, storage)
         return RunCreateResponse(**_run_status_response(existing, storage).model_dump(), idempotent=True)
     if existing:
-        error = run_idempotency_conflict(commit.idempotency_key, commit.run_id)
-        raise TDEaseError(
-            code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
-            message=error.message,
-            remedy="Reuse the existing Run, or submit with a fresh idempotency_key.",
-            retryable=False,
-        )
+        if not _is_same_workspace_run(existing, commit):
+            error = run_idempotency_conflict(commit.idempotency_key, commit.run_id)
+            raise TDEaseError(
+                code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
+                message=error.message,
+                remedy="A Backend Run id belongs to one Workspace Run and cannot be reused elsewhere.",
+                retryable=False,
+            )
+        status = _run_status_value(commit.run_id, storage)
+        if status not in TERMINAL_STATUSES:
+            raise TDEaseError(
+                code=ErrorCode.RUN_NOT_TERMINAL,
+                message=f"Run {commit.run_id} is {status.value}; its definition cannot change while executing.",
+                remedy="Wait for the Run to become terminal, then submit the edited Workspace Run as a new revision.",
+                retryable=False,
+            )
 
     if not commit.workspace_files:
         raise TDEaseError(
@@ -651,6 +691,14 @@ def _create_run(body: RunCreateRequest, request: Request):
     run_data = commit.model_dump()
     run_data["snakefile"] = snake_text
     run_data = freeze_definition(run_data)
+    if existing:
+        # The row's creation time and user-facing title belong to the durable
+        # Workspace Run, while every frozen definition gets its own journal
+        # revision. Results from older successful definitions remain in
+        # revisions/*.json and their content-addressed blobs.
+        run_data["created_at"] = existing.get("created_at", run_data["created_at"])
+        if not run_data.get("labels"):
+            run_data["labels"] = existing.get("labels", {})
     storage.atomic_write_json(run_json, run_data)
 
     # Write initial event through storage (seq allocated by storage)
@@ -916,6 +964,20 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     storage = get_storage()
     workspace_id = data.get("workspace_id", "")
     specs = data.get("result_specs") or []
+    if not specs:
+        # The agent does not classify or select outputs. When a workflow has
+        # no optional product metadata, its Snakemake default targets are the
+        # authoritative publish set and receive a neutral file projection.
+        specs = [
+            {
+                "result_id": f"output-{hashlib.sha256(output.encode('utf-8')).hexdigest()[:20]}",
+                "name": Path(output).name,
+                "kind": "workflow_output",
+                "dimensions": {},
+                "output": output,
+            }
+            for output in storage.declared_output_files(run_id)
+        ]
     current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
     revision_id = current_manifest.get("revision_id")
     indexed = _indexed_files(run_id, revision_id) if isinstance(revision_id, str) else None
@@ -1101,7 +1163,11 @@ def list_run_files(
                 if rel in seen:
                     continue
                 seen.add(rel)
-                files.append({"path": rel, "size": candidate.stat().st_size, "sha256": ""})
+                files.append({
+                    "path": rel,
+                    "size": candidate.stat().st_size,
+                    "sha256": None,
+                })
         for rel in storage.declared_output_files(run_id):
             try:
                 declared = _run_file(run_id, rel)
