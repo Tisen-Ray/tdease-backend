@@ -11,7 +11,6 @@ TDEase-zero API Server — 极简 FastAPI 后端。
 from __future__ import annotations
 
 import logging
-import os
 import asyncio
 import socket
 from contextlib import asynccontextmanager
@@ -24,6 +23,7 @@ from time import perf_counter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from src.backend_settings import BACKEND_SETTINGS, BackendSettings
 
 # Path setup
 _project_root = Path(__file__).parent.parent
@@ -37,9 +37,8 @@ from app.database.lifecycle import migrate_database
 # ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
-log_level = getattr(logging, os.getenv("TDEASE_LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
-    level=log_level,
+    level=BACKEND_SETTINGS.log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()],
 )
@@ -53,7 +52,6 @@ from app.api.runs_v2 import router as runs_v2_router
 from app.api.files import router as files_router
 from app.api.uploads import router as uploads_router
 from app.api.nodes import router as nodes_router
-from app.api.templates import router as templates_router
 from app.api.capabilities import router as capabilities_router
 from app.core.workspace_roots import router as workspace_roots_router, get_workspace_root_registry
 from app.core.auth import authenticate_request, router as auth_router
@@ -64,7 +62,7 @@ from app.core.errors import ErrorCode, TDEaseError, register_error_handlers
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("TDEase-zero starting (env=%s)", os.getenv("TDEASE_ENV", "development"))
+    logger.info("TDEase-zero starting (env=%s)", BACKEND_SETTINGS.environment)
     from src.execution_runtime.storage import get_storage
     storage = get_storage()
     storage.bootstrap()
@@ -75,11 +73,18 @@ async def lifespan(app: FastAPI):
     migrate_database(db_path)
     check_database_health(db_path)
     get_workspace_root_registry().configure(db_path)
+    try:
+        from src.services.run_index import get_run_index
+
+        get_run_index().reconcile(storage)
+        logger.info("Run index reconciled from filesystem truth")
+    except Exception:
+        logger.exception("Run index rebuild failed; filesystem fallbacks remain available")
     logger.info("Database ready: %s", db_path)
 
     worker_stop = None
     worker_task = None
-    if os.getenv("TDEASE_EMBEDDED_WORKER", "1") == "1":
+    if BACKEND_SETTINGS.embedded_worker:
         from threading import Event
         from src.services.run_worker import run_loop
 
@@ -115,9 +120,9 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-_is_prod = os.getenv("TDEASE_ENV") == "production"
+_is_prod = BACKEND_SETTINGS.environment == "production"
 _service_instance_id = uuid.uuid4().hex
-_service_generation = os.getenv("TDEASE_BACKEND_GENERATION", _service_instance_id[:12])
+_service_generation = BACKEND_SETTINGS.backend_generation or _service_instance_id[:12]
 _service_started_at = datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(
@@ -176,7 +181,6 @@ app.include_router(runs_v2_router)
 app.include_router(files_router)
 app.include_router(uploads_router)
 app.include_router(nodes_router)
-app.include_router(templates_router)
 app.include_router(capabilities_router)
 app.include_router(workspace_roots_router)
 app.include_router(auth_router)
@@ -190,7 +194,7 @@ async def root():
     return {
         "name": "TDEase-zero",
         "version": "0.2.0",
-        "environment": os.getenv("TDEASE_ENV", "development"),
+        "environment": BACKEND_SETTINGS.environment,
     }
 
 
@@ -260,20 +264,16 @@ async def global_handler(request: Request, exc: Exception):
 # port was actually bound -- never a fixed 0.0.0.0:8000 that collides across
 # instances and is reachable from other local software.
 # ---------------------------------------------------------------------------
-def _resolve_backend_host() -> str:
-    """Loopback by default. Resolved once at process startup, never per-request."""
-    return os.getenv("TDEASE_BACKEND_HOST", "127.0.0.1")
+def _resolve_backend_host(settings: BackendSettings = BACKEND_SETTINGS) -> str:
+    """Return the host frozen by the process-wide startup settings."""
+    return settings.bind_host
 
 
-def _resolve_backend_port() -> int:
+def _resolve_backend_port(settings: BackendSettings = BACKEND_SETTINGS) -> int:
     """0 means "let the OS assign a free port" -- the Desktop default. A caller
     that wants a fixed port for local debugging may still set TDEASE_BACKEND_PORT.
     """
-    raw = os.getenv("TDEASE_BACKEND_PORT", "0")
-    try:
-        return int(raw)
-    except ValueError:
-        return 0
+    return settings.bind_port
 
 
 def _select_backend_port(host: str, port: int) -> int:
@@ -314,5 +314,5 @@ if __name__ == "__main__":
 
     _host = _resolve_backend_host()
     _port = _select_backend_port(_host, _resolve_backend_port())
-    _report_backend_port(_port, os.getenv("TDEASE_PORT_FILE"))
+    _report_backend_port(_port, BACKEND_SETTINGS.port_file)
     uvicorn.run("app.main:app", host=_host, port=_port, reload=False)

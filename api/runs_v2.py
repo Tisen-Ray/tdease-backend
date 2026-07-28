@@ -10,16 +10,16 @@ Runs API v2 — SSE 事件流 + 状态查询。
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import hashlib
 import base64
 import os
-import subprocess
 import sys
 import fnmatch
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
@@ -46,13 +46,16 @@ from src.contracts import (
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.errors import ExecutionError
+from src.contracts import ErrorCode as RuntimeErrorCode
 from src.execution_runtime.storage import get_storage, get_tools_root
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
+from src.execution_runtime.execution import run_captured_process
 from src.execution_runtime.workspace_containment import validate_root_containment
 from src.services.node_catalog import (
     materialize_bindings,
     resolve_bindings,
 )
+from src.services.run_definition import freeze_definition
 
 # Reuses the Backend's own startup-resolved capability document (frozen at import
 # time in app/api/capabilities.py) to select a materialization strategy instead of
@@ -62,9 +65,51 @@ from app.api.capabilities import _CAPABILITIES
 from app.core.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
+logger = logging.getLogger(__name__)
 
 LOCAL_WORKSPACE_HARDLINK = "local_workspace_hardlink"
 BLOB_STORE = "blob_store"
+
+
+def _index_run(data: dict, storage) -> None:
+    index = None
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        run_id = str(data.get("run_id", ""))
+        index.upsert_run(data, storage.recover_seq(run_id))
+        index.catch_up_run(storage, run_id)
+    except Exception:
+        if index is not None:
+            index.mark_dirty()
+        logger.exception("Run index update failed for %s", data.get("run_id"))
+
+
+def _remove_indexed_run(run_id: str) -> None:
+    index = None
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        index.remove_run(run_id)
+    except Exception:
+        if index is not None:
+            index.mark_dirty()
+        logger.exception("Run index removal failed for %s", run_id)
+
+
+def _indexed_files(run_id: str, revision_id: str) -> list[dict] | None:
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        if index.is_dirty():
+            index.reconcile(get_storage())
+        return index.files_for_revision(run_id, revision_id)
+    except Exception:
+        logger.exception("Run file index query failed for %s:%s", run_id, revision_id)
+        return None
 
 
 def _validate_compute_budget(cores: int) -> None:
@@ -80,6 +125,23 @@ def _validate_compute_budget(cores: int) -> None:
             remedy="Lower commit.cores to GET /api/capabilities limits.max_cores and retry.",
             retryable=False,
         )
+
+
+def _resolve_memory_budget(memory_mb: int | None) -> int:
+    requested = memory_mb if memory_mb is not None else RESOURCE_BUDGET.compute_memory_mb
+    if requested > RESOURCE_BUDGET.compute_memory_mb:
+        raise TDEaseError(
+            code=ErrorCode.RUN_PLAN_INVALID,
+            message=(
+                f"Run requests {requested} MB, but this Backend permits at most "
+                f"{RESOURCE_BUDGET.compute_memory_mb} MB; "
+                f"{RESOURCE_BUDGET.reserved_service_memory_mb} MB of "
+                f"{RESOURCE_BUDGET.total_memory_mb} MB is reserved for services."
+            ),
+            remedy="Lower commit.memory_mb to GET /api/capabilities limits.max_memory_mb and retry.",
+            retryable=False,
+        )
+    return requested
 
 
 def _workspace_execution_error(exc: ExecutionError) -> TDEaseError:
@@ -165,7 +227,7 @@ def _is_owner(data: dict, request: Request) -> bool:
     return data.get("user_id") == request.state.principal.user_id
 
 
-async def _owned_run(run_id: str, request: Request) -> dict:
+def _owned_run(run_id: str, request: Request) -> dict:
     """FastAPI dependency: load `run_id`'s run.json and enforce `_is_owner`.
 
     Applied via `Depends()` on every route addressed by `run_id` below, rather than
@@ -186,7 +248,7 @@ async def _owned_run(run_id: str, request: Request) -> dict:
     return data
 
 
-async def _owned_trashed_run(run_id: str, request: Request) -> dict:
+def _owned_trashed_run(run_id: str, request: Request) -> dict:
     """Same enforcement as `_owned_run`, for a Run currently in trash."""
     storage = get_storage()
     data = storage.read_json(storage.trash / "runs" / run_id / "run.json")
@@ -234,31 +296,66 @@ def _parse_datetime(value: object) -> datetime:
     return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
+def _run_status_value(run_id: str, storage) -> RunStatus:
+    projection, _lifecycle = storage.project_run_snapshot(run_id)
+    if projection.status is None:
+        raise TDEaseError(
+            code=ErrorCode.RUN_NOT_FOUND,
+            message=f"Run {run_id} has no submitted Journal entry.",
+            remedy="Resubmit the Run definition.",
+            retryable=False,
+        )
+    return RunStatus(projection.status)
+
+
 def _run_status_response(data: dict, storage) -> RunStatusResponse:
     run_id = data.get("run_id", "")
-    labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+    _projection, lifecycle = storage.project_run_snapshot(run_id)
+    status_value = lifecycle.get("status")
+    if status_value is None:
+        raise TDEaseError(
+            code=ErrorCode.RUN_NOT_FOUND,
+            message=f"Run {run_id} has no submitted Journal entry.",
+            remedy="Resubmit the Run definition.",
+            retryable=False,
+        )
+    raw_labels = data.get("labels")
+    labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
     manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
-    result_files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+    raw_result_files = manifest.get("files")
+    result_files: list = raw_result_files if isinstance(raw_result_files, list) else []
+    process = storage.read_json(storage.resolve(run_id, ".runtime", "process.json")) or {}
+    events = storage.read_events(run_id)
+    queue_event = next(
+        (event for event in reversed(events) if event.get("type") == "run.queue_requested"),
+        None,
+    )
+    queue_data = queue_event.get("data") if isinstance(queue_event, dict) else {}
+    if not isinstance(queue_data, dict):
+        queue_data = {}
     strategy = data.get("materialization_strategy") or LOCAL_WORKSPACE_HARDLINK
+    raw_rerun_mode = queue_data.get("rerun_mode")
+    rerun_mode: Literal["resume", "overwrite"] = (
+        raw_rerun_mode if raw_rerun_mode in ("resume", "overwrite") else "resume"
+    )
     return RunStatusResponse(
         run_id=run_id,
         name=str(labels.get("name") or run_id),
         workspace_id=data.get("workspace_id", ""),
         workspace_run_path=data.get("workspace_run_path") or data.get("local_run_path"),
-        current_revision=data.get("current_revision"),
-        status=RunStatus(data.get("status", "QUEUED")),
-        mode="local" if strategy == LOCAL_WORKSPACE_HARDLINK else "remote",
+        current_revision=manifest.get("revision_id"),
+        status=RunStatus(status_value),
         materialization_strategy=strategy,
         cores=data.get("cores", 4),
-        pid=data.get("pid"),
-        exit_code=data.get("exit_code"),
-        error=data.get("error"),
-        rerun_mode=data.get("rerun_mode", "resume"),
+        pid=process.get("engine_pid"),
+        exit_code=lifecycle.get("exit_code"),
+        error=lifecycle.get("error"),
+        rerun_mode=rerun_mode,
         labels={str(key): str(value) for key, value in labels.items()},
         result_file_count=len(result_files),
         created_at=_parse_datetime(data.get("created_at")),
-        started_at=_parse_datetime(data.get("started_at")) if data.get("started_at") else None,
-        finished_at=_parse_datetime(data.get("finished_at")) if data.get("finished_at") else None,
+        started_at=_parse_datetime(lifecycle.get("started_at")) if lifecycle.get("started_at") else None,
+        finished_at=_parse_datetime(lifecycle.get("finished_at")) if lifecycle.get("finished_at") else None,
         event_seq_last=storage.recover_seq(run_id),
     )
 
@@ -267,10 +364,28 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
 async def dry_run(payload: RunDryRunRequest, request: Request):
     """Validate an immutable client snapshot with the real workflow engine."""
     await _reject_legacy_mode_field(request)
-    commit = payload.commit.model_copy(update={"user_id": request.state.principal.user_id})
+    commit = payload.commit.model_copy(update={
+        "user_id": request.state.principal.user_id,
+        "memory_mb": _resolve_memory_budget(payload.commit.memory_mb),
+    })
     _validate_compute_budget(commit.cores)
     inline_blobs = payload.inline_blobs
     storage = get_storage()
+    if not storage.claim_execution_slot():
+        raise TDEaseError(
+            code=ErrorCode.RUN_DRY_RUN_UNAVAILABLE,
+            message="The Backend execution slot is busy with another Run or dry-run.",
+            remedy="Wait for the current execution to finish, then retry the dry-run.",
+            retryable=True,
+        )
+    try:
+        return await asyncio.to_thread(_dry_run_with_slot, commit, inline_blobs, storage)
+    finally:
+        storage.release_execution_slot()
+
+
+def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
+    """Materialize and supervise one dry-run without blocking the API event loop."""
     if not commit.workspace_files:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
@@ -304,7 +419,7 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
                 )
                 if workspace is None:
                     raise ExecutionError(
-                        ErrorCode.WORKSPACE_PATH_ESCAPE,
+                        RuntimeErrorCode.WORKSPACE_PATH_ESCAPE,
                         "Workspace root capability is missing, revoked, or the Run path escapes it.",
                     )
             except ExecutionError as exc:
@@ -408,7 +523,13 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
             engine_request.model_dump(),
         )
         command = [sys.executable, "-m", "src.execution_runtime.engine_runner"]
-        completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=300, env=os.environ)
+        completed = run_captured_process(
+            command,
+            root,
+            300,
+            commit.memory_mb,
+            os.environ,
+        )
         output = completed.stdout + completed.stderr
         projection = storage.read_json(root / ".tdease" / "workflow-projection.json")
         return {"valid": completed.returncode == 0, "exit_code": completed.returncode,
@@ -418,13 +539,21 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
 
 @router.post("", status_code=201, response_model=RunCreateResponse)
 async def create_run(body: RunCreateRequest, request: Request):
+    """Validate the request envelope, then perform durable submission off-loop."""
+    await _reject_legacy_mode_field(request)
+    return await asyncio.to_thread(_create_run, body, request)
+
+
+def _create_run(body: RunCreateRequest, request: Request):
     """
     提交 Run commit。
 
     使用 Storage Layout 原子写入 run.json + 初始事件。
     """
-    await _reject_legacy_mode_field(request)
-    commit = body.commit.model_copy(update={"user_id": request.state.principal.user_id})
+    commit = body.commit.model_copy(update={
+        "user_id": request.state.principal.user_id,
+        "memory_mb": _resolve_memory_budget(body.commit.memory_mb),
+    })
     _validate_compute_budget(commit.cores)
     storage = get_storage()
 
@@ -436,6 +565,7 @@ async def create_run(body: RunCreateRequest, request: Request):
     # Check idempotency first
     existing = storage.read_json(run_json)
     if existing and existing.get("idempotency_key") == commit.idempotency_key:
+        _index_run(existing, storage)
         return RunCreateResponse(**_run_status_response(existing, storage).model_dump(), idempotent=True)
     if existing:
         error = run_idempotency_conflict(commit.idempotency_key, commit.run_id)
@@ -473,7 +603,7 @@ async def create_run(body: RunCreateRequest, request: Request):
             )
             if local_run_root is None:
                 raise ExecutionError(
-                    ErrorCode.WORKSPACE_PATH_ESCAPE,
+                    RuntimeErrorCode.WORKSPACE_PATH_ESCAPE,
                     "Workspace root capability is missing, revoked, or the Run path escapes it.",
                 )
             storage.materialize_local_run_files(
@@ -517,17 +647,18 @@ async def create_run(body: RunCreateRequest, request: Request):
             retryable=False,
         ) from exc
 
-    # Atomically write run.json (status QUEUED)
+    # The Backend definition is immutable. Lifecycle belongs only to events.jsonl.
     run_data = commit.model_dump()
     run_data["snakefile"] = snake_text
-    run_data["status"] = "QUEUED"
-    run_data["rerun_mode"] = "resume"
+    run_data = freeze_definition(run_data)
     storage.atomic_write_json(run_json, run_data)
 
     # Write initial event through storage (seq allocated by storage)
     from src.execution_runtime.events import EventEmitter
     emitter = EventEmitter(commit.run_id)
-    emitter.run_queued(
+    revision_id = str(run_data["definition_revision_id"])
+    emitter.run_submitted(
+        revision_id,
         idempotency_key=commit.idempotency_key,
         workspace_tree_hash=commit.workspace_tree_hash,
         user_id=commit.user_id,
@@ -535,12 +666,19 @@ async def create_run(body: RunCreateRequest, request: Request):
         workflow_steps=0,
         actor=_actor(request),
     )
+    emitter.run_queue_requested(
+        revision_id,
+        "execute",
+        rerun_mode="resume",
+        actor=_actor(request),
+    )
+    _index_run(run_data, storage)
 
     return RunCreateResponse(**_run_status_response(run_data, storage).model_dump(), idempotent=False)
 
 
 @router.get("/trash", response_model=RunTrashListResponse)
-async def list_trashed_runs(request: Request):
+def list_trashed_runs(request: Request):
     storage = get_storage()
     entries: list[RunTrashEntry] = []
     for directory in storage.trashed_run_dirs():
@@ -548,7 +686,8 @@ async def list_trashed_runs(request: Request):
         if not _is_owner(data, request):
             continue
         metadata = storage.read_json(directory / ".tdease" / "trash.json") or {}
-        labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+        raw_labels = data.get("labels")
+        labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
         entries.append(RunTrashEntry(
             run_id=data.get("run_id", directory.name),
             name=str(labels.get("name") or data.get("run_id") or directory.name),
@@ -562,7 +701,7 @@ async def list_trashed_runs(request: Request):
 
 
 @router.post("/trash/{run_id}/restore", response_model=RunStatusResponse)
-async def restore_run(run_id: str, request: Request, _owned: dict = Depends(_owned_trashed_run)):
+def restore_run(run_id: str, request: Request, _owned: dict = Depends(_owned_trashed_run)):
     storage = get_storage()
     try:
         storage.restore_run(run_id)
@@ -583,35 +722,36 @@ async def restore_run(run_id: str, request: Request, _owned: dict = Depends(_own
     data = storage.read_json(storage.resolve(run_id, "run.json")) or {}
     from src.execution_runtime.events import EventEmitter
     EventEmitter(run_id).run_action("restore", _actor(request))
+    _index_run(data, storage)
+    index = None
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        for manifest in storage.revision_manifests(run_id):
+            index.replace_manifest(run_id, manifest)
+    except Exception:
+        if index is not None:
+            index.mark_dirty()
+        logger.exception("Run file index restore failed for %s", run_id)
     return _run_status_response(data, storage)
 
 
 @router.delete("/trash/{run_id}", status_code=204)
-async def purge_trashed_run(
+def purge_trashed_run(
     run_id: str,
     request: Request,
     _owned: dict = Depends(_owned_trashed_run),
 ) -> Response:
-    """Permanently remove a trashed Run and its legacy database projection."""
-    import sqlite3
-
+    """Permanently remove a trashed Run and its rebuildable index projection."""
     storage = get_storage()
-    database = storage.data / "database" / "db.sqlite3"
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("DELETE FROM runs WHERE id = ?", (run_id,))
-        storage.purge_trashed_run(run_id)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    storage.purge_trashed_run(run_id)
+    _remove_indexed_run(run_id)
     return Response(status_code=204)
 
 
 @router.get("/{run_id}", response_model=RunStatusResponse)
-async def get_run(run_id: str, data: dict = Depends(_owned_run)):
+def get_run(run_id: str, data: dict = Depends(_owned_run)):
     """查询 Run 状态 — 从 run.json + events.jsonl 投影。"""
     storage = get_storage()
     return _run_status_response(data, storage)
@@ -620,6 +760,35 @@ async def get_run(run_id: str, data: dict = Depends(_owned_run)):
 @router.get("/{run_id}/graph", response_model=RunWorkflowGraphResponse)
 def get_run_graph(run_id: str, data: dict = Depends(_owned_run)):
     """Project the frozen dry-run DAG through persisted structured job events."""
+    storage = get_storage()
+    try:
+        from src.services.run_index import get_run_index
+
+        indexed = get_run_index().graph_projection(run_id)
+        if indexed and indexed["projected_at_seq"] >= storage.recover_seq(run_id):
+            statuses = {job["job_id"]: job["status"] for job in indexed["jobs"]}
+            wildcards = {job["job_id"]: job["wildcards"] for job in indexed["jobs"]}
+            if _run_status_value(run_id, storage) == RunStatus.CANCELLED:
+                for node in indexed.get("nodes", []):
+                    statuses.setdefault(node.get("id"), "cancelled")
+            return {
+                "run_id": run_id,
+                "nodes": [
+                    {
+                        **node,
+                        "status": statuses.get(
+                            node.get("id"), node.get("initial_status", "waiting")
+                        ),
+                        "wildcards": wildcards.get(node.get("id"), {}),
+                    }
+                    for node in indexed.get("nodes", [])
+                ],
+                "edges": indexed.get("edges", []),
+            }
+    except Exception:
+        # A locked, dirty, or rebuilding index is never allowed to delay graph
+        # delivery. The immutable event log remains the authoritative fallback.
+        pass
     projection = {"nodes": [], "edges": []}
     statuses: dict[int, str] = {}
     wildcards: dict[int, dict[str, str]] = {}
@@ -628,7 +797,6 @@ def get_run_graph(run_id: str, data: dict = Depends(_owned_run)):
         "job.succeeded": "succeeded",
         "job.failed": "failed",
     }
-    storage = get_storage()
     for event in storage.read_events(run_id):
         if event.get("type") == "workflow.graph":
             payload = event.get("data") or {}
@@ -636,14 +804,14 @@ def get_run_graph(run_id: str, data: dict = Depends(_owned_run)):
             statuses.clear()
             wildcards.clear()
             continue
-        status = event_status.get(event.get("type"))
+        status = event_status.get(str(event.get("type", "")))
         payload = event.get("data") or {}
         job_id = payload.get("job_id")
         if status and isinstance(job_id, int):
             statuses[job_id] = status
             if isinstance(payload.get("wildcards"), dict):
                 wildcards[job_id] = {str(k): str(v) for k, v in payload["wildcards"].items()}
-    if data.get("status") == "CANCELLED":
+    if _run_status_value(run_id, storage) == RunStatus.CANCELLED:
         for node in projection.get("nodes", []):
             statuses.setdefault(node.get("id"), "cancelled")
     return {
@@ -658,12 +826,10 @@ def get_run_graph(run_id: str, data: dict = Depends(_owned_run)):
 
 
 @router.post("/{run_id}/rerun", response_model=RunActionResponse)
-async def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: dict = Depends(_owned_run)):
+def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: dict = Depends(_owned_run)):
     """Queue the same Run in place, preserving its incremental engine state."""
     storage = get_storage()
-    run_json = storage.resolve(run_id, "run.json")
-
-    status = RunStatus(data.get("status", "QUEUED"))
+    status = _run_status_value(run_id, storage)
     if status not in TERMINAL_STATUSES:
         raise TDEaseError(
             code=ErrorCode.RUN_NOT_TERMINAL,
@@ -675,31 +841,15 @@ async def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: 
     storage.clear_cancelled(run_id)
     storage.release_claim(run_id)
     storage.resolve(run_id, "results.manifest.json").unlink(missing_ok=True)
-    storage.atomic_write_json(
-        run_json,
-        {
-            **data,
-            "status": RunStatus.QUEUED.value,
-            "rerun_mode": body.mode,
-            "pid": None,
-            "engine_pid": None,
-            "exit_code": None,
-            "error": None,
-            "started_at": None,
-            "finished_at": None,
-        },
-    )
-
     from src.execution_runtime.events import EventEmitter
-    EventEmitter(run_id).run_queued(
-        rerun=True,
+    EventEmitter(run_id).run_queue_requested(
+        str(data["definition_revision_id"]),
+        "continue",
         rerun_mode=body.mode,
-        workspace_tree_hash=data.get("workspace_tree_hash", ""),
-        user_id=data.get("user_id", ""),
-        cores=data.get("cores", 1),
         actor=_actor(request),
     )
     EventEmitter(run_id).run_action("rerun", _actor(request), mode=body.mode)
+    _index_run(data, storage)
     return RunActionResponse(
         run_id=run_id,
         status=RunStatus.QUEUED,
@@ -709,9 +859,9 @@ async def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: 
 
 
 @router.post("/{run_id}/trash", response_model=RunTrashEntry)
-async def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
+def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
     storage = get_storage()
-    status = RunStatus(data.get("status", "QUEUED"))
+    status = _run_status_value(run_id, storage)
     if status not in TERMINAL_STATUSES:
         raise TDEaseError(
             code=ErrorCode.RUN_NOT_TERMINAL,
@@ -721,7 +871,8 @@ async def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_r
         )
     deleted_at = datetime.now(timezone.utc)
     deleted_by = _actor(request)
-    labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+    raw_labels = data.get("labels")
+    labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
     from src.execution_runtime.events import EventEmitter
     EventEmitter(run_id).run_action("trash", deleted_by)
     try:
@@ -732,6 +883,7 @@ async def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_r
             "deleted_at": deleted_at.isoformat(),
             "deleted_by": deleted_by,
         })
+        _remove_indexed_run(run_id)
     except FileExistsError as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
@@ -750,7 +902,7 @@ async def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_r
 
 
 @router.get("/{run_id}/results", response_model=RunResultsResponse)
-async def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
+def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     """Published Result projection: join `result_specs` against what actually
     materialized (docs/spec/WORKFLOW-RUN-CONTRACT.md 8.4; docs/design/CORE-ARCHITECTURE.md 3).
 
@@ -764,6 +916,13 @@ async def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     storage = get_storage()
     workspace_id = data.get("workspace_id", "")
     specs = data.get("result_specs") or []
+    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+    revision_id = current_manifest.get("revision_id")
+    indexed = _indexed_files(run_id, revision_id) if isinstance(revision_id, str) else None
+    indexed_by_path = {
+        entry["path"]: entry for entry in (indexed or [])
+        if entry.get("role") == "result" and isinstance(entry.get("path"), str)
+    }
     results: list[RunResultEntry] = []
     for spec in specs:
         result_id = spec.get("result_id", "")
@@ -774,8 +933,9 @@ async def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
         status = "declared"
         if path.is_file():
             status = "ready"
-            digest = storage.file_digest(path)
-            size = path.stat().st_size
+            indexed_entry = indexed_by_path.get(output)
+            digest = str(indexed_entry["sha256"]) if indexed_entry else storage.file_digest(path)
+            size = int(indexed_entry["size"]) if indexed_entry else path.stat().st_size
         results.append(RunResultEntry(
             result_id=result_id,
             name=spec.get("name", ""),
@@ -791,12 +951,12 @@ async def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
 
 
 @router.get("/{run_id}/files")
-async def list_run_files(
+def list_run_files(
     run_id: str,
     pattern: str = Query("results/**"),
     revision: Optional[str] = Query(None),
     include_workflow: bool = Query(False),
-    _owned: dict = Depends(_owned_run),
+    data: dict = Depends(_owned_run),
 ):
     """Return a hash-addressed manifest for pull/fetch and AI discovery.
 
@@ -838,8 +998,10 @@ async def list_run_files(
                 remedy="List retained revisions with GET /api/v2/runs/<run_id>/revisions.",
                 retryable=False,
             )
-        result_entries = manifest.get("files") if isinstance(manifest.get("files"), list) else []
-        workflow_entries = manifest.get("workflow_files") if isinstance(manifest.get("workflow_files"), list) else []
+        raw_result_entries = manifest.get("files")
+        result_entries: list = raw_result_entries if isinstance(raw_result_entries, list) else []
+        raw_workflow_entries = manifest.get("workflow_files")
+        workflow_entries: list = raw_workflow_entries if isinstance(raw_workflow_entries, list) else []
         entries = [
             *({**entry, "role": "result"} for entry in result_entries if isinstance(entry, dict)),
             *({**entry, "role": "workflow"} for entry in workflow_entries if include_workflow and isinstance(entry, dict)),
@@ -850,6 +1012,27 @@ async def list_run_files(
             and (pattern == "results/**" or fnmatch.fnmatch(entry["path"], pattern))
         ]
         return {"run_id": run_id, "revision_id": revision, "files": files}
+
+    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+    current_revision = current_manifest.get("revision_id")
+    if _run_status_value(run_id, storage) == RunStatus.SUCCEEDED and isinstance(current_revision, str):
+        indexed = _indexed_files(run_id, current_revision)
+        if indexed is not None:
+            files = [
+                {
+                    "path": entry["path"],
+                    "size": entry["size"],
+                    "sha256": entry["sha256"],
+                    "role": entry["role"],
+                }
+                for entry in indexed
+                if (include_workflow or entry.get("role") == "result")
+                and (
+                    pattern == "results/**"
+                    or fnmatch.fnmatch(str(entry.get("path", "")), pattern)
+                )
+            ]
+            return {"run_id": run_id, "revision_id": current_revision, "files": files}
 
     files = []
     seen: set[str] = set()
@@ -932,15 +1115,15 @@ async def list_run_files(
 
 
 @router.get("/{run_id}/files/{file_path:path}")
-async def download_run_file(
+def download_run_file(
     run_id: str,
     file_path: str,
     revision: Optional[str] = Query(None),
-    _owned: dict = Depends(_owned_run),
+    data: dict = Depends(_owned_run),
 ):
     """Stream one run snapshot/result file; Starlette provides HTTP Range support."""
+    storage = get_storage()
     if revision:
-        storage = get_storage()
         manifest = storage.revision_manifest(run_id, revision)
         entries = [
             *(manifest.get("files", []) if manifest else []),
@@ -979,16 +1162,29 @@ async def download_run_file(
             remedy="List the Run files with GET /api/v2/runs/<run_id>/files.",
             retryable=False,
         )
-    digest = get_storage().file_digest(path)
+    digest = None
+    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+    current_revision = current_manifest.get("revision_id")
+    if _run_status_value(run_id, storage) == RunStatus.SUCCEEDED and isinstance(current_revision, str):
+        indexed = _indexed_files(run_id, current_revision)
+        indexed_entry = next(
+            (entry for entry in (indexed or []) if entry.get("path") == file_path),
+            None,
+        )
+        if indexed_entry:
+            digest = str(indexed_entry.get("sha256", "")) or None
+    digest = digest or get_storage().file_digest(path)
     return FileResponse(path, filename=path.name, headers={"ETag": f'"sha256-{digest}"'})
 
 
 @router.get("/{run_id}/revisions")
-async def list_run_revisions(run_id: str, _owned: dict = Depends(_owned_run)):
+def list_run_revisions(run_id: str, _owned: dict = Depends(_owned_run)):
     revisions = []
     for manifest in get_storage().revision_manifests(run_id):
-        files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
-        workflow_files = manifest.get("workflow_files") if isinstance(manifest.get("workflow_files"), list) else []
+        raw_files = manifest.get("files")
+        files: list = raw_files if isinstance(raw_files, list) else []
+        raw_workflow_files = manifest.get("workflow_files")
+        workflow_files: list = raw_workflow_files if isinstance(raw_workflow_files, list) else []
         revisions.append({
             "revision_id": manifest.get("revision_id"),
             "parent_revision_id": manifest.get("parent_revision_id"),
@@ -1000,7 +1196,7 @@ async def list_run_revisions(run_id: str, _owned: dict = Depends(_owned_run)):
 
 
 @router.get("/{run_id}/log")
-async def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owned: dict = Depends(_owned_run)):
+def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owned: dict = Depends(_owned_run)):
     paths = [
         _run_file(run_id, "logs/tasks/engine.stdout.log"),
         _run_file(run_id, "logs/tasks/engine.stderr.log"),
@@ -1010,7 +1206,7 @@ async def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owne
         return PlainTextResponse("")
     lines: list[str] = []
     for path in existing:
-        lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        lines.extend(get_storage().tail_text_lines(path, tail))
     return PlainTextResponse("\n".join(lines[-tail:]) + ("\n" if lines else ""))
 
 
@@ -1024,7 +1220,6 @@ async def get_events_sse(
     storage = get_storage()
 
     async def event_generator():
-        events_file = storage.events_path(run_id)
         # query param 优先，其次读标准 SSE Last-Event-ID header
         cursor = last_event_id
         if cursor is None:
@@ -1035,37 +1230,38 @@ async def get_events_sse(
                 except (ValueError, TypeError):
                     cursor = 0
         sent_seq = cursor or 0
-
-        if events_file.exists():
-            for line in events_file.read_text(encoding="utf-8").strip().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    evt = json.loads(line)
-                    if evt.get("seq", 0) > sent_seq:
-                        yield f"id: {evt['seq']}\ndata: {line}\n\n"
-                        sent_seq = evt["seq"]
-                except json.JSONDecodeError:
-                    continue
+        file_offset = await asyncio.to_thread(
+            storage.event_offset_after_seq, run_id, sent_seq
+        )
 
         while True:
             if await request.is_disconnected():
                 break
-            if events_file.exists():
-                lines = events_file.read_text(encoding="utf-8").strip().splitlines()
-                for line in lines:
-                    if not line.strip():
-                        continue
-                    try:
-                        evt = json.loads(line)
-                        if evt.get("seq", 0) > sent_seq:
-                            yield f"id: {evt['seq']}\ndata: {line}\n\n"
-                            sent_seq = evt["seq"]
-                    except json.JSONDecodeError:
-                        continue
-            data = storage.read_json(storage.resolve(run_id, "run.json"))
-            if data and data.get("status") in ("SUCCEEDED", "FAILED", "CANCELLED"):
-                yield f"event: done\ndata: {{\"status\": \"{data['status']}\"}}\n\n"
+            event_lines, file_offset = await asyncio.to_thread(
+                storage.read_event_lines_from, run_id, file_offset
+            )
+            for evt, line in event_lines:
+                if evt.get("seq", 0) > sent_seq:
+                    yield f"id: {evt['seq']}\ndata: {line}\n\n"
+                    sent_seq = evt["seq"]
+            projection, _snapshot = await asyncio.to_thread(
+                storage.project_run_snapshot, run_id
+            )
+            if projection.status in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                # The Worker can append the terminal event after this loop's
+                # incremental read but before the projection snapshot. Never
+                # let `done` overtake journal bytes the snapshot has already
+                # observed; immediately drain from the current byte offset.
+                if sent_seq < projection.projected_at_seq:
+                    continue
+                payload = json.dumps(
+                    {
+                        "status": projection.status,
+                        "last_event_id": sent_seq,
+                    },
+                    separators=(",", ":"),
+                )
+                yield f"event: done\ndata: {payload}\n\n"
                 break
             await asyncio.sleep(0.5)
 
@@ -1076,7 +1272,7 @@ async def get_events_sse(
 
 
 @router.get("", response_model=RunListResponse)
-async def list_runs(
+def list_runs(
     request: Request,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
@@ -1084,11 +1280,35 @@ async def list_runs(
     status: list[RunStatus] | None = Query(default=None),
     query: Optional[str] = Query(default=None, min_length=1, max_length=200),
 ):
-    """列出 Run — 从文件系统扫描，只返回调用方 Principal 拥有的 Run。"""
+    """List owned Runs through the rebuildable index, with filesystem fallback."""
     storage = get_storage()
     runs_dir = storage.data / "runs"
     if not runs_dir.exists():
         return RunListResponse(runs=[], total=0, offset=offset, limit=limit, has_more=False)
+
+    try:
+        from src.services.run_index import get_run_index
+
+        index = get_run_index()
+        if index.is_dirty():
+            index.reconcile(storage)
+        run_ids, total = index.list_run_ids(
+            request.state.principal.user_id, offset, limit, workspace_id,
+            [item.value for item in status] if status else None, query,
+        )
+        page = []
+        for run_id in run_ids:
+            data = storage.read_json(storage.resolve(run_id, "run.json"))
+            if not data or not _is_owner(data, request):
+                raise RuntimeError(f"stale Run index row: {run_id}")
+            page.append(data)
+        runs = [_run_status_response(run, storage) for run in page]
+        return RunListResponse(
+            runs=runs, total=total, offset=offset, limit=limit,
+            has_more=offset + len(runs) < total,
+        )
+    except Exception:
+        logger.exception("Run index query failed; scanning filesystem truth")
 
     all_runs = []
     for rd in sorted(runs_dir.iterdir(), reverse=True):
@@ -1101,10 +1321,15 @@ async def list_runs(
             continue
         if workspace_id and data.get("workspace_id") != workspace_id:
             continue
-        if status and RunStatus(data.get("status", "QUEUED")) not in status:
-            continue
+        if status:
+            try:
+                if _run_status_value(str(data.get("run_id", rd.name)), storage) not in status:
+                    continue
+            except TDEaseError:
+                continue
         if query:
-            labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
+            raw_labels = data.get("labels")
+            labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
             haystack = " ".join([
                 str(data.get("run_id", "")),
                 str(data.get("workspace_id", "")),
@@ -1133,10 +1358,10 @@ async def list_runs(
 
 
 @router.post("/{run_id}/cancel", response_model=RunActionResponse)
-async def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
+def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
     """取消 Run — 通过 Storage Layout 写入 cancel 标记。"""
     storage = get_storage()
-    status = RunStatus(data.get("status", "QUEUED"))
+    status = _run_status_value(run_id, storage)
     if status not in (RunStatus.QUEUED, RunStatus.RUNNING):
         from src.contracts import run_not_queued
         raise TDEaseError(
@@ -1154,16 +1379,9 @@ async def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_
     # Dequeue: mark CANCELLED if still QUEUED (not yet claimed)
     response_status = status
     if status == RunStatus.QUEUED:
-        storage.atomic_write_json(
-            storage.resolve(run_id, "run.json"),
-            {
-                **data,
-                "status": RunStatus.CANCELLED.value,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        EventEmitter(run_id).run_cancelled()
+        EventEmitter(run_id).run_cancelled(str(data["definition_revision_id"]))
         response_status = RunStatus.CANCELLED
+        _index_run(data, storage)
 
     return RunActionResponse(
         run_id=run_id,

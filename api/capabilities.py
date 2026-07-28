@@ -4,10 +4,10 @@ The field-level contract lives in `docs/spec/CAPABILITIES.md`; this module is th
 code half of that contract and must match it field for field
 (`tests/test_capabilities.py` asserts the correspondence).
 
-Resolution happens exactly once, at import time (process startup). No request
-handler in this module reads an environment variable, touches the filesystem, or
-queries installed package metadata — the cached `_CAPABILITIES` instance is the only
-thing ever returned. Restarting the process is the only way the document changes.
+Resolution happens exactly once from the process-wide `BackendSettings`,
+`RuntimeInventory`, `CapabilityRegistry`, and `ResourceBudget`. No request handler
+reads deployment state; the cached `_CAPABILITIES` instance is the only thing ever
+returned. Restarting the process is the only way the document changes.
 
 This module intentionally does not wire itself into the app: it exports `router`
 only. Router registration (`app/main.py`) and the auth public-path allowlist
@@ -18,18 +18,25 @@ without a Bearer token or a bootstrap deadlock results.
 
 from __future__ import annotations
 
-import os
-from importlib import metadata as importlib_metadata
 from typing import Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
-from src.execution_runtime.resource_budget import RESOURCE_BUDGET
+
+from src.backend_settings import (
+    BACKEND_SETTINGS,
+    CAPABILITY_REGISTRY,
+    RUNTIME_INVENTORY,
+    BackendSettings,
+    CapabilityRegistry,
+    RuntimeInventory,
+)
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET, ResourceBudget
 
 # Bump only for a breaking change (removed/renamed/retyped field, changed field
 # meaning, narrowed limit). Additive changes never bump this. See
 # docs/spec/CAPABILITIES.md §5.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION: Literal[3] = 3
 
 MaterializationStrategy = Literal["local_workspace_hardlink", "blob_store"]
 
@@ -51,6 +58,12 @@ class LimitsCapability(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     max_cores: int
+    max_memory_mb: int
+    total_logical_cpus: int
+    reserved_service_cpus: int
+    total_memory_mb: int
+    reserved_service_memory_mb: int
+    max_concurrent_runs: Literal[1]
     dry_run_timeout_seconds: int
     log_tail_default_lines: int
     log_tail_max_lines: int
@@ -79,7 +92,7 @@ class CapabilitiesResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    protocol_version: int
+    protocol_version: Literal[3]
     auth: AuthCapability
     materialization: MaterializationCapability
     limits: LimitsCapability
@@ -88,106 +101,59 @@ class CapabilitiesResponse(BaseModel):
     multi_user: bool
 
 
-def _resolve_engine_version() -> str:
-    try:
-        return importlib_metadata.version("snakemake")
-    except importlib_metadata.PackageNotFoundError:
-        return "unknown"
-
-
-def _resolve_materialization_strategies() -> tuple[MaterializationStrategy, ...]:
-    # Resolved once at startup, never at request time (M0 grep gate; also
-    # docs/spec/CAPABILITIES.md §7, which removes this same read from
-    # app/api/runs_v2.py's request handlers).
-    mode = os.environ.get("TDEASE_DEPLOYMENT_MODE", "local").strip().lower()
-    if mode == "local":
-        return ("local_workspace_hardlink",)
-    return ("blob_store",)
-
-
-def _has_published_results() -> bool:
-    """Derived from the contract, never declared.
-
-    The Client branches on this flag to show or hide the Published Results panel
-    (docs/spec/CAPABILITIES.md: "`false`/absent: results are only reachable as raw
-    run files"). A hardcoded `True` here is not an optimistic default -- it makes
-    the Client render a panel the Backend cannot fill, and it did: this returned
-    `True` while `RunCommit` had no `result_specs`, there was no `/results` route,
-    and the Client gateway threw `UnsupportedBackendCapabilityError`.
-
-    Deriving it from the commit contract means the flag flips itself the moment
-    Published Results actually land, and cannot drift in either direction.
-    """
-    from src.contracts.run import RunCommit
-
-    return "result_specs" in RunCommit.model_fields
-
-
-def _has_run_definition() -> bool:
-    """Same rule as `_has_published_results`, applied to the Run definition view.
-
-    This was the last hardcoded `True` in this document. It claimed the Backend
-    could serve a Run's definition while no route existed to serve one -- the
-    Client's `getRunDefinition` throws `UnsupportedBackendCapabilityError`
-    unconditionally, which is the honest half of a contradiction the flag was
-    telling the other half of.
-
-    Derived from the response contract rather than the router, for the same
-    reason the two helpers around it are: `app.api.runs_v2` already imports this
-    module, so reaching back into it would be a circular import. A Run
-    definition the Backend can serve is one it can *describe*, so the presence
-    of the response model is the honest test.
-    """
-    import src.contracts.run as run_contracts
-
-    return hasattr(run_contracts, "RunDefinitionResponse")
-
-
-def _has_native_dry_run_projection() -> bool:
-    """Same rule: true only when the dry-run response can actually carry a
-    structured projection instead of engine text. Today `RunDryRunResponse` is
-    `{valid, exit_code, engine, output}` -- text only -- so this is false, and the
-    Client correctly renders preformatted output rather than a DAG."""
-    from src.contracts.run import RunDryRunResponse
-
-    return "projection" in RunDryRunResponse.model_fields
-
-
-def _build_capabilities() -> CapabilitiesResponse:
-    auth_mode = os.environ.get("TDEASE_AUTH_MODE", "local").strip().lower()
+def build_capabilities(
+    settings: BackendSettings,
+    inventory: RuntimeInventory,
+    registry: CapabilityRegistry,
+    budget: ResourceBudget,
+) -> CapabilitiesResponse:
+    strategies: tuple[MaterializationStrategy, ...] = (
+        ("local_workspace_hardlink",)
+        if settings.deployment_mode == "local"
+        else ("blob_store",)
+    )
     return CapabilitiesResponse(
         protocol_version=PROTOCOL_VERSION,
         auth=AuthCapability(
-            scheme="bearer" if auth_mode == "bearer" else "none",
-            bootstrap="desktop" if auth_mode == "bearer" else None,
+            scheme="bearer" if settings.auth_mode == "bearer" else "none",
+            bootstrap="desktop" if settings.auth_mode == "bearer" else None,
         ),
-        materialization=MaterializationCapability(
-            strategies=_resolve_materialization_strategies(),
-        ),
+        materialization=MaterializationCapability(strategies=strategies),
         limits=LimitsCapability(
-            max_cores=RESOURCE_BUDGET.compute_cpus,
-            dry_run_timeout_seconds=300,
-            log_tail_default_lines=200,
-            log_tail_max_lines=10000,
+            max_cores=budget.compute_cpus,
+            max_memory_mb=budget.compute_memory_mb,
+            total_logical_cpus=budget.logical_cpus,
+            reserved_service_cpus=budget.reserved_service_cpus,
+            total_memory_mb=budget.total_memory_mb,
+            reserved_service_memory_mb=budget.reserved_service_memory_mb,
+            max_concurrent_runs=budget.max_concurrent_runs,
+            dry_run_timeout_seconds=settings.dry_run_timeout_seconds,
+            log_tail_default_lines=settings.log_tail_default_lines,
+            log_tail_max_lines=settings.log_tail_max_lines,
         ),
         engine=EngineCapability(
-            name="snakemake",
-            version=_resolve_engine_version(),
-            execution_profile="desktop-local",
+            name=inventory.engine_name,
+            version=inventory.engine_version,
+            execution_profile=inventory.execution_profile,
         ),
         features=FeatureCapability(
-            run_definition=_has_run_definition(),
-            published_results=_has_published_results(),
-            native_dry_run_projection=_has_native_dry_run_projection(),
-            mutable_run_title=False,
-            cursor_logs=False,
+            run_definition=registry.run_definition,
+            published_results=registry.published_results,
+            native_dry_run_projection=registry.native_dry_run_projection,
+            mutable_run_title=registry.mutable_run_title,
+            cursor_logs=registry.cursor_logs,
         ),
-        multi_user=False,
+        multi_user=registry.multi_user,
     )
 
 
-# Resolved once, at import time. Every request returns this same instance.
-_CAPABILITIES: CapabilitiesResponse = _build_capabilities()
+# Resolved once at process startup. Every request returns this same instance.
+_CAPABILITIES: CapabilitiesResponse = build_capabilities(
+    BACKEND_SETTINGS,
+    RUNTIME_INVENTORY,
+    CAPABILITY_REGISTRY,
+    RESOURCE_BUDGET,
+)
 
 
 router = APIRouter(prefix="/api/capabilities", tags=["capabilities"])

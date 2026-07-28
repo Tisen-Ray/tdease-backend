@@ -8,7 +8,6 @@ Bearer authentication explicitly with ``TDEASE_AUTH_MODE=bearer``.
 from __future__ import annotations
 
 import logging
-import os
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.errors import ErrorCode, TDEaseError
+from src.backend_settings import BACKEND_SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +159,9 @@ class DesktopAuth:
         return LOCAL_OWNER
 
 
-AUTH_MODE = os.environ.get("TDEASE_AUTH_MODE", "local").strip().lower()
-if AUTH_MODE not in {"local", "bearer"}:
-    raise RuntimeError("TDEASE_AUTH_MODE must be 'local' or 'bearer'")
 desktop_auth = DesktopAuth(
-    os.environ.pop("TDEASE_BOOTSTRAP_SECRET", None),
-    required=AUTH_MODE == "bearer",
+    BACKEND_SETTINGS.bootstrap_secret,
+    required=BACKEND_SETTINGS.auth_mode == "bearer",
 )
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -206,7 +203,7 @@ PUBLIC_PATHS = frozenset({
 
 
 async def authenticate_request(request: Request) -> Principal:
-    if AUTH_MODE == "local":
+    if BACKEND_SETTINGS.auth_mode == "local":
         return LOCAL_OWNER
     # A CORS preflight is never authenticated: the browser sends OPTIONS with
     # no Authorization header by specification, and refuses to send the real
