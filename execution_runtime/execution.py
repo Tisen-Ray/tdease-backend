@@ -14,11 +14,13 @@ import signal
 import subprocess
 import threading
 import time
+import json
 from pathlib import Path
 from typing import Optional, Sequence
 
 from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.storage import get_storage
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 
 
 def execute_task(
@@ -57,6 +59,8 @@ def execute_task(
     stderr_lines: list[str] = []
 
     try:
+        if task_id == "engine":
+            (run_dir / ".tdease" / "job-events.jsonl").unlink(missing_ok=True)
         popen_kwargs: dict = dict(
             shell=isinstance(command, str),
             stdout=subprocess.PIPE,
@@ -71,6 +75,13 @@ def execute_task(
             popen_kwargs["start_new_session"] = True
 
         proc = subprocess.Popen(command, **popen_kwargs)
+        if task_id == "engine":
+            _isolate_engine_process(run_id, task_id, proc.pid)
+            threading.Thread(
+                target=_isolate_engine_descendants,
+                args=(proc.pid,),
+                daemon=True,
+            ).start()
         # 记录 engine_runner 真实 pid（非 worker/uvicorn pid），
         # 以便 reconcile_orphaned_runs 正确识别并 kill 孤儿进程。
         if task_id == "engine":
@@ -104,11 +115,22 @@ def execute_task(
         for reader in readers:
             reader.start()
 
+        job_event_stop = threading.Event()
+        job_event_reader = None
+        if task_id == "engine" and emitter is not None:
+            job_event_reader = threading.Thread(
+                target=_relay_job_events,
+                args=(run_dir / ".tdease" / "job-events.jsonl", emitter, job_event_stop),
+                daemon=True,
+            )
+            job_event_reader.start()
+
         deadline = start + timeout
         while proc.poll() is None:
             # Check cancel
             if storage.check_cancelled(run_id):
                 _kill_process_group(proc)
+                job_event_stop.set()
                 elapsed = time.perf_counter() - start
                 if emitter:
                     emitter.task_failed(task_id, -1, elapsed, "cancelled")
@@ -119,6 +141,7 @@ def execute_task(
             # Check timeout
             if time.perf_counter() > deadline:
                 _kill_process_group(proc)
+                job_event_stop.set()
                 elapsed = time.perf_counter() - start
                 msg = f"task timed out after {timeout}s"
                 if emitter:
@@ -131,6 +154,9 @@ def execute_task(
 
         for reader in readers:
             reader.join(timeout=2)
+        job_event_stop.set()
+        if job_event_reader:
+            job_event_reader.join(timeout=2)
 
         exit_code = proc.returncode
 
@@ -155,6 +181,73 @@ def execute_task(
             emitter.task_failed(task_id, exit_code, elapsed, stderr_tail[-500:])
 
     return success, exit_code, elapsed, stderr_tail
+
+
+def _relay_job_events(path: Path, emitter: EventEmitter, stop: threading.Event) -> None:
+    offset = 0
+    while not stop.is_set() or (path.exists() and path.stat().st_size > offset):
+        if not path.exists():
+            stop.wait(0.1)
+            continue
+        with path.open("r", encoding="utf-8") as stream:
+            stream.seek(offset)
+            for line in stream:
+                try:
+                    payload = json.loads(line)
+                    if payload.get("type") == "workflow.graph":
+                        emitter.workflow_graph({"nodes": payload.get("nodes", []), "edges": payload.get("edges", [])})
+                    else:
+                        emitter.job_event(
+                            __import__("src.contracts", fromlist=["EventType"]).EventType(payload["type"]),
+                            int(payload["job_id"]), str(payload["rule"]), payload.get("wildcards"),
+                        )
+                except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+            offset = stream.tell()
+        stop.wait(0.1)
+
+
+def _isolate_engine_process(run_id: str, task_id: str, pid: int) -> None:
+    """Constrain the workflow-engine subtree while leaving service CPUs available."""
+    try:
+        import psutil
+
+        _apply_compute_isolation(psutil.Process(pid), psutil)
+    except Exception as exc:
+        message = f"engine resource isolation could not be applied: {exc}"
+        storage = get_storage()
+        storage.append_task_output(run_id, task_id, "stderr", f"WARNING: {message}\n")
+        storage.append_runtime_record(run_id, "warning", message, task_id)
+
+
+def _isolate_engine_descendants(engine_pid: int) -> None:
+    """Apply the Backend budget to every scientific process spawned later."""
+    import psutil
+
+    isolated: set[int] = set()
+    while psutil.pid_exists(engine_pid):
+        try:
+            engine = psutil.Process(engine_pid)
+            descendants = engine.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        for process in descendants:
+            if process.pid in isolated:
+                continue
+            try:
+                _apply_compute_isolation(process, psutil)
+                isolated.add(process.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+        time.sleep(0.25)
+
+
+def _apply_compute_isolation(process, psutil_module) -> None:
+    process.cpu_affinity(list(RESOURCE_BUDGET.compute_cpu_ids))
+    if os.name == "nt":
+        process.nice(psutil_module.BELOW_NORMAL_PRIORITY_CLASS)
+    else:
+        process.nice(5)
 
 
 def _sanitize_command(cmd: str) -> str:

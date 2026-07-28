@@ -35,6 +35,7 @@ from src.execution_runtime.errors import (
 )
 from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.storage import get_storage
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 
 
 @dataclass
@@ -154,6 +155,9 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
 
     start = time.perf_counter()
     emitter.run_started(pid=os.getpid(), worker_id=platform.node())
+    # Long workflows must become publicly RUNNING as soon as their worker starts,
+    # rather than remaining QUEUED until the terminal projection after execute().
+    storage.sync_run_projection(commit.run_id)
     snakefile_path = storage.resolve(run_id, "Snakefile")
     storage.atomic_write(snakefile_path, commit.snakefile)
 
@@ -162,15 +166,27 @@ def execute(commit: RunCommit, rerun_mode: str = "resume") -> ExecutionResult:
     total, succeeded, failed = 1, 0, 0
     execution_root = storage.resolve(run_id)
     run_dir = str(execution_root)
+    effective_cores = min(commit.cores, RESOURCE_BUDGET.compute_cpus)
+    if effective_cores != commit.cores:
+        storage.append_runtime_record(
+            run_id,
+            "warning",
+            (
+                f"stored Run requested {commit.cores} cores; execution was limited "
+                f"to the current Backend budget of {effective_cores}"
+            ),
+            "engine",
+        )
     engine_request = WorkflowEngineRequest(
         mode="execute",
         snakefile="Snakefile",
         config=commit.config,
-        cores=commit.cores,
+        cores=effective_cores,
         targets=commit.targets,
         rerun_mode=rerun_mode,
         rerun_incomplete=True,
         retries=0,
+        job_event_path=".tdease/job-events.jsonl",
     )
     storage.atomic_write_json(
         execution_root / ".tdease" / "engine-request.json",

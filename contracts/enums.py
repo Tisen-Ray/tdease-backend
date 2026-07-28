@@ -59,6 +59,10 @@ class EventType(str, Enum):
     TASK_PROGRESS = "task.progress"
     TASK_SUCCEEDED = "task.succeeded"
     TASK_FAILED = "task.failed"
+    JOB_STARTED = "job.started"
+    JOB_SUCCEEDED = "job.succeeded"
+    JOB_FAILED = "job.failed"
+    WORKFLOW_GRAPH = "workflow.graph"
 
     # 诊断事件（不驱动状态）
     RUNTIME_MESSAGE = "runtime.message"

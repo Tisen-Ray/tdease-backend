@@ -45,7 +45,7 @@ without a `user_id` (`app/api/runs_v2.py`, `local_workspace_hardlink`
 branch) must start passing one -- `RunCommit.user_id` already carries it:
 
     storage.materialize_local_run_files(
-        commit.run_id, Path(commit.local_workspace_root), commit.workspace_files,
+        commit.run_id, resolved_capability_path, commit.workspace_files,
         user_id=commit.user_id,
     )
 

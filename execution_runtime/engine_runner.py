@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import logging
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -32,6 +34,61 @@ from src.execution_runtime.storage import get_tools_root
 
 
 ENGINE_REQUEST = Path(".tdease") / "engine-request.json"
+
+
+def _projection_from_dag(dag) -> dict:
+    engine_dag = dag.workflow_api._workflow.dag
+    jobs = list(engine_dag.jobs)
+    return {
+        "nodes": [
+            {"id": engine_dag.jobid(job), "rule": job.rule.name, "label": job.rule.name,
+             "initial_status": "waiting" if engine_dag.needrun(job) else "up_to_date"}
+            for job in jobs
+        ],
+        "edges": [
+            {"source": engine_dag.jobid(dependency), "target": engine_dag.jobid(job)}
+            for job in jobs
+            for dependency in engine_dag._dependencies[job]
+            if engine_dag.needrun(dependency)
+        ],
+    }
+
+
+class _JobEventHandler(logging.Handler):
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+        self.jobs: dict[int, tuple[str, dict]] = {}
+        self.terminal: set[tuple[str, int]] = set()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from snakemake_interface_logger_plugins.common import LogEvent
+        event = getattr(record, "event", None)
+        mapping = {
+            LogEvent.JOB_INFO: "job.started",
+            LogEvent.JOB_FINISHED: "job.succeeded",
+            LogEvent.JOB_ERROR: "job.failed",
+        }
+        event_type = mapping.get(event)
+        job_id = getattr(record, "jobid", getattr(record, "job_id", None))
+        rule = getattr(record, "rule_name", None)
+        if event == LogEvent.JOB_INFO and job_id is not None and rule:
+            self.jobs[int(job_id)] = (str(rule), getattr(record, "wildcards", None) or {})
+        if job_id is not None and not rule and int(job_id) in self.jobs:
+            rule = self.jobs[int(job_id)][0]
+        if event_type is not None and job_id is not None and rule:
+            terminal_key = (event_type, int(job_id))
+            if event_type in {"job.succeeded", "job.failed"} and terminal_key in self.terminal:
+                return
+            if event_type in {"job.succeeded", "job.failed"}:
+                self.terminal.add(terminal_key)
+            saved_wildcards = self.jobs.get(int(job_id), ("", {}))[1]
+            payload = {"type": event_type, "job_id": int(job_id), "rule": str(rule),
+                       "wildcards": getattr(record, "wildcards", None) or saved_wildcards}
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+                stream.flush()
 
 
 def main() -> int:
@@ -109,7 +166,10 @@ def main() -> int:
     try:
         with SnakemakeApi(output_settings) as api:
             workflow = api.workflow(
-                resource_settings=ResourceSettings(cores=request.cores),
+                resource_settings=ResourceSettings(
+                    cores=request.cores,
+                    resources={"toppic_slots": 1},
+                ),
                 config_settings=ConfigSettings(config=request.config),
                 snakefile=snakefile,
                 workdir=root,
@@ -121,6 +181,29 @@ def main() -> int:
                     force_incomplete=request.rerun_incomplete,
                 )
             )
+            needs_graph = bool(request.projection_path or (request.mode == "execute" and request.job_event_path))
+            projection = None
+            if needs_graph:
+                dag.workflow_api._workflow._prepare_dag(
+                    forceall=dag.dag_settings.forceall, ignore_incomplete=True, lock_warn_only=True
+                )
+                dag.workflow_api._workflow._build_dag()
+                projection = _projection_from_dag(dag)
+            if request.projection_path and projection is not None:
+                projection_target = (root / request.projection_path).resolve(strict=False)
+                projection_target.relative_to(root)
+                projection_target.parent.mkdir(parents=True, exist_ok=True)
+                projection_target.write_text(
+                    json.dumps(projection, ensure_ascii=False), encoding="utf-8"
+                )
+            if request.mode == "execute" and request.job_event_path:
+                from snakemake.logging import logger as engine_logger
+                event_target = (root / request.job_event_path).resolve(strict=False)
+                event_target.relative_to(root)
+                event_target.parent.mkdir(parents=True, exist_ok=True)
+                with event_target.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({"type": "workflow.graph", **(projection or {"nodes": [], "edges": []})}) + "\n")
+                engine_logger.addHandler(_JobEventHandler(event_target))
             dag.execute_workflow(
                 executor="dryrun" if request.mode == "dry-run" else "local",
                 execution_settings=ExecutionSettings(retries=request.retries),

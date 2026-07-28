@@ -64,6 +64,8 @@ from .run import (
     RunStatusResponse,
     RunTrashEntry,
     RunTrashListResponse,
+    RunWorkflowGraphResponse,
+    WorkflowProjection,
 )
 from .tree import TreeDiff, TreeEntry, TreeManifest
 from .workspace import WorkspaceAttachRequest, WorkspaceIdentity, WorkspaceRegistration
@@ -90,6 +92,7 @@ __all__ = [
     "RunCommit", "RunCreateRequest", "RunCreateResponse", "RunDryRunRequest", "RunDryRunResponse",
     "RunRerunRequest", "RunActionResponse", "RunStatusResponse", "RunListResponse",
     "RunTrashEntry", "RunTrashListResponse",
+    "RunWorkflowGraphResponse", "WorkflowProjection",
     "PackageLock", "NodeBinding", "ResultSpec", "ResultRef", "RunResultEntry", "RunResultsResponse",
     # event
     "Event", "EventBatch", "RuntimeRef",

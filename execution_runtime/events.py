@@ -87,6 +87,15 @@ class EventEmitter:
             {"task_id": task_id, "exit_code": exit_code,
              "duration_seconds": duration_seconds, "error_message": error_message})
 
+    def job_event(self, event_type: EventType, job_id: int, rule: str,
+                  wildcards: dict[str, str] | None = None) -> int:
+        return self._emit(event_type, f"Workflow job {event_type.value}: {rule}",
+            "error" if event_type == EventType.JOB_FAILED else "info",
+            {"job_id": job_id, "rule": rule, "wildcards": wildcards or {}})
+
+    def workflow_graph(self, projection: dict[str, Any]) -> int:
+        return self._emit(EventType.WORKFLOW_GRAPH, "Workflow graph resolved", "info", projection)
+
     # ── Diagnostic ──
 
     def runtime_message(self, level: str, message: str,

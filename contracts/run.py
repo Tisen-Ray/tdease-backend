@@ -63,6 +63,23 @@ class ResultSpec(BaseModel):
     _validate_output = field_validator("output")(_validate_path_no_traversal)
 
 
+class WorkflowJobNode(BaseModel):
+    id: int
+    rule: str
+    label: str
+    initial_status: Literal["waiting", "up_to_date"] = "waiting"
+
+
+class WorkflowJobEdge(BaseModel):
+    source: int
+    target: int
+
+
+class WorkflowProjection(BaseModel):
+    nodes: list[WorkflowJobNode] = Field(default_factory=list)
+    edges: list[WorkflowJobEdge] = Field(default_factory=list)
+
+
 class RunCommit(BaseModel):
     """
     不可变 Run commit — 前端/CLI/Agent 提交，后端只做机械校验。
@@ -87,10 +104,23 @@ class RunCommit(BaseModel):
         default_factory=list,
         description="客户端冻结的 path→blob 映射；服务端据此物化隔离运行快照",
     )
-    local_workspace_root: Optional[str] = Field(
+    local_root_id: Optional[str] = Field(
         default=None,
-        description="仅 local 部署使用的用户 workspace 绝对路径；remote 必须为空",
+        description="Desktop local materialization 使用的 Backend-issued root capability",
     )
+    local_run_path: Optional[str] = Field(
+        default=None,
+        description="相对于已授权 Workspace root 的 Run 路径；remote 必须为空",
+    )
+    workspace_run_path: Optional[str] = Field(
+        default=None,
+        description="Client Workspace-relative Run directory used when returning selected artifacts.",
+    )
+
+    @field_validator("workspace_run_path")
+    @classmethod
+    def validate_workspace_run_path(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_path_no_traversal(value) if value is not None else None
 
     # Snakemake 执行参数
     snakefile: str = Field(description="Snakefile 完整内容（提交时固化）")
@@ -135,7 +165,7 @@ class RunCommit(BaseModel):
             "服务端解析并记录的物化策略 (如 local_workspace_hardlink | blob_store)。"
             "调用方不得声明部署模式——见 docs/spec/CAPABILITIES.md 7 与 "
             "docs/design/REMAINING-DESIGNS.md 0.2；Backend 在 app/api/runs_v2.py "
-            "中根据 commit 形状 (是否携带 local_workspace_root) 匹配自身启动时解析的 "
+            "中根据 commit 形状 (是否携带 local_root_id) 匹配自身启动时解析的 "
             "capabilities.materialization.strategies 来选定该值，并覆盖任何调用方提交的值。"
             "此前的 mode 字段已从调用方可提交的 commit 面中移除；调用方若仍提交 "
             "mode 会被显式拒绝 (RUN_MODE_MISMATCH)，而不是被静默忽略。"
@@ -180,6 +210,18 @@ class RunDryRunResponse(BaseModel):
     exit_code: int
     engine: Literal["tdease-workflow"] = "tdease-workflow"
     output: str
+    projection: Optional[WorkflowProjection] = None
+
+
+class WorkflowGraphNode(WorkflowJobNode):
+    status: Literal["waiting", "up_to_date", "running", "succeeded", "failed", "cancelled"]
+    wildcards: dict[str, str] = Field(default_factory=dict)
+
+
+class RunWorkflowGraphResponse(BaseModel):
+    run_id: str
+    nodes: list[WorkflowGraphNode] = Field(default_factory=list)
+    edges: list[WorkflowJobEdge] = Field(default_factory=list)
 
 
 class ResultRef(BaseModel):
@@ -261,6 +303,8 @@ class RunStatusResponse(BaseModel):
     run_id: str
     name: str = ""
     workspace_id: str
+    workspace_run_path: Optional[str] = None
+    current_revision: Optional[str] = None
     status: RunStatus
     mode: str = Field(
         default="local",

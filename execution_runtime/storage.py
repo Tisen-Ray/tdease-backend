@@ -230,6 +230,45 @@ class StorageLayout:
     def is_claimed(self, run_id: str) -> bool:
         return self.resolve(run_id, ".runtime", "claimed").exists()
 
+    def claim_execution_slot(self) -> bool:
+        """Acquire the Backend-wide execution slot.
+
+        Run claims prevent duplicate execution of one Run. This second lock
+        prevents different workers or Backend processes from executing two
+        Runs concurrently on the same deployment.
+        """
+        claim = self.data / ".runtime" / "execution.claim"
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        payload = f"{os.getpid()}\n".encode("ascii")
+        try:
+            fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                owner = int(claim.read_text(encoding="ascii").strip())
+                import psutil
+                if psutil.pid_exists(owner):
+                    return False
+                claim.unlink(missing_ok=True)
+                fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except (FileNotFoundError, FileExistsError, ValueError, OSError):
+                return False
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+
+    def release_execution_slot(self) -> None:
+        """Release this process's Backend-wide execution slot."""
+        claim = self.data / ".runtime" / "execution.claim"
+        try:
+            owner = int(claim.read_text(encoding="ascii").strip())
+        except (FileNotFoundError, ValueError, OSError):
+            return
+        if owner == os.getpid():
+            claim.unlink(missing_ok=True)
+
     # -- Events (JSONL append, single-writer) --
 
     def events_path(self, run_id: str) -> Path:
@@ -610,6 +649,11 @@ class StorageLayout:
 
     def write_results_manifest(self, run_id: str) -> Path:
         run_root = self.resolve(run_id)
+        run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
+        submitted_inputs = {
+            entry.get("path") for entry in (run_data.get("workspace_files") or [])
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
         entries: list[dict[str, Any]] = []
         seen: set[str] = set()
 
@@ -623,7 +667,10 @@ class StorageLayout:
             if rel in seen:
                 return
             seen.add(rel)
-            entries.append({"path": rel, "size": path.stat().st_size, "sha256": self.file_digest(path)})
+            digest = self.file_digest(path)
+            with path.open("rb") as source:
+                self.blob_put_stream(source, digest)
+            entries.append({"path": rel, "size": path.stat().st_size, "sha256": digest})
 
         # Declared outputs first (rule all / result_specs), then nested results/**
         # for templates that use that layout -- so both a flat and a results/-rooted
@@ -636,10 +683,84 @@ class StorageLayout:
         for path in self.result_files(run_id):
             add(path)
 
+        # Flat scientific workflows write outputs beside their inputs. The
+        # committed workspace_files mapping is the frozen input set, so every
+        # other ordinary file created in the Run snapshot is an execution
+        # artifact even when result_specs are absent or rule-all parsing cannot
+        # understand a valid Snakemake expression (for example an f-string).
+        for path in run_root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(run_root).as_posix()
+            if rel in submitted_inputs or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
+                continue
+            if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/")):
+                continue
+            if any(part.endswith("_idx") for part in Path(rel).parts):
+                continue
+            add(path)
+
+        workflow_entries: list[dict[str, Any]] = []
+        workflow_seen: set[str] = set()
+        for item in run_data.get("workspace_files") or []:
+            rel = item.get("path") if isinstance(item, dict) else None
+            if not isinstance(rel, str) or not self._is_workflow_source(rel):
+                continue
+            source = self.resolve(run_id, rel)
+            if not source.is_file() or rel in workflow_seen:
+                continue
+            workflow_seen.add(rel)
+            digest = self.file_digest(source)
+            with source.open("rb") as stream:
+                self.blob_put_stream(stream, digest)
+            workflow_entries.append({"path": rel, "size": source.stat().st_size, "sha256": digest})
+
         entries.sort(key=lambda entry: entry["path"])
+        revision_id = f"rev-{self.recover_seq(run_id):08d}"
+        manifest = {
+            "schema_version": 2,
+            "run_id": run_id,
+            "revision_id": revision_id,
+            "parent_revision_id": run_data.get("current_revision"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "files": entries,
+            "workflow_files": sorted(workflow_entries, key=lambda entry: entry["path"]),
+        }
         target = self.resolve(run_id, "results.manifest.json")
-        self.atomic_write_json(target, {"schema_version": 1, "run_id": run_id, "files": entries})
+        self.atomic_write_json(target, manifest)
+        self.atomic_write_json(self.resolve(run_id, "revisions", f"{revision_id}.json"), manifest)
+        self.atomic_write_json(self.resolve(run_id, "run.json"), {**run_data, "current_revision": revision_id})
         return target
+
+    @staticmethod
+    def _is_workflow_source(path: str) -> bool:
+        normalized = path.replace("\\", "/")
+        return (
+            normalized in {"Snakefile", "config.yaml"}
+            or normalized.endswith(".smk")
+            or normalized.startswith("scripts/")
+        )
+
+    def revision_manifests(self, run_id: str) -> list[dict[str, Any]]:
+        revision_dir = self.resolve(run_id, "revisions")
+        if not revision_dir.is_dir():
+            return []
+        manifests = [self.read_json(path) for path in revision_dir.glob("rev-*.json")]
+        return sorted(
+            (manifest for manifest in manifests if isinstance(manifest, dict)),
+            key=lambda manifest: str(manifest.get("revision_id", "")),
+            reverse=True,
+        )
+
+    def revision_manifest(self, run_id: str, revision_id: str) -> Optional[dict[str, Any]]:
+        if not __import__("re").fullmatch(r"rev-[0-9]{8,}", revision_id):
+            return None
+        return self.read_json(self.resolve(run_id, "revisions", f"{revision_id}.json"))
+
+    def blob_path(self, digest: str) -> Path:
+        if not __import__("re").fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("invalid blob digest")
+        return self.data / "store" / digest[:2] / digest
 
     def _engine_pid_alive(self, data: dict[str, Any]) -> bool:
         """Whether the recorded engine_runner child (the actual computation
@@ -797,6 +918,14 @@ class StorageLayout:
         shutil.move(str(source), str(destination))
         (destination / ".tdease" / "trash.json").unlink(missing_ok=True)
         return destination
+
+    def purge_trashed_run(self, run_id: str) -> None:
+        """Permanently remove one validated Run from recoverable trash."""
+        self._validate_run_id(run_id)
+        target = self.trash / "runs" / run_id
+        if not target.is_dir():
+            raise FileNotFoundError(run_id)
+        shutil.rmtree(target)
 
     def trashed_run_dirs(self) -> list[Path]:
         root = self.trash / "runs"

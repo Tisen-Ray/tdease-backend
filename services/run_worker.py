@@ -77,7 +77,9 @@ def execute_run(run_data: dict) -> None:
         workspace_id=run_data.get("workspace_id", ""),
         workspace_tree_hash=run_data.get("workspace_tree_hash", "0" * 64),
         workspace_files=run_data.get("workspace_files", []),
-        local_workspace_root=run_data.get("local_workspace_root"),
+        local_root_id=run_data.get("local_root_id"),
+        local_run_path=run_data.get("local_run_path"),
+        workspace_run_path=run_data.get("workspace_run_path"),
         snakefile=run_data.get("snakefile", ""),
         config=run_data.get("config", {}),
         cores=run_data.get("cores", 4),
@@ -99,7 +101,6 @@ def execute_run(run_data: dict) -> None:
         run_json,
         {**current, "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()},
     )
-
     try:
         if commit.mode == "local":
             storage.verify_local_inputs(run_id)
@@ -144,16 +145,27 @@ def run_loop(
         if stop_event and stop_event.is_set():
             return
         try:
-            run_data = _dequeue()
-            if run_data:
-                execute_run(run_data)
-            elif once:
-                break
-            else:
+            if not storage.claim_execution_slot():
+                if once:
+                    break
                 if stop_event:
                     stop_event.wait(poll_interval)
                 else:
                     time.sleep(poll_interval)
+                continue
+            try:
+                run_data = _dequeue()
+                if run_data:
+                    execute_run(run_data)
+                elif once:
+                    break
+                else:
+                    if stop_event:
+                        stop_event.wait(poll_interval)
+                    else:
+                        time.sleep(poll_interval)
+            finally:
+                storage.release_execution_slot()
         except KeyboardInterrupt:
             break
         except Exception:
