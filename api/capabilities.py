@@ -24,11 +24,12 @@ from typing import Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 
 # Bump only for a breaking change (removed/renamed/retyped field, changed field
 # meaning, narrowed limit). Additive changes never bump this. See
 # docs/spec/CAPABILITIES.md §5.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 MaterializationStrategy = Literal["local_workspace_hardlink", "blob_store"]
 
@@ -164,7 +165,7 @@ def _build_capabilities() -> CapabilitiesResponse:
             strategies=_resolve_materialization_strategies(),
         ),
         limits=LimitsCapability(
-            max_cores=256,
+            max_cores=RESOURCE_BUDGET.compute_cpus,
             dry_run_timeout_seconds=300,
             log_tail_default_lines=200,
             log_tail_max_lines=10000,

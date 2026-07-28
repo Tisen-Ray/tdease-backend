@@ -72,12 +72,10 @@ async def lifespan(app: FastAPI):
     if recovered:
         logger.warning("Recovered orphaned runs: %s", recovered)
     db_path = str(storage.data / "database" / "db.sqlite3")
-    try:
-        migrate_database(db_path)
-        check_database_health(db_path)
-        logger.info("Database ready: %s", db_path)
-    except Exception as e:
-        logger.warning("Database migration skipped: %s", e)
+    migrate_database(db_path)
+    check_database_health(db_path)
+    get_workspace_root_registry().configure(db_path)
+    logger.info("Database ready: %s", db_path)
 
     worker_stop = None
     worker_task = None
@@ -94,7 +92,7 @@ async def lifespan(app: FastAPI):
     # Workspace root containment: until this is wired, the fail-closed default in
     # src/execution_runtime/workspace_containment.py approves no root for anyone and
     # every local materialization raises WORKSPACE_PATH_ESCAPE. The registry is the
-    # only thing consulted -- never the local_workspace_root a Run commit asserts.
+    # only thing consulted; Run commits carry an opaque root capability, not a path.
     from src.execution_runtime.workspace_containment import set_approved_roots_checker
 
     # Late-bound on purpose: the route handlers in app/core/workspace_roots.py read
@@ -118,6 +116,9 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 _is_prod = os.getenv("TDEASE_ENV") == "production"
+_service_instance_id = uuid.uuid4().hex
+_service_generation = os.getenv("TDEASE_BACKEND_GENERATION", _service_instance_id[:12])
+_service_started_at = datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(
     title="TDEase-zero",
@@ -195,7 +196,13 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instance_id": _service_instance_id,
+        "generation": _service_generation,
+        "started_at": _service_started_at,
+    }
 
 
 @app.get("/healthz")
@@ -211,7 +218,13 @@ async def ready():
         return JSONResponse(status_code=503, content={"status": "not_ready", "missing": "workflow-engine"})
     storage = __import__("src.execution_runtime.storage", fromlist=["get_storage"]).get_storage()
     storage.bootstrap()
-    return {"status": "ready", "engine": "tdease-workflow"}
+    return {
+        "status": "ready",
+        "engine": "tdease-workflow",
+        "instance_id": _service_instance_id,
+        "generation": _service_generation,
+        "started_at": _service_started_at,
+    }
 
 
 @app.exception_handler(Exception)

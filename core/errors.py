@@ -78,7 +78,6 @@ class ErrorCode(str, Enum):
     RUN_NOT_TERMINAL = "RUN_NOT_TERMINAL"
     RUN_IDEMPOTENCY_CONFLICT = "RUN_IDEMPOTENCY_CONFLICT"
     RUN_PLAN_INVALID = "RUN_PLAN_INVALID"
-    RUN_PARAM_INVALID = "RUN_PARAM_INVALID"
     RUN_PLAN_STALE = "RUN_PLAN_STALE"
     RUN_MODE_MISMATCH = "RUN_MODE_MISMATCH"
     RUN_DRY_RUN_UNAVAILABLE = "RUN_DRY_RUN_UNAVAILABLE"
@@ -149,7 +148,6 @@ CODE_DOMAIN: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.RUN_NOT_TERMINAL: ErrorDomain.RUN,
     ErrorCode.RUN_IDEMPOTENCY_CONFLICT: ErrorDomain.RUN,
     ErrorCode.RUN_PLAN_INVALID: ErrorDomain.RUN,
-    ErrorCode.RUN_PARAM_INVALID: ErrorDomain.RUN,
     ErrorCode.RUN_PLAN_STALE: ErrorDomain.RUN,
     ErrorCode.RUN_MODE_MISMATCH: ErrorDomain.RUN,
     ErrorCode.RUN_DRY_RUN_UNAVAILABLE: ErrorDomain.RUN,
@@ -253,12 +251,6 @@ CODE_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_BLOB_NOT_FOUND: 404,
     # forbidden, not correctable by editing the request
     ErrorCode.WORKSPACE_PATH_ESCAPE: 403,
-    # a well-formed commit whose parameter value is outside a node's declared
-    # `choices` -- 422 Unprocessable Entity, the same status the pre-envelope
-    # runs_v2 used for a semantically invalid submission (FAILURE-CONTRACT.md §3.7),
-    # sharpened from the run-domain default of 409 (a param the caller CAN correct
-    # by editing a field, not a state conflict).
-    ErrorCode.RUN_PARAM_INVALID: 422,
 }
 
 

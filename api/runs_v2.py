@@ -16,12 +16,13 @@ import base64
 import os
 import subprocess
 import sys
+import fnmatch
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from starlette.responses import FileResponse, PlainTextResponse, StreamingResponse
+from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
 from src.contracts import (
     ResultRef,
@@ -38,6 +39,7 @@ from src.contracts import (
     RunStatusResponse,
     RunTrashEntry,
     RunTrashListResponse,
+    RunWorkflowGraphResponse,
     TERMINAL_STATUSES,
     run_not_found,
     run_idempotency_conflict,
@@ -45,11 +47,11 @@ from src.contracts import (
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.errors import ExecutionError
 from src.execution_runtime.storage import get_storage, get_tools_root
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.workspace_containment import validate_root_containment
 from src.services.node_catalog import (
     materialize_bindings,
     resolve_bindings,
-    validate_config_choices,
 )
 
 # Reuses the Backend's own startup-resolved capability document (frozen at import
@@ -63,6 +65,21 @@ router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
 
 LOCAL_WORKSPACE_HARDLINK = "local_workspace_hardlink"
 BLOB_STORE = "blob_store"
+
+
+def _validate_compute_budget(cores: int) -> None:
+    if cores > RESOURCE_BUDGET.compute_cpus:
+        raise TDEaseError(
+            code=ErrorCode.RUN_PLAN_INVALID,
+            message=(
+                f"Run requests {cores} cores, but this Backend permits at most "
+                f"{RESOURCE_BUDGET.compute_cpus}; "
+                f"{RESOURCE_BUDGET.reserved_service_cpus} of "
+                f"{RESOURCE_BUDGET.logical_cpus} logical CPUs are reserved for services."
+            ),
+            remedy="Lower commit.cores to GET /api/capabilities limits.max_cores and retry.",
+            retryable=False,
+        )
 
 
 def _workspace_execution_error(exc: ExecutionError) -> TDEaseError:
@@ -87,6 +104,13 @@ async def _reject_legacy_mode_field(request: Request) -> None:
     """
     raw = await request.json()
     commit_raw = raw.get("commit") if isinstance(raw, dict) else None
+    if isinstance(commit_raw, dict) and "local_workspace_root" in commit_raw:
+        raise TDEaseError(
+            code=ErrorCode.RUN_MODE_MISMATCH,
+            message="the Run commit no longer accepts a Client absolute local_workspace_root",
+            remedy="Attach the Workspace once, then submit local_root_id and local_run_path.",
+            retryable=False,
+        )
     if isinstance(commit_raw, dict) and "mode" in commit_raw:
         raise TDEaseError(
             code=ErrorCode.RUN_MODE_MISMATCH,
@@ -106,13 +130,13 @@ def _select_materialization_strategy(commit) -> str:
     from an environment variable read at request time (DESKTOP-FIRST-DEPLOYMENT.md
     section 8 rule 2; docs/spec/CAPABILITIES.md section 7).
 
-    The strategy is derived from the commit's own shape: a `local_workspace_root`
+    The strategy is derived from the commit's own shape: a Backend-issued `local_root_id`
     reference requests `local_workspace_hardlink`; content-addressed
     `workspace_files` alone request `blob_store`. A shape that requests a strategy
     absent from this Backend's resolved `materialization.strategies` is rejected
     with a `run`-domain error, never silently coerced to a different strategy.
     """
-    requested = LOCAL_WORKSPACE_HARDLINK if commit.local_workspace_root else BLOB_STORE
+    requested = LOCAL_WORKSPACE_HARDLINK if commit.local_root_id else BLOB_STORE
     allowed = _CAPABILITIES.materialization.strategies
     if requested not in allowed:
         raise TDEaseError(
@@ -122,44 +146,13 @@ def _select_materialization_strategy(commit) -> str:
                 f"is not among this Backend's resolved capabilities {list(allowed)}"
             ),
             remedy=(
-                "Match the commit shape (local_workspace_root vs. content-addressed "
+                "Match the commit shape (local_root_id vs. content-addressed "
                 "workspace_files) to a strategy listed in GET /api/capabilities' "
                 "materialization.strategies, or submit to a Backend that supports it."
             ),
             retryable=False,
         )
     return requested
-
-
-def _reject_unknown_enum_params(commit, resolved_nodes) -> None:
-    """Reject a submitted parameter value outside a bound Node's declared `choices`
-    before the value can reach the binary (docs/paper/ITERATION.md 11.1). TopPIC's
-    `-R proteoform_type=TERMIN` is the motivating case: the binary accepts an unknown
-    enum silently, matches nothing, and exits 0, so an empty proteoform table is
-    reported as a SUCCEEDED Run. A distinguishable 422 at the door replaces that
-    silent empty success -- the guiding principle of EVIDENCE-AND-KNOWLEDGE.md 2.6.
-
-    Raises RUN_PARAM_INVALID (422). Applied at both create and dry-run so a plan that
-    would be rejected on submit is never reported valid by a preflight.
-    """
-    violations = validate_config_choices(commit.config, resolved_nodes)
-    if not violations:
-        return
-    summary = "; ".join(
-        f"{v['node']}.{'.'.join(v['config_path'])}={v['submitted']!r} "
-        f"(invalid: {v['invalid']}; allowed: {v['choices']})"
-        for v in violations
-    )
-    raise TDEaseError(
-        code=ErrorCode.RUN_PARAM_INVALID,
-        message=f"Run parameter value(s) outside the Node's declared choices: {summary}",
-        remedy=(
-            "Set each listed parameter to one of the allowed choices (a comma-separated "
-            "subset is allowed where the Node declares a list) and resubmit."
-        ),
-        retryable=False,
-        details={"violations": violations},
-    )
 
 
 def _is_owner(data: dict, request: Request) -> bool:
@@ -251,6 +244,8 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
         run_id=run_id,
         name=str(labels.get("name") or run_id),
         workspace_id=data.get("workspace_id", ""),
+        workspace_run_path=data.get("workspace_run_path") or data.get("local_run_path"),
+        current_revision=data.get("current_revision"),
         status=RunStatus(data.get("status", "QUEUED")),
         mode="local" if strategy == LOCAL_WORKSPACE_HARDLINK else "remote",
         materialization_strategy=strategy,
@@ -273,6 +268,7 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
     """Validate an immutable client snapshot with the real workflow engine."""
     await _reject_legacy_mode_field(request)
     commit = payload.commit.model_copy(update={"user_id": request.state.principal.user_id})
+    _validate_compute_budget(commit.cores)
     inline_blobs = payload.inline_blobs
     storage = get_storage()
     if not commit.workspace_files:
@@ -292,18 +288,25 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
             remedy="Correct the node bindings on the commit, or install the missing node package.",
             retryable=False,
         ) from exc
-    _reject_unknown_enum_params(commit, resolved_nodes)
     with storage.temp_dir("dry-run", commit.run_id) as root:
         if strategy == LOCAL_WORKSPACE_HARDLINK:
-            if not commit.local_workspace_root:
+            if not commit.local_root_id:
                 raise TDEaseError(
                     code=ErrorCode.RUN_DRY_RUN_UNAVAILABLE,
-                    message="local dry-run requires local_workspace_root for the local_workspace_hardlink strategy",
-                    remedy="Submit local_workspace_root, or resubmit a commit shaped for the blob_store strategy.",
+                    message="local dry-run requires a Backend-issued local_root_id",
+                    remedy="Attach the Workspace root, then submit its root_id and relative Run path.",
                     retryable=False,
                 )
             try:
-                workspace = validate_root_containment(commit.local_workspace_root, commit.user_id)
+                from app.core.workspace_roots import get_workspace_root_registry
+                workspace = get_workspace_root_registry().resolve(
+                    commit.user_id, commit.local_root_id, commit.local_run_path or "."
+                )
+                if workspace is None:
+                    raise ExecutionError(
+                        ErrorCode.WORKSPACE_PATH_ESCAPE,
+                        "Workspace root capability is missing, revoked, or the Run path escapes it.",
+                    )
             except ExecutionError as exc:
                 raise _workspace_execution_error(exc) from exc
             for entry in commit.workspace_files:
@@ -398,6 +401,7 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
             cores=commit.cores,
             targets=commit.targets,
             rerun_mode="resume",
+            projection_path=".tdease/workflow-projection.json",
         )
         storage.atomic_write_json(
             root / ".tdease" / "engine-request.json",
@@ -406,8 +410,10 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
         command = [sys.executable, "-m", "src.execution_runtime.engine_runner"]
         completed = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=300, env=os.environ)
         output = completed.stdout + completed.stderr
+        projection = storage.read_json(root / ".tdease" / "workflow-projection.json")
         return {"valid": completed.returncode == 0, "exit_code": completed.returncode,
-                "engine": "tdease-workflow", "output": output[-200_000:]}
+                "engine": "tdease-workflow", "output": output[-200_000:],
+                "projection": projection}
 
 
 @router.post("", status_code=201, response_model=RunCreateResponse)
@@ -419,6 +425,7 @@ async def create_run(body: RunCreateRequest, request: Request):
     """
     await _reject_legacy_mode_field(request)
     commit = body.commit.model_copy(update={"user_id": request.state.principal.user_id})
+    _validate_compute_budget(commit.cores)
     storage = get_storage()
 
     # Idempotent allocation (creates dir if not exists)
@@ -450,14 +457,9 @@ async def create_run(body: RunCreateRequest, request: Request):
     commit = commit.model_copy(update={"materialization_strategy": strategy})
     try:
         resolved_nodes = resolve_bindings(get_tools_root(), commit.nodes)
-        # Reject an unknown enum value before any filesystem materialization and
-        # before the Run is ever queued -- a TDEaseError (422) here is not caught by
-        # the (FileNotFoundError, ValueError) handler below, so it surfaces as the
-        # structured RUN_PARAM_INVALID envelope rather than a generic RUN_PLAN_INVALID.
-        _reject_unknown_enum_params(commit, resolved_nodes)
         if strategy == LOCAL_WORKSPACE_HARDLINK:
-            if not commit.local_workspace_root:
-                raise ValueError("local_workspace_root is required for the local_workspace_hardlink strategy")
+            if not commit.local_root_id:
+                raise ValueError("local_root_id is required for the local_workspace_hardlink strategy")
             # user_id is passed so containment resolves against *this Principal's*
             # approved Workspace roots (app.core.workspace_roots.is_within_approved_root),
             # never a root the request itself asserts -- see
@@ -465,13 +467,22 @@ async def create_run(body: RunCreateRequest, request: Request):
             # "the one call site that currently invokes materialize_local_run_files
             # without a user_id ... must start passing one" (owned by agent B4;
             # this is the B2-owned call site that docstring names).
+            from app.core.workspace_roots import get_workspace_root_registry
+            local_run_root = get_workspace_root_registry().resolve(
+                commit.user_id, commit.local_root_id, commit.local_run_path or "."
+            )
+            if local_run_root is None:
+                raise ExecutionError(
+                    ErrorCode.WORKSPACE_PATH_ESCAPE,
+                    "Workspace root capability is missing, revoked, or the Run path escapes it.",
+                )
             storage.materialize_local_run_files(
-                commit.run_id, Path(commit.local_workspace_root), commit.workspace_files,
+                commit.run_id, local_run_root, commit.workspace_files,
                 user_id=commit.user_id,
             )
         else:
-            if commit.local_workspace_root:
-                raise ValueError("local_workspace_root is forbidden for the blob_store strategy")
+            if commit.local_root_id or commit.local_run_path:
+                raise ValueError("local root references are forbidden for the blob_store strategy")
             storage.materialize_run_files(commit.run_id, commit.workspace_files)
     except ExecutionError as exc:
         raise _workspace_execution_error(exc) from exc
@@ -575,11 +586,75 @@ async def restore_run(run_id: str, request: Request, _owned: dict = Depends(_own
     return _run_status_response(data, storage)
 
 
+@router.delete("/trash/{run_id}", status_code=204)
+async def purge_trashed_run(
+    run_id: str,
+    request: Request,
+    _owned: dict = Depends(_owned_trashed_run),
+) -> Response:
+    """Permanently remove a trashed Run and its legacy database projection."""
+    import sqlite3
+
+    storage = get_storage()
+    database = storage.data / "database" / "db.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        storage.purge_trashed_run(run_id)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return Response(status_code=204)
+
+
 @router.get("/{run_id}", response_model=RunStatusResponse)
 async def get_run(run_id: str, data: dict = Depends(_owned_run)):
     """查询 Run 状态 — 从 run.json + events.jsonl 投影。"""
     storage = get_storage()
     return _run_status_response(data, storage)
+
+
+@router.get("/{run_id}/graph", response_model=RunWorkflowGraphResponse)
+def get_run_graph(run_id: str, data: dict = Depends(_owned_run)):
+    """Project the frozen dry-run DAG through persisted structured job events."""
+    projection = {"nodes": [], "edges": []}
+    statuses: dict[int, str] = {}
+    wildcards: dict[int, dict[str, str]] = {}
+    event_status = {
+        "job.started": "running",
+        "job.succeeded": "succeeded",
+        "job.failed": "failed",
+    }
+    storage = get_storage()
+    for event in storage.read_events(run_id):
+        if event.get("type") == "workflow.graph":
+            payload = event.get("data") or {}
+            projection = {"nodes": payload.get("nodes", []), "edges": payload.get("edges", [])}
+            statuses.clear()
+            wildcards.clear()
+            continue
+        status = event_status.get(event.get("type"))
+        payload = event.get("data") or {}
+        job_id = payload.get("job_id")
+        if status and isinstance(job_id, int):
+            statuses[job_id] = status
+            if isinstance(payload.get("wildcards"), dict):
+                wildcards[job_id] = {str(k): str(v) for k, v in payload["wildcards"].items()}
+    if data.get("status") == "CANCELLED":
+        for node in projection.get("nodes", []):
+            statuses.setdefault(node.get("id"), "cancelled")
+    return {
+        "run_id": run_id,
+        "nodes": [
+            {**node, "status": statuses.get(node.get("id"), node.get("initial_status", "waiting")),
+             "wildcards": wildcards.get(node.get("id"), {})}
+            for node in projection.get("nodes", [])
+        ],
+        "edges": projection.get("edges", []),
+    }
 
 
 @router.post("/{run_id}/rerun", response_model=RunActionResponse)
@@ -716,7 +791,13 @@ async def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
 
 
 @router.get("/{run_id}/files")
-async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned: dict = Depends(_owned_run)):
+async def list_run_files(
+    run_id: str,
+    pattern: str = Query("results/**"),
+    revision: Optional[str] = Query(None),
+    include_workflow: bool = Query(False),
+    _owned: dict = Depends(_owned_run),
+):
     """Return a hash-addressed manifest for pull/fetch and AI discovery.
 
     `pattern` is caller-controlled and fed to `Path.glob`, which honours a
@@ -748,6 +829,28 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned
         )
     resolved_root = root.resolve()
     storage = get_storage()
+    if revision:
+        manifest = storage.revision_manifest(run_id, revision)
+        if manifest is None:
+            raise TDEaseError(
+                code=ErrorCode.RUN_FILE_NOT_FOUND,
+                message=f"Run {run_id} has no retained revision {revision}.",
+                remedy="List retained revisions with GET /api/v2/runs/<run_id>/revisions.",
+                retryable=False,
+            )
+        result_entries = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+        workflow_entries = manifest.get("workflow_files") if isinstance(manifest.get("workflow_files"), list) else []
+        entries = [
+            *({**entry, "role": "result"} for entry in result_entries if isinstance(entry, dict)),
+            *({**entry, "role": "workflow"} for entry in workflow_entries if include_workflow and isinstance(entry, dict)),
+        ]
+        files = [
+            entry for entry in entries
+            if isinstance(entry.get("path"), str)
+            and (pattern == "results/**" or fnmatch.fnmatch(entry["path"], pattern))
+        ]
+        return {"run_id": run_id, "revision_id": revision, "files": files}
+
     files = []
     seen: set[str] = set()
 
@@ -756,7 +859,7 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned
             rel = resolved.relative_to(resolved_root).as_posix()
         except ValueError:
             return
-        if rel.startswith((".runtime/", ".tdease/", ".snakemake/")) or rel in seen:
+        if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "revisions/")) or rel in seen:
             return
         seen.add(rel)
         files.append({"path": rel, "size": resolved.stat().st_size, "sha256": storage.file_digest(resolved)})
@@ -775,6 +878,47 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned
     # actually materialized so the default view is never silently empty over real
     # products.
     if pattern == "results/**":
+        manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+        for entry in manifest.get("files", []):
+            rel = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(rel, str):
+                continue
+            try:
+                artifact = _run_file(run_id, rel)
+            except TDEaseError:
+                continue
+            if artifact.is_file() and rel not in seen:
+                seen.add(rel)
+                files.append({
+                    "path": rel,
+                    "size": entry.get("size", artifact.stat().st_size),
+                    "sha256": entry.get("sha256") or storage.file_digest(artifact),
+                })
+
+        # A manifest is finalized only after terminal success. While a Run is
+        # active, expose its current execution outputs without hashing files
+        # that are still growing. Submitted inputs and Backend-private state
+        # stay hidden; terminal responses are replaced by the verified manifest.
+        if not manifest.get("files"):
+            run_data = storage.read_json(storage.resolve(run_id, "run.json")) or {}
+            submitted = {
+                item.get("path") for item in (run_data.get("workspace_files") or [])
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            }
+            for candidate in root.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                rel = candidate.relative_to(root).as_posix()
+                if rel in submitted or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
+                    continue
+                if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/")):
+                    continue
+                if any(part.endswith("_idx") for part in Path(rel).parts):
+                    continue
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                files.append({"path": rel, "size": candidate.stat().st_size, "sha256": ""})
         for rel in storage.declared_output_files(run_id):
             try:
                 declared = _run_file(run_id, rel)
@@ -788,10 +932,47 @@ async def list_run_files(run_id: str, pattern: str = Query("results/**"), _owned
 
 
 @router.get("/{run_id}/files/{file_path:path}")
-async def download_run_file(run_id: str, file_path: str, _owned: dict = Depends(_owned_run)):
+async def download_run_file(
+    run_id: str,
+    file_path: str,
+    revision: Optional[str] = Query(None),
+    _owned: dict = Depends(_owned_run),
+):
     """Stream one run snapshot/result file; Starlette provides HTTP Range support."""
+    if revision:
+        storage = get_storage()
+        manifest = storage.revision_manifest(run_id, revision)
+        entries = [
+            *(manifest.get("files", []) if manifest else []),
+            *(manifest.get("workflow_files", []) if manifest else []),
+        ]
+        entry = next(
+            (item for item in entries if isinstance(item, dict) and item.get("path") == file_path),
+            None,
+        )
+        if entry is None:
+            raise TDEaseError(
+                code=ErrorCode.RUN_FILE_NOT_FOUND,
+                message=f"Revision {revision} has no readable file at {file_path}.",
+                remedy="List the revision files before requesting an exact path.",
+                retryable=False,
+            )
+        try:
+            path = storage.blob_path(str(entry.get("sha256", "")))
+        except ValueError:
+            path = Path()
+        if not path.is_file():
+            raise TDEaseError(
+                code=ErrorCode.RUN_FILE_NOT_FOUND,
+                message=f"The retained bytes for {revision}:{file_path} are unavailable.",
+                remedy="Check the Backend retention policy and revision manifest integrity.",
+                retryable=False,
+            )
+        digest = str(entry["sha256"])
+        return FileResponse(path, filename=Path(file_path).name, headers={"ETag": f'"sha256-{digest}"'})
+
     path = _run_file(run_id, file_path)
-    if not path.is_file() or file_path.startswith((".runtime/", ".tdease/", ".snakemake/")):
+    if not path.is_file() or file_path.startswith((".runtime/", ".tdease/", ".snakemake/", "revisions/")):
         raise TDEaseError(
             code=ErrorCode.RUN_FILE_NOT_FOUND,
             message=f"Run {run_id} has no readable file at {file_path}.",
@@ -802,6 +983,22 @@ async def download_run_file(run_id: str, file_path: str, _owned: dict = Depends(
     return FileResponse(path, filename=path.name, headers={"ETag": f'"sha256-{digest}"'})
 
 
+@router.get("/{run_id}/revisions")
+async def list_run_revisions(run_id: str, _owned: dict = Depends(_owned_run)):
+    revisions = []
+    for manifest in get_storage().revision_manifests(run_id):
+        files = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+        workflow_files = manifest.get("workflow_files") if isinstance(manifest.get("workflow_files"), list) else []
+        revisions.append({
+            "revision_id": manifest.get("revision_id"),
+            "parent_revision_id": manifest.get("parent_revision_id"),
+            "created_at": manifest.get("created_at"),
+            "file_count": len(files),
+            "workflow_file_count": len(workflow_files),
+        })
+    return {"run_id": run_id, "revisions": revisions}
+
+
 @router.get("/{run_id}/log")
 async def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owned: dict = Depends(_owned_run)):
     paths = [
@@ -810,12 +1007,7 @@ async def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owne
     ]
     existing = [path for path in paths if path.is_file()]
     if not existing:
-        raise TDEaseError(
-            code=ErrorCode.RUN_FILE_NOT_FOUND,
-            message=f"Run {run_id} has no log file yet.",
-            remedy="Logs appear once the Run starts; check the Run status first.",
-            retryable=False,
-        )
+        return PlainTextResponse("")
     lines: list[str] = []
     for path in existing:
         lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())

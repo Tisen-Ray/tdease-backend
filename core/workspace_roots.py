@@ -1,58 +1,19 @@
-"""Per-Principal registered Workspace roots -- Desktop filesystem authorization.
+"""Durable, per-principal capabilities for Desktop-local Workspace roots.
 
-`DESKTOP-FIRST-DEPLOYMENT.md` section 5 and `REMAINING-DESIGNS.md` P0 "Workspace root
-registration":
-
-    containment in `src/execution_runtime/storage.py:377-385` validates against the
-    root supplied in the request, not a previously approved root.
-
-That is a caller asserting its own boundary, not containment. This module is the half
-of the fix that Electron and the registration endpoint own: the user picks a directory
-through the native picker, Electron registers the resolved root with the Backend
-*once per launch*, and every later Run commit's `local_workspace_root` must resolve
-beneath a root this module already approved for that Principal -- never against a
-value the commit itself asserts.
-
-The other half -- making `storage.materialize_local_run_files` (and any other
-containment check in `src/execution_runtime/storage.py`) call the lookup function
-below instead of trusting `commit.local_workspace_root` directly -- is owned by
-another agent (`src/execution_runtime/**` is out of scope here). The exact interface
-that agent must call is `is_within_approved_root`, restated on the registry class
-below and in the B2 agent report.
-
-Decisions stated here, not left implicit:
-
-- A **relative path is rejected**. Electron's native picker always returns an
-  absolute path; a relative one has no stable meaning across the Electron process's
-  cwd and the Backend's own cwd, so there is no ambiguous "resolve against some base"
-  fallback -- it is refused outright.
-- A **UNC path is rejected** (`\\\\host\\share\\...` or POSIX `//host/share/...`).
-  Desktop Workspace roots are local-machine directories; a UNC path is a network
-  location with different identity, availability and permission semantics that this
-  design does not cover yet (`DESKTOP-FIRST-DEPLOYMENT.md` section 8 defers remote
-  storage transports). This may be revisited explicitly if a future release needs it;
-  it is not silently allowed today.
-- **Symlinks and junctions are resolved** (`Path.resolve()`) before a root is stored,
-  so containment comparisons always compare real paths. Otherwise a symlink could be
-  registered, approved, and then swapped to point somewhere else after registration --
-  a TOCTOU-shaped bypass of the very containment this module exists to provide.
-- **Windows paths are compared case-insensitively** (NTFS is case-insensitive,
-  case-preserving), but the stored/displayed path keeps the resolved casing so
-  registration output stays readable; only the *comparison key* is case-folded.
-
-Storage is process-lifetime and in-memory. The Client registers known roots after a
-Desktop Backend launch and idempotently re-registers the active root before every
-local dry-run or submit, so a Backend reload cannot strand an open Workspace. No
-on-disk Backend copy is required for the current single-process Desktop release; a
-future Server would replace this in-memory dict with a per-tenant persistent store
-without changing the public interface below.
+An absolute path crosses the public boundary only when the Desktop Client attaches a
+directory. Later Run requests name the opaque ``root_id`` and a relative Run path;
+they cannot assert their own filesystem authorization boundary. Grants live in
+Backend-private SQLite state so a Backend restart does not invalidate an open
+Workspace. Server/blob deployments never use this capability.
 """
 
 from __future__ import annotations
 
 import os
+import hashlib
+import sqlite3
 import threading
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -137,7 +98,14 @@ def canonicalize_root(raw_path: str) -> Path:
             message=f"path must be absolute: {raw_path}",
             remedy="Submit the absolute path returned by the native directory picker.",
         )
-    return path.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    if not resolved.is_dir():
+        raise _reject(
+            code="WORKSPACE_IDENTITY_INVALID",
+            message=f"Workspace root is not an existing directory: {raw_path}",
+            remedy="Choose an existing Workspace directory through the native picker.",
+        )
+    return resolved
 
 
 def _comparison_parts(path: Path) -> tuple[str, ...]:
@@ -167,86 +135,91 @@ def _is_contained(candidate: Path, root: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _PrincipalRoots:
-    by_id: dict[str, Path] = field(default_factory=dict)
-
-    def add(self, resolved: Path) -> str:
-        target_key = _comparison_parts(resolved)
-        for root_id, existing in self.by_id.items():
-            if _comparison_parts(existing) == target_key:
-                return root_id
-        root_id = f"root-{len(self.by_id) + 1}"
-        self.by_id[root_id] = resolved
-        return root_id
-
-
 class WorkspaceRootRegistry:
-    """Process-lifetime, per-Principal registered Workspace root store."""
+    """Durable per-principal root grants backed by Backend-private SQLite."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._principals: dict[str, _PrincipalRoots] = {}
+        self._db_path: Path | None = None
+        self._connection = sqlite3.connect(":memory:", check_same_thread=False)
+        self._ensure_schema()
+
+    def configure(self, db_path: str | Path) -> None:
+        with self._lock:
+            self._connection.close()
+            self._db_path = Path(db_path)
+            self._connection = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        return self._connection
+
+    def _ensure_schema(self) -> None:
+        from app.database.lifecycle import WORKSPACE_ROOT_GRANTS_DDL
+
+        self._connection.execute(WORKSPACE_ROOT_GRANTS_DDL)
+        self._connection.commit()
 
     def register(self, user_id: str, raw_path: str) -> WorkspaceRootEntry:
         resolved = canonicalize_root(raw_path)
+        normalized = os.path.normcase(str(resolved))
+        root_id = "root_" + hashlib.sha256(f"{user_id}\0{normalized}".encode()).hexdigest()[:24]
         with self._lock:
-            roots = self._principals.setdefault(user_id, _PrincipalRoots())
-            root_id = roots.add(resolved)
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO workspace_root_grants "
+                    "(root_id, user_id, path, created_at) VALUES (?, ?, ?, ?)",
+                    (root_id, user_id, str(resolved), datetime.now(timezone.utc).isoformat()),
+                )
         return WorkspaceRootEntry(root_id=root_id, path=str(resolved))
 
     def list_roots(self, user_id: str) -> list[WorkspaceRootEntry]:
         with self._lock:
-            roots = self._principals.get(user_id)
-            if not roots:
-                return []
-            return [
-                WorkspaceRootEntry(root_id=root_id, path=str(path))
-                for root_id, path in roots.by_id.items()
-            ]
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT root_id, path FROM workspace_root_grants WHERE user_id = ? ORDER BY created_at",
+                    (user_id,),
+                ).fetchall()
+        return [WorkspaceRootEntry(root_id=row[0], path=row[1]) for row in rows]
+
+    def revoke(self, user_id: str, root_id: str) -> bool:
+        with self._lock:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM workspace_root_grants WHERE user_id = ? AND root_id = ?",
+                    (user_id, root_id),
+                )
+                return cursor.rowcount > 0
+
+    def resolve(self, user_id: str, root_id: str, relative_path: str = ".") -> Path | None:
+        relative = Path(relative_path)
+        if relative.is_absolute():
+            return None
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT path FROM workspace_root_grants WHERE user_id = ? AND root_id = ?",
+                    (user_id, root_id),
+                ).fetchone()
+        if row is None:
+            return None
+        root = Path(row[0]).resolve(strict=False)
+        candidate = (root / relative).resolve(strict=False)
+        return candidate if _is_contained(candidate, root) else None
 
     def is_within_approved_root(self, user_id: str, candidate_path: str) -> bool:
-        """The lookup function `src/execution_runtime/storage.py` must call.
-
-        Stable signature for the other agent's integration:
-
-            is_within_approved_root(user_id: str, candidate_path: str) -> bool
-
-        Returns True only if `candidate_path`, resolved the same way a registered
-        root is (symlinks resolved, Windows-case-folded for comparison), is equal to
-        or nested beneath one of that Principal's registered roots. `storage.py`'s
-        `materialize_local_run_files` (and any other place that currently trusts
-        `commit.local_workspace_root` at storage.py:377-385) must call this instead
-        of validating against the value the request itself supplies -- that is the
-        exact defect this registry replaces.
-
-        Never raises: an unresolvable or malformed `candidate_path` is simply not
-        contained (`False`), so callers do not need a second exception-handling path
-        for containment checks specifically.
-        """
+        """Return whether a path belongs to one of the principal's durable grants."""
 
         try:
             resolved_candidate = Path(candidate_path).resolve(strict=False)
         except (OSError, ValueError):
             return False
         with self._lock:
-            roots = self._principals.get(user_id)
-            if not roots:
-                return False
-            return any(_is_contained(resolved_candidate, root) for root in roots.by_id.values())
-
-    def all_roots(self) -> list[Path]:
-        """Every root registered for every Principal, flattened.
-
-        Desktop currently has exactly one Principal (`local-owner`), so this is
-        that Principal's roots today. Diagnostic/introspection use only (e.g. a
-        future admin surface listing every approved root); the containment check
-        `src/execution_runtime/workspace_containment.py` actually calls is
-        `is_within_approved_root`, not this method -- see that method's
-        docstring for the stable wiring contract.
-        """
-        with self._lock:
-            return [path for roots in self._principals.values() for path in roots.by_id.values()]
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT path FROM workspace_root_grants WHERE user_id = ?", (user_id,)
+                ).fetchall()
+        return any(_is_contained(resolved_candidate, Path(row[0])) for row in rows)
 
 
 _registry = WorkspaceRootRegistry()
@@ -277,5 +250,26 @@ async def register_workspace_root(body: WorkspaceRootRegisterRequest, request: R
 
 @router.get("", response_model=WorkspaceRootListResponse)
 async def list_workspace_roots(request: Request) -> WorkspaceRootListResponse:
+    from app.api.capabilities import _CAPABILITIES
+
+    if "local_workspace_hardlink" not in _CAPABILITIES.materialization.strategies:
+        raise _reject(
+            code="WORKSPACE_LOCAL_UNAVAILABLE",
+            message="This Backend does not expose Client-local filesystem materialization.",
+            remedy="Upload the Run manifest blobs using the blob_store strategy.",
+            status_code=409,
+        )
     principal = request.state.principal
     return WorkspaceRootListResponse(roots=_registry.list_roots(principal.user_id))
+
+
+@router.delete("/{root_id}", status_code=204)
+async def revoke_workspace_root(root_id: str, request: Request) -> None:
+    principal = request.state.principal
+    if not _registry.revoke(principal.user_id, root_id):
+        raise _reject(
+            code="WORKSPACE_ROOT_NOT_FOUND",
+            message="The Workspace root capability does not exist.",
+            remedy="Attach the Workspace again before running it.",
+            status_code=404,
+        )
