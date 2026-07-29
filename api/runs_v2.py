@@ -700,6 +700,13 @@ def _create_run(body: RunCreateRequest, request: Request):
             run_data["labels"] = existing.get("labels", {})
     storage.atomic_write_json(run_json, run_data)
 
+    # Establish the disposable list projection before publishing lifecycle
+    # events. Event projection is asynchronous and may run immediately; without
+    # this baseline row it observes a Run that the list index cannot identify.
+    # The second call below catches the row up through the durable Journal
+    # before the 201 response makes the Run externally visible.
+    _index_run(run_data, storage)
+
     # Write initial event through storage (seq allocated by storage)
     from src.execution_runtime.events import EventEmitter
     emitter = EventEmitter(commit.run_id)
