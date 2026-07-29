@@ -561,7 +561,6 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
             command,
             root,
             300,
-            commit.memory_mb,
             os.environ,
         )
         output = completed.stdout + completed.stderr
