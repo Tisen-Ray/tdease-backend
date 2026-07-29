@@ -194,7 +194,6 @@ def execute(
             revision_id=revision_id,
             execution_mode=execution_mode,
             timeout_seconds=7 * 24 * 60 * 60,
-            memory_limit_mb=commit.memory_mb or RESOURCE_BUDGET.compute_memory_mb,
         )
     finally:
         cleanup_engine_alias(execution_root)

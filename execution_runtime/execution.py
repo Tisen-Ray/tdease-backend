@@ -49,32 +49,13 @@ def _isolate_engine_descendants(engine_pid: int) -> None:
         time.sleep(0.25)
 
 
-def _process_tree_rss_mb(pid: int) -> int:
-    """Return aggregate RSS for a supervised process and all live descendants."""
-    import psutil
-
-    try:
-        process = psutil.Process(pid)
-        processes = [process, *process.children(recursive=True)]
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return 0
-    total = 0
-    for member in processes:
-        try:
-            total += member.memory_info().rss
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return (total + (1024 * 1024) - 1) // (1024 * 1024)
-
-
 def run_captured_process(
     command: Sequence[str],
     cwd: str | Path,
     timeout: int,
-    memory_limit_mb: int | None,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a captured workflow subprocess with the same CPU and memory wall as Runs."""
+    """Run a captured workflow subprocess with the same CPU isolation as Runs."""
     proc = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -111,15 +92,6 @@ def run_captured_process(
             failure = f"workflow process timed out after {timeout}s"
             _kill_process_group(proc)
             break
-        if memory_limit_mb is not None:
-            used_mb = _process_tree_rss_mb(proc.pid)
-            if used_mb > memory_limit_mb:
-                failure = (
-                    f"workflow process tree exceeded memory limit: "
-                    f"{used_mb} MB > {memory_limit_mb} MB"
-                )
-                _kill_process_group(proc)
-                break
         time.sleep(0.25)
     reader.join(timeout=5)
     if failure:

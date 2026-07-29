@@ -134,7 +134,7 @@ class RunCommit(BaseModel):
     memory_mb: Optional[int] = Field(
         default=None,
         ge=128,
-        description="Snakemake 进程树内存上限 (MB)；null 由 Backend 收紧为当前计算预算",
+        description="Snakemake 调度内存声明 (MB)；null 时由 Backend 取当前计算预算",
     )
     targets: list[str] = Field(
         default_factory=list,

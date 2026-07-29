@@ -25,7 +25,6 @@ from src.execution_runtime.execution import (
     _isolate_engine_descendants,
     _isolate_engine_process,
     _kill_process_group,
-    _process_tree_rss_mb,
 )
 from src.execution_runtime.storage import StorageLayout
 
@@ -68,7 +67,6 @@ class SnakemakeAdapter:
         revision_id: str,
         execution_mode: str,
         timeout_seconds: int,
-        memory_limit_mb: int | None,
     ) -> SnakemakeExecutionResult:
         inspection_start = time.perf_counter()
         projection, _snapshot = self.storage.project_run_snapshot(self.run_id)
@@ -186,7 +184,6 @@ class SnakemakeAdapter:
         event_reader.start()
 
         deadline = start + timeout_seconds
-        next_resource_check = start
         failure: str | None = None
         was_cancelled = False
         try:
@@ -201,16 +198,6 @@ class SnakemakeAdapter:
                     failure = f"workflow engine timed out after {timeout_seconds}s"
                     _kill_process_group(proc)
                     break
-                if memory_limit_mb is not None and now >= next_resource_check:
-                    used_mb = _process_tree_rss_mb(proc.pid)
-                    if used_mb > memory_limit_mb:
-                        failure = (
-                            "engine process tree exceeded memory limit: "
-                            f"{used_mb} MB > {memory_limit_mb} MB"
-                        )
-                        _kill_process_group(proc)
-                        break
-                    next_resource_check = now + 0.25
                 time.sleep(0.05)
         except Exception as exc:
             failure = f"execution error: {exc}"
