@@ -1,0 +1,35 @@
+{
+  "schema_version": 3,
+  "statuses": {
+    "run.queue_requested": "QUEUED",
+    "run.started": "RUNNING",
+    "run.succeeded": "SUCCEEDED",
+    "run.failed": "FAILED",
+    "run.cancelled": "CANCELLED"
+  },
+  "terminal_events": [
+    "run.succeeded",
+    "run.failed",
+    "run.cancelled"
+  ],
+  "execution_modes": [
+    "execute",
+    "continue"
+  ],
+  "required_data": {
+    "run.submitted": ["revision_id"],
+    "run.queue_requested": ["revision_id", "mode"],
+    "run.started": ["revision_id", "mode"],
+    "run.succeeded": ["revision_id"],
+    "run.failed": ["revision_id"],
+    "run.cancelled": ["revision_id"]
+  },
+  "allowed_from": {
+    "run.submitted": [null, "SUCCEEDED", "FAILED", "CANCELLED"],
+    "run.queue_requested": [null, "SUCCEEDED", "FAILED", "CANCELLED"],
+    "run.started": ["QUEUED"],
+    "run.succeeded": ["QUEUED", "RUNNING"],
+    "run.failed": ["QUEUED", "RUNNING"],
+    "run.cancelled": ["QUEUED", "RUNNING"]
+  }
+}
