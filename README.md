@@ -29,6 +29,10 @@ uv run uvicorn app.main:app --reload --port 8000
 Requires Python ≥3.11, <3.15. Uses [uv](https://docs.astral.sh/uv/) for
 dependency management (`uv.lock` is the lockfile).
 
+Runtime data is external to this repository. The service owns its data layout and may
+consume the Scientific System only through public commands or protocols; it never imports
+Desktop implementation paths.
+
 ## Architecture
 
 ```
