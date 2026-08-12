@@ -53,6 +53,9 @@ dependencies = [
 [project.optional-dependencies]
 prod = ["gunicorn>=22.0.0"]
 
+[project.scripts]
+tdease-backend = "src.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",

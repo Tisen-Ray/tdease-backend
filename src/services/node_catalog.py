@@ -1,6 +1,7 @@
 """Single read-only catalog for executable node packages deployed by the server.
 
-A node package is a self-contained directory under <dataRoot>/backend/nodes/<id>/:
+A node package is a self-contained directory under the configured Backend node root:
+<backend>/nodes/<id>/:
   - rules.smk   (required) — Snakemake rule fragments. The rules.smk IS the
                               declaration: rule names = capabilities,
                               params/input/output sections = the contract,
@@ -28,6 +29,8 @@ def package_digest(root: Path) -> str:
     """sha256 over every file's relative path + bytes in the package dir."""
     digest = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path.is_symlink():
+            raise ValueError(f"node package cannot contain symlinks: {path.relative_to(root)}")
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
@@ -172,47 +175,41 @@ def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     return nodes, errors
 
 
-def scan_node_catalog(
-    root: Path, tools_root_env: str = "TDEASE_TOOLS_ROOT"
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def scan_node_catalog(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Scan the deployed node catalog for the read-only `GET /api/nodes` surface.
 
     Unlike `scan_nodes` (a pure best-effort projection used by run resolution,
     which must stay silent about a missing root so a `nodes: []` commit still
-    resolves), this reports a **missing or unreadable tools root** as a structured
+    resolves), this reports a **missing or unreadable Node catalog** as a structured
     error. An empty catalog over a broken root and an empty catalog over a healthy
     but genuinely-empty root are otherwise identical on the wire -- exactly the
     "empty result indistinguishable from health" failure this project forbids
     (docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6). The error carries the resolved
-    absolute path and the env var (`TDEASE_TOOLS_ROOT`) that sets it, so the
-    operator knows both what was looked at and what to fix.
+    absolute path from Backend JSON configuration.
     """
     resolved = Path(os.path.normpath(str(root)))
     if not root.exists():
         return [], [{
             "path": str(resolved),
             "error": (
-                f"tools root does not exist: {resolved} -- set {tools_root_env} to the "
-                "deployed nodes directory, or deploy node packages into it"
+                f"node catalog does not exist: {resolved} -- deploy node packages "
+                "under the configured Backend data root"
             ),
-            "tools_root": str(resolved),
-            "env": tools_root_env,
+            "node_root": str(resolved),
         }]
     if not root.is_dir():
         return [], [{
             "path": str(resolved),
-            "error": f"tools root is not a directory: {resolved} (set {tools_root_env})",
-            "tools_root": str(resolved),
-            "env": tools_root_env,
+            "error": f"node catalog is not a directory: {resolved}",
+            "node_root": str(resolved),
         }]
     try:
         next(iter(root.iterdir()), None)
     except OSError as exc:
         return [], [{
             "path": str(resolved),
-            "error": f"tools root is not readable: {resolved} ({exc}); set {tools_root_env}",
-            "tools_root": str(resolved),
-            "env": tools_root_env,
+            "error": f"node catalog is not readable: {resolved} ({exc})",
+            "node_root": str(resolved),
         }]
     return scan_nodes(root)
 
@@ -244,8 +241,18 @@ def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[st
     return resolved
 
 
-def materialize_bindings(target_root: Path, resolved: list[tuple[Any, dict[str, Any]]], atomic_write) -> None:
-    """Write each bound node's rules.smk into <target>/nodes/<id>/rules.smk
-    so the Snakefile can `include: "nodes/<id>/rules.smk"`."""
+def materialize_bindings(target_root: Path, resolved: list[tuple[Any, dict[str, Any]]], atomic_copy) -> None:
+    """Freeze each complete bound package under <target>/nodes/<id>/.
+
+    Rules and their binaries/resources cross the execution boundary together. A Run
+    therefore executes only its digest-pinned snapshot and needs no Backend path ENV.
+    """
     for binding, node in resolved:
-        atomic_write(target_root / "nodes" / binding.id / "rules.smk", node["rules_text"])
+        package_dir = node["package_dir"]
+        for source in sorted(path for path in package_dir.rglob("*") if path.is_file()):
+            if source.is_symlink():
+                raise ValueError(
+                    f"node package cannot contain symlinks: {source.relative_to(package_dir)}"
+                )
+            relative = source.relative_to(package_dir)
+            atomic_copy(source, target_root / "nodes" / binding.id / relative)

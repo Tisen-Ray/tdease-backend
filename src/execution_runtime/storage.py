@@ -175,17 +175,19 @@ class StorageLayout:
             prefix="." + target.name + ".",
         )
         try:
-            if isinstance(content, str):
-                os.write(fd, content.encode("utf-8"))
-            else:
-                os.write(fd, content)
-            os.fsync(fd)
+            payload = content.encode("utf-8") if isinstance(content, str) else content
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
         except Exception:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             try: os.unlink(tmp)
             except OSError: pass
             raise
-        os.close(fd)
         try:
             os.replace(tmp, target)
         except Exception:
@@ -202,6 +204,35 @@ class StorageLayout:
 
     def atomic_write_json(self, target: Path, obj: dict | list) -> None:
         self.atomic_write(target, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
+
+    def atomic_copy(self, source: Path, target: Path) -> None:
+        """Atomically stream one file into Backend-owned storage."""
+        source = Path(source)
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix="." + target.name + ".")
+        try:
+            with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        if os.name != "nt":
+            dfd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
 
     def read_json(self, path: Path) -> Optional[dict]:
         if not path.exists():
@@ -1091,12 +1122,7 @@ _storage: Optional[StorageLayout] = None
 
 
 def get_storage() -> StorageLayout:
-    """Return the single resolved Backend runtime root.
-
-    An explicit ``TDEASE_DATA_ROOT`` is an installation/deployment override.
-    Without it, resolve from the running Backend package or repository layout;
-    there is no process-cwd-dependent ``server-data`` default.
-    """
+    """Return the runtime root frozen from the Backend JSON configuration."""
     global _storage
     if _storage is None:
         _storage = StorageLayout(_resolve_backend_root())
@@ -1104,24 +1130,9 @@ def get_storage() -> StorageLayout:
 
 
 def _resolve_backend_root() -> Path:
-    configured = os.environ.get("TDEASE_DATA_ROOT")
-    if configured and configured.strip():
-        return Path(configured).expanduser().resolve()
+    from src.backend_settings import BACKEND_SETTINGS
 
-    # Installed layout: <resources>/backend/src/execution_runtime/storage.py.
-    module_backend = Path(__file__).resolve().parents[2]
-    if (module_backend / "pyproject.toml").is_file() and (module_backend / "nodes").is_dir():
-        return module_backend
-
-    # Repository layout: <repo>/data/backend/ is the Backend runtime root.
-    repo_root = Path(__file__).resolve().parents[2]
-    repo_backend = repo_root / "data" / "backend"
-    if (repo_backend / "nodes").is_dir() or (repo_backend / "pyproject.toml").is_file():
-        return repo_backend
-
-    # A relocatable source checkout may not have runtime assets materialized yet.
-    # Keep the root beside the Backend package so bootstrap can create it.
-    return module_backend
+    return BACKEND_SETTINGS.data_root
 
 
 def get_tools_root() -> Path:
@@ -1132,7 +1143,9 @@ def get_tools_root() -> Path:
     and enumeration; no separate tools-root deployment variable is required.
     """
     from pathlib import Path as _Path
-    return get_storage().data / "nodes"
+    from src.backend_settings import BACKEND_SETTINGS
+
+    return BACKEND_SETTINGS.node_root
 
 
 def set_storage(s: StorageLayout) -> None:

@@ -1,8 +1,8 @@
 """Authentication boundary for local and remote Backend deployments.
 
 Local Desktop and development Backends are loopback services owned by the current
-user. They use the local-owner principal directly. A remote Server must opt into
-Bearer authentication explicitly with ``TDEASE_AUTH_MODE=bearer``.
+user. They use the local-owner principal directly. A remote Server selects Bearer
+authentication in Backend JSON.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ class DesktopAuth:
             # the process's life -- the Backend starts, but nothing protected
             # is reachable until it is restarted with a secret.
             logger.error(
-                "startup error: TDEASE_BOOTSTRAP_SECRET was not supplied; "
+                "startup error: the configured bootstrap secret was not supplied; "
                 "authentication cannot succeed and every protected request will "
                 "be rejected until the Backend is restarted with a secret."
             )
@@ -138,7 +138,7 @@ class DesktopAuth:
                 ),
                 remedy=(
                     "Restart the Backend through the Desktop app so it receives "
-                    "a bootstrap secret, or set TDEASE_BOOTSTRAP_SECRET before "
+                    "a bootstrap secret before "
                     "starting it."
                 ),
             )

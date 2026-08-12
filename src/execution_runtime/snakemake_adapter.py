@@ -22,6 +22,7 @@ from src.contracts import EventType
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.execution import (
+    backend_child_env,
     _isolate_engine_descendants,
     _isolate_engine_process,
     _kill_process_group,
@@ -123,7 +124,7 @@ class SnakemakeAdapter:
             proc = subprocess.Popen(
                 command,
                 cwd=str(self.run_root),
-                env=os.environ,
+                env=backend_child_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

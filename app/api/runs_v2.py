@@ -50,6 +50,7 @@ from src.contracts import ErrorCode as RuntimeErrorCode
 from src.execution_runtime.storage import get_storage, get_tools_root
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.execution import run_captured_process
+from src.execution_runtime.execution import backend_child_env
 from src.execution_runtime.workspace_containment import validate_root_containment
 from src.services.node_catalog import (
     materialize_bindings,
@@ -541,7 +542,7 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                 remedy="Refreeze the Run so both Snakefile views agree, then retry dry-run.",
                 retryable=False,
             )
-        materialize_bindings(root, resolved_nodes, storage.atomic_write)
+        materialize_bindings(root, resolved_nodes, storage.atomic_copy)
         engine_request = WorkflowEngineRequest(
             mode="dry-run",
             snakefile="Snakefile",
@@ -561,7 +562,7 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
             command,
             root,
             300,
-            os.environ,
+            backend_child_env(),
         )
         output = completed.stdout + completed.stderr
         projection = storage.read_json(root / ".tdease" / "workflow-projection.json")
@@ -675,7 +676,7 @@ def _create_run(body: RunCreateRequest, request: Request):
                 remedy="Prepare the Run again so both Snakefile views agree, then resubmit.",
                 retryable=False,
             )
-        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_write)
+        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_copy)
     except TDEaseError:
         raise
     except (FileNotFoundError, ValueError) as exc:

@@ -11,7 +11,6 @@ TDEase-zero API Server — 极简 FastAPI 后端。
 from __future__ import annotations
 
 import logging
-import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +21,7 @@ from time import perf_counter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from src.backend_settings import BACKEND_SETTINGS, BackendSettings
+from src.backend_settings import BACKEND_SETTINGS
 
 # Path setup
 _project_root = Path(__file__).parent.parent
@@ -236,66 +235,3 @@ async def global_handler(request: Request, exc: Exception):
         retryable=True,
     )
     return JSONResponse(status_code=internal.http_status, content=internal.to_envelope())
-
-# ---------------------------------------------------------------------------
-# Standalone entrypoint (`python -m app.main`). The packaged Desktop app does not
-# use this path -- Electron spawns `uv run uvicorn app.main:app --host ... --port
-# ...` directly with a port it already chose (DESKTOP-FIRST-DEPLOYMENT.md §4.1:
-# "Electron starts Backend on 127.0.0.1 and a random available port"). This block
-# exists for local/manual runs and must honour the same contract: loopback only,
-# OS-assigned port by default, and a deterministic, parseable report of whatever
-# port was actually bound -- never a fixed 0.0.0.0:8000 that collides across
-# instances and is reachable from other local software.
-# ---------------------------------------------------------------------------
-def _resolve_backend_host(settings: BackendSettings = BACKEND_SETTINGS) -> str:
-    """Return the host frozen by the process-wide startup settings."""
-    return settings.bind_host
-
-
-def _resolve_backend_port(settings: BackendSettings = BACKEND_SETTINGS) -> int:
-    """0 means "let the OS assign a free port" -- the Desktop default. A caller
-    that wants a fixed port for local debugging may still set TDEASE_BACKEND_PORT.
-    """
-    return settings.bind_port
-
-
-def _select_backend_port(host: str, port: int) -> int:
-    """Resolve the real port to bind, letting the OS assign a free one when
-    ``port == 0``.
-
-    Binds and immediately releases a probe socket so the real port is known
-    -- deterministically, in this process -- before uvicorn starts. uvicorn's
-    own ``fd=`` socket-handoff option is built around AF_UNIX socket
-    activation (see uvicorn.Config.bind_socket) and is not a portable fit for
-    a plain AF_INET port-0 bind on Windows, so this process hands uvicorn a
-    concrete, already-resolved ``--port`` instead of a live socket.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((host, port))
-        return sock.getsockname()[1]
-    finally:
-        sock.close()
-
-
-def _report_backend_port(port: int, port_file: str | None = None) -> None:
-    """Report the bound port deterministically.
-
-    A structured, stable-prefixed stdout line is always emitted; a parent process
-    should match on the `TDEASE_BACKEND_PORT=` prefix rather than parsing
-    arbitrary log output. If TDEASE_PORT_FILE is set, the port is also written to
-    that file so a parent that prefers file-based discovery can poll it instead.
-    """
-    print(f"TDEASE_BACKEND_PORT={port}", flush=True)
-    if port_file:
-        Path(port_file).write_text(str(port), encoding="utf-8")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    _host = _resolve_backend_host()
-    _port = _select_backend_port(_host, _resolve_backend_port())
-    _report_backend_port(_port, BACKEND_SETTINGS.port_file)
-    uvicorn.run("app.main:app", host=_host, port=_port, reload=False)

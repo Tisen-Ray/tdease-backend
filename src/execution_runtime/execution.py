@@ -10,6 +10,11 @@ import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
+
+def backend_child_env() -> dict[str, str]:
+    """Return the Backend execution environment without product config leakage."""
+    return {key: value for key, value in os.environ.items() if not key.startswith("TDEASE_")}
+
 from src.execution_runtime.storage import get_storage
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 
