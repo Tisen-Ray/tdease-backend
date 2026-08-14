@@ -737,8 +737,8 @@ class StorageLayout:
 
         workspace_root is validated against the Backend approved roots for
         `user_id` (src.execution_runtime.workspace_containment), never
-        trusted merely because this request named it -- REMAINING-DESIGNS.md
-        Sec 1 "Workspace root registration". `user_id` is keyword-only and
+        trusted merely because this request named it -- docs/STATUS.md
+        "Workspace root registration". `user_id` is keyword-only and
         required -- the caller (app/api/runs_v2.py) must pass
         `RunCommit.user_id`, never omit it. Until Backend startup wires a
         real checker in via set_approved_roots_checker, no root is approved
@@ -792,7 +792,7 @@ class StorageLayout:
         flat-layout template -- whose outputs sit at the run root, not under
         `results/` -- have a non-empty canonical result list, so a SUCCEEDED Run whose
         declared table came back empty still lists that table and is distinguishable
-        from a Run that produced nothing (docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6).
+        from a Run that produced nothing.
 
         Best-effort and never raising: an unparseable Snakefile yields the
         result_specs alone (or []), and the caller falls back to the `results/**`

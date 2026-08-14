@@ -44,7 +44,7 @@ class ResultSpec(BaseModel):
     """
     一条声明的 Published Result — 冻结进 RunCommit.result_specs。
 
-    语义见 docs/design/CORE-ARCHITECTURE.md 3、docs/spec/WORKFLOW-RUN-CONTRACT.md 8.4：
+    语义见 docs/design/CORE-ARCHITECTURE.md 3、docs/spec/WORKFLOW-RUN.md：
     这是可选的 Published Result 语义元数据。未提供时，Backend 从 Snakemake 的默认
     target 声明生成中性的 workflow_output 条目；模型不会从文件名猜测语义。就绪状态是
     output 与 Run 文件清单 join (3.1)，不是独立的状态机；未就绪不代表被吞掉，必须投影为
@@ -167,7 +167,7 @@ class RunCommit(BaseModel):
         description=(
             "服务端解析并记录的物化策略 (如 local_workspace_hardlink | blob_store)。"
             "调用方不得声明部署模式——见 docs/spec/CAPABILITIES.md 7 与 "
-            "docs/design/REMAINING-DESIGNS.md 0.2；Backend 在 app/api/runs_v2.py "
+            "docs/STATUS.md；Backend 在 app/api/runs_v2.py "
             "中根据 commit 形状 (是否携带 local_root_id) 匹配自身启动时解析的 "
             "capabilities.materialization.strategies 来选定该值，并覆盖任何调用方提交的值。"
             "此前的 mode 字段已从调用方可提交的 commit 面中移除；调用方若仍提交 "

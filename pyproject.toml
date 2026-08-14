@@ -54,7 +54,7 @@ dependencies = [
 prod = ["gunicorn>=22.0.0"]
 
 [project.scripts]
-tdease-backend = "src.cli:main"
+tdease-backend = "cli:main"
 
 [dependency-groups]
 dev = [
@@ -72,6 +72,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app", "src"]
+# The composition root lives at the repository root (not inside `src/`), so it is
+# shipped as a top-level module -- docs/design/THREE-REPOSITORY-ARCHITECTURE.md §4.1.
+py-modules = ["cli"]
 
 [tool.coverage.run]
 source = ["app", "src"]

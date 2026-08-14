@@ -6,15 +6,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-WORKSPACE_ROOT_GRANTS_DDL = """
-    CREATE TABLE IF NOT EXISTS workspace_root_grants (
-        root_id     TEXT PRIMARY KEY,
-        user_id     TEXT NOT NULL,
-        path        TEXT NOT NULL,
-        created_at  TEXT NOT NULL,
-        UNIQUE(user_id, path)
-    )
-"""
+# The workspace_root_grants table is owned by the domain registry
+# (src/services/workspace_roots.py); migration applies the same DDL.
+from src.services.workspace_roots import WORKSPACE_ROOT_GRANTS_DDL
 
 
 def migrate_database(db_path: str) -> None:

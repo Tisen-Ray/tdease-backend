@@ -8,30 +8,23 @@ Worker 调用:
 
 preflight 和 execute 共用 parser.py 的 parse_snakefile 作为唯一解析入口。
 execute 在 task 之间检查 storage.check_cancelled(run_id)。
-错误分类：ExecutionError 原样传递，未知异常 → execution_runtime_internal。
+错误分类：TDEaseError 原样传递，未知异常 → ENGINE_RUNTIME_INTERNAL。
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 from src.contracts import RunCommit
-from src.execution_runtime.parser import parse_snakefile
+from src.contracts.errors import ErrorCode, TDEaseError
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.engine_layout import cleanup_engine_alias
-from src.execution_runtime.snakemake_adapter import SnakemakeAdapter
-from src.execution_runtime.errors import (
-    ExecutionError,
-    invalid_workflow,
-    runtime_internal,
-    cancelled,
-    task_failed,
-)
 from src.execution_runtime.events import EventEmitter
-from src.execution_runtime.storage import get_storage
+from src.execution_runtime.parser import parse_snakefile
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
+from src.execution_runtime.snakemake_adapter import SnakemakeAdapter
+from src.execution_runtime.storage import get_storage
 
 
 @dataclass
@@ -50,8 +43,8 @@ class PreflightResult:
 class ExecutionResult:
     """execute() 返回。"""
     success: bool
-    exit_code: Optional[int] = None
-    error: Optional[ExecutionError] = None
+    exit_code: int | None = None
+    error: TDEaseError | None = None
     run_time_seconds: float = 0.0
     total_tasks: int = 0
     succeeded_tasks: int = 0
@@ -73,7 +66,7 @@ def preflight(commit: RunCommit) -> PreflightResult:
         wf = parse_snakefile(commit.snakefile, f"run:{commit.run_id}")
     except SyntaxError as e:
         return PreflightResult(valid=False, errors=[f"Syntax error: {e}"])
-    except ExecutionError as e:
+    except TDEaseError as e:
         return PreflightResult(valid=False, errors=[str(e)])
 
     unsupported: set[str] = set()
@@ -145,7 +138,7 @@ def execute(
 
     1. parse_snakefile（统一解析入口，与 preflight 共用）
     2. Popen-based task execution（流式日志 + cancel 检查）
-    3. 错误分类：ExecutionError 原样保留，未知异常 → runtime_internal
+    3. 错误分类：TDEaseError 原样保留，未知异常 → ENGINE_RUNTIME_INTERNAL
     """
     storage = get_storage()
     run_id = commit.run_id
@@ -199,7 +192,16 @@ def execute(
         cleanup_engine_alias(execution_root)
     if engine_result.cancelled or storage.check_cancelled(run_id):
         emitter.run_cancelled(revision_id, time.perf_counter() - start)
-        return ExecutionResult(success=False, exit_code=engine_result.exit_code, error=cancelled(run_id),
+        return ExecutionResult(
+            success=False,
+            exit_code=engine_result.exit_code,
+            error=TDEaseError(
+                code=ErrorCode.ENGINE_CANCELLED,
+                message=f"执行已取消: {run_id}",
+                remedy="Resubmit the Run to start a fresh execution.",
+                retryable=False,
+                details={"run_id": run_id},
+            ),
             run_time_seconds=time.perf_counter() - start, total_tasks=1,
             final_seq=emitter.last_seq)
     if engine_result.success:
@@ -207,7 +209,14 @@ def execute(
     else:
         failed = 1
         total_elapsed = time.perf_counter() - start
-        error = task_failed("engine", engine_result.exit_code, engine_result.stderr_tail)
+        error = TDEaseError(
+            code=ErrorCode.ENGINE_TASK_FAILED,
+            message=f"Task 失败: engine (exit {engine_result.exit_code})",
+            remedy="Inspect the engine log for the failed task's stderr, then fix and rerun.",
+            retryable=False,
+            details={"task_id": "engine", "exit_code": engine_result.exit_code,
+                     "reason": engine_result.stderr_tail},
+        )
         emitter.run_failed(revision_id, engine_result.exit_code, total_elapsed, str(error))
         return ExecutionResult(success=False, exit_code=engine_result.exit_code, error=error,
             run_time_seconds=total_elapsed, total_tasks=1, failed_tasks=1,

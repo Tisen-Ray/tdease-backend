@@ -14,9 +14,11 @@ TDEase Execution Runtime — 产品执行引擎。
   execution.py  — 本地任务执行
   storage.py    — 唯一文件写入原语
   events.py     — typed event emitter
-  errors.py     — ExecutionError
+  错误 — TDEaseError（src/contracts/errors.py，FAILURE-CONTRACT.md 单一权威）
 """
 
+from src.execution_runtime.events import EventEmitter
+from src.execution_runtime.parser import Rule, Workflow, parse_snakefile
 from src.execution_runtime.runtime import (
     ExecutionResult,
     PreflightResult,
@@ -25,14 +27,18 @@ from src.execution_runtime.runtime import (
     preflight,
 )
 from src.execution_runtime.storage import StorageLayout, get_storage, set_storage
-from src.execution_runtime.events import EventEmitter
-from src.execution_runtime.errors import ExecutionError
-from src.execution_runtime.parser import parse_snakefile, Workflow, Rule
 
 __all__ = [
-    "preflight", "execute", "cancel",
-    "PreflightResult", "ExecutionResult",
-    "StorageLayout", "get_storage", "set_storage",
-    "EventEmitter", "ExecutionError",
-    "parse_snakefile", "Workflow", "Rule",
+    "EventEmitter",
+    "ExecutionResult",
+    "PreflightResult",
+    "Rule",
+    "StorageLayout",
+    "Workflow",
+    "cancel",
+    "execute",
+    "get_storage",
+    "parse_snakefile",
+    "preflight",
+    "set_storage",
 ]

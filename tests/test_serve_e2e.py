@@ -21,7 +21,7 @@ def test_serve_starts_api_and_worker_from_json(tmp_path: Path) -> None:
     }), encoding="utf-8")
 
     process = subprocess.Popen(
-        [sys.executable, "-m", "src.cli", "serve", "--config", str(config)],
+        [sys.executable, "-m", "cli", "serve", "--config", str(config)],
         cwd=Path(__file__).resolve().parents[1],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

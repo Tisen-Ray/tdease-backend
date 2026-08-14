@@ -28,7 +28,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Body
 from fastapi.responses import PlainTextResponse, JSONResponse
 
-from app.core.errors import ErrorCode, TDEaseError
+from src.contracts.errors import ErrorCode, TDEaseError
 
 logger = logging.getLogger(__name__)
 

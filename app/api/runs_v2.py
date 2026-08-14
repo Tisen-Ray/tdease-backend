@@ -41,17 +41,12 @@ from src.contracts import (
     RunTrashListResponse,
     RunWorkflowGraphResponse,
     TERMINAL_STATUSES,
-    run_not_found,
-    run_idempotency_conflict,
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
-from src.execution_runtime.errors import ExecutionError
-from src.contracts import ErrorCode as RuntimeErrorCode
 from src.execution_runtime.storage import get_storage, get_tools_root
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.execution import run_captured_process
 from src.execution_runtime.execution import backend_child_env
-from src.execution_runtime.workspace_containment import validate_root_containment
 from src.services.node_catalog import (
     materialize_bindings,
     resolve_bindings,
@@ -61,9 +56,9 @@ from src.services.run_definition import freeze_definition
 # Reuses the Backend's own startup-resolved capability document (frozen at import
 # time in app/api/capabilities.py) to select a materialization strategy instead of
 # reading TDEASE_DEPLOYMENT_MODE per request. See docs/spec/CAPABILITIES.md section 7
-# ("Materialization selection rule (resolves 0.2)") and REMAINING-DESIGNS.md section 0.2.
+# ("Materialization selection rule (resolves 0.2)") and docs/STATUS.md.
 from app.api.capabilities import _CAPABILITIES
-from app.core.errors import ErrorCode, TDEaseError
+from src.contracts.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
 logger = logging.getLogger(__name__)
@@ -159,19 +154,9 @@ def _schedule_commit(commit, user_id: str):
     })
 
 
-def _workspace_execution_error(exc: ExecutionError) -> TDEaseError:
-    return TDEaseError(
-        code=ErrorCode(exc.code.value),
-        message=exc.message,
-        remedy="Reattach the Workspace so the Client registers its root with this Backend, then retry.",
-        retryable=False,
-        details=exc.details,
-    )
-
-
 async def _reject_legacy_mode_field(request: Request) -> None:
-    """Reject a caller-declared `mode` on the commit explicitly (REMAINING-DESIGNS.md
-    section 0.2): `mode` has left the Run commit surface. Ignoring it silently would be
+    """Reject a caller-declared `mode` on the commit explicitly (docs/STATUS.md):
+    `mode` has left the Run commit surface. Ignoring it silently would be
     a mysterious behaviour change for a caller that still believes it controls
     materialization; a caller must be told to stop sending it.
 
@@ -204,8 +189,8 @@ async def _reject_legacy_mode_field(request: Request) -> None:
 def _select_materialization_strategy(commit) -> str:
     """Resolve the materialization strategy for a commit from the Backend's own
     startup-resolved capabilities -- never from a caller-declared mode and never
-    from an environment variable read at request time (DESKTOP-FIRST-DEPLOYMENT.md
-    section 8 rule 2; docs/spec/CAPABILITIES.md section 7).
+    from an environment variable read at request time (docs/design/THREE-REPOSITORY-ARCHITECTURE.md;
+    docs/spec/CAPABILITIES.md section 7).
 
     The strategy is derived from the commit's own shape: a Backend-issued `local_root_id`
     reference requests `local_workspace_hardlink`; content-addressed
@@ -249,7 +234,7 @@ def _is_same_workspace_run(existing: dict, commit) -> bool:
 
 
 def _is_owner(data: dict, request: Request) -> bool:
-    """The single ownership predicate every Run route consults (REMAINING-DESIGNS.md
+    """The single ownership predicate every Run route consults (docs/STATUS.md
     P0 "Resource authorization on read and mutate paths"). With today's single
     `local-owner` Principal this is always true -- that is the point: behaviour is
     unchanged today, but the enforcement point already exists everywhere a Run is
@@ -446,18 +431,17 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                     remedy="Attach the Workspace root, then submit its root_id and relative Run path.",
                     retryable=False,
                 )
-            try:
-                from app.core.workspace_roots import get_workspace_root_registry
-                workspace = get_workspace_root_registry().resolve(
-                    commit.user_id, commit.local_root_id, commit.local_run_path or "."
+            from src.services.workspace_roots import get_workspace_root_registry
+            workspace = get_workspace_root_registry().resolve(
+                commit.user_id, commit.local_root_id, commit.local_run_path or "."
+            )
+            if workspace is None:
+                raise TDEaseError(
+                    code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+                    message="Workspace root capability is missing, revoked, or the Run path escapes it.",
+                    remedy="Register the Workspace root with this Backend, then retry.",
+                    retryable=False,
                 )
-                if workspace is None:
-                    raise ExecutionError(
-                        RuntimeErrorCode.WORKSPACE_PATH_ESCAPE,
-                        "Workspace root capability is missing, revoked, or the Run path escapes it.",
-                    )
-            except ExecutionError as exc:
-                raise _workspace_execution_error(exc) from exc
             for entry in commit.workspace_files:
                 source = (workspace / entry.path).resolve(strict=True)
                 try:
@@ -600,10 +584,9 @@ def _create_run(body: RunCreateRequest, request: Request):
         return RunCreateResponse(**_run_status_response(existing, storage).model_dump(), idempotent=True)
     if existing:
         if not _is_same_workspace_run(existing, commit):
-            error = run_idempotency_conflict(commit.idempotency_key, commit.run_id)
             raise TDEaseError(
                 code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
-                message=error.message,
+                message=f"幂等键 {commit.idempotency_key} 已存在 (run: {commit.run_id})",
                 remedy="A Backend Run id belongs to one Workspace Run and cannot be reused elsewhere.",
                 retryable=False,
             )
@@ -631,20 +614,22 @@ def _create_run(body: RunCreateRequest, request: Request):
             if not commit.local_root_id:
                 raise ValueError("local_root_id is required for the local_workspace_hardlink strategy")
             # user_id is passed so containment resolves against *this Principal's*
-            # approved Workspace roots (app.core.workspace_roots.is_within_approved_root),
+            # approved Workspace roots (src.services.workspace_roots.is_within_approved_root),
             # never a root the request itself asserts -- see
             # src/execution_runtime/workspace_containment.py's module docstring,
             # "the one call site that currently invokes materialize_local_run_files
             # without a user_id ... must start passing one" (owned by agent B4;
             # this is the B2-owned call site that docstring names).
-            from app.core.workspace_roots import get_workspace_root_registry
+            from src.services.workspace_roots import get_workspace_root_registry
             local_run_root = get_workspace_root_registry().resolve(
                 commit.user_id, commit.local_root_id, commit.local_run_path or "."
             )
             if local_run_root is None:
-                raise ExecutionError(
-                    RuntimeErrorCode.WORKSPACE_PATH_ESCAPE,
-                    "Workspace root capability is missing, revoked, or the Run path escapes it.",
+                raise TDEaseError(
+                    code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+                    message="Workspace root capability is missing, revoked, or the Run path escapes it.",
+                    remedy="Register the Workspace root with this Backend, then retry.",
+                    retryable=False,
                 )
             storage.materialize_local_run_files(
                 commit.run_id, local_run_root, commit.workspace_files,
@@ -654,8 +639,6 @@ def _create_run(body: RunCreateRequest, request: Request):
             if commit.local_root_id or commit.local_run_path:
                 raise ValueError("local root references are forbidden for the blob_store strategy")
             storage.materialize_run_files(commit.run_id, commit.workspace_files)
-    except ExecutionError as exc:
-        raise _workspace_execution_error(exc) from exc
     except (FileNotFoundError, ValueError) as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
@@ -959,7 +942,7 @@ def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
 @router.get("/{run_id}/results", response_model=RunResultsResponse)
 def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     """Published Result projection: join `result_specs` against what actually
-    materialized (docs/spec/WORKFLOW-RUN-CONTRACT.md 8.4; docs/design/CORE-ARCHITECTURE.md 3).
+    materialized (docs/spec/WORKFLOW-RUN.md; docs/design/CORE-ARCHITECTURE.md 3).
 
     Readiness is a join, not a state: a declared spec whose `output` is not yet a
     file on disk projects `status="declared"` -- it is reported, never silently
@@ -1124,8 +1107,7 @@ def list_run_files(
     # A flat-layout template names its outputs in `rule all`, at the run root rather
     # than under results/. The default discovery pattern would then report files:[]
     # for a run whose declared outputs all sit at the root -- a SUCCEEDED run
-    # indistinguishable from one that produced nothing (docs/paper/ITERATION.md 11.9;
-    # EVIDENCE-AND-KNOWLEDGE.md 2.6). Only under the default pattern (an explicit
+    # indistinguishable from one that produced nothing. Only under the default pattern (an explicit
     # caller pattern is honoured verbatim), also surface the declared outputs that
     # actually materialized so the default view is never silently empty over real
     # products.
@@ -1436,10 +1418,9 @@ def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
     storage = get_storage()
     status = _run_status_value(run_id, storage)
     if status not in (RunStatus.QUEUED, RunStatus.RUNNING):
-        from src.contracts import run_not_queued
         raise TDEaseError(
             code=ErrorCode.RUN_NOT_QUEUED,
-            message=run_not_queued(run_id, status.value).message,
+            message=f"Run {run_id} 状态为 {status.value}，不可取消",
             remedy="Only a queued or running Run can be cancelled.",
             retryable=False,
         )

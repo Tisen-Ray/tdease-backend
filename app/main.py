@@ -51,9 +51,11 @@ from app.api.files import router as files_router
 from app.api.uploads import router as uploads_router
 from app.api.nodes import router as nodes_router
 from app.api.capabilities import router as capabilities_router
-from app.core.workspace_roots import router as workspace_roots_router, get_workspace_root_registry
-from app.core.auth import authenticate_request, router as auth_router
-from app.core.errors import ErrorCode, TDEaseError, register_error_handlers
+from app.api.workspace_roots import router as workspace_roots_router
+from app.auth import authenticate_request, router as auth_router
+from app.errors import register_error_handlers
+from src.contracts.errors import ErrorCode, TDEaseError
+from src.services.workspace_roots import get_workspace_root_registry
 
 # ---------------------------------------------------------------------------
 # 生命周期
@@ -86,9 +88,10 @@ async def lifespan(app: FastAPI):
     # only thing consulted; Run commits carry an opaque root capability, not a path.
     from src.execution_runtime.workspace_containment import set_approved_roots_checker
 
-    # Late-bound on purpose: the route handlers in app/core/workspace_roots.py read
-    # the module-level registry at call time, so capturing a bound method here would
-    # let the two diverge if the singleton is ever substituted.
+    # Late-bound on purpose: the route handlers in app/api/workspace_roots.py
+    # resolve the registry via get_workspace_root_registry() at call time, so
+    # capturing a bound method here would let the two diverge if the singleton is
+    # ever substituted.
     set_approved_roots_checker(
         lambda user_id, candidate_path: get_workspace_root_registry().is_within_approved_root(
             user_id, candidate_path
@@ -136,7 +139,7 @@ async def desktop_auth(request: Request, call_next):
     try:
         request.state.principal = await authenticate_request(request)
     except HTTPException as exc:
-        # `exc.detail` is already the failure envelope (app/core/auth.py builds it
+        # `exc.detail` is already the failure envelope (app/auth.py builds it
         # from TDEaseError). Wrapping it in {"detail": ...} produced a second,
         # incompatible shape on the wire that no Client could parse with the same
         # code path as every other error -- the envelope goes out as-is.

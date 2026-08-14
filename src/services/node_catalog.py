@@ -183,8 +183,8 @@ def scan_node_catalog(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     resolves), this reports a **missing or unreadable Node catalog** as a structured
     error. An empty catalog over a broken root and an empty catalog over a healthy
     but genuinely-empty root are otherwise identical on the wire -- exactly the
-    "empty result indistinguishable from health" failure this project forbids
-    (docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6). The error carries the resolved
+    "empty result indistinguishable from health" failure this project forbids.
+    The error carries the resolved
     absolute path from Backend JSON configuration.
     """
     resolved = Path(os.path.normpath(str(root)))

@@ -6,7 +6,7 @@ import socket
 
 import pytest
 
-from src.cli import _select_port
+from cli import _select_port
 
 
 def test_default_port_is_os_assigned() -> None:

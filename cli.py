@@ -48,13 +48,14 @@ def _serve(args: argparse.Namespace) -> int:
     settings = _configure(args)
     settings.data_root.mkdir(parents=True, exist_ok=True)
     port = _select_port(settings.bind_host, settings.bind_port)
-    worker_args = [sys.executable, "-m", "src.cli", "worker", "--config", str(args.config.resolve())]
+    worker_args = [sys.executable, "-m", "cli", "worker", "--config", str(args.config.resolve())]
     if args.allow_env_overrides:
         worker_args.append("--allow-env-overrides")
-    worker = subprocess.Popen(worker_args, cwd=Path(__file__).resolve().parents[1])
+    worker = subprocess.Popen(worker_args, cwd=Path(__file__).resolve().parent)
 
     try:
         import uvicorn
+
         from app.main import app
 
         class ReadyServer(uvicorn.Server):

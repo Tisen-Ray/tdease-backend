@@ -10,12 +10,11 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
-from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from app.core.errors import ErrorCode, TDEaseError
 from src.backend_settings import BACKEND_SETTINGS
+from src.contracts.errors import ErrorCode, TDEaseError
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ LOCAL_OWNER = Principal(
 def _rejection(*, code: ErrorCode, message: str, remedy: str) -> HTTPException:
     """Build an auth rejection carrying the one failure envelope.
 
-    domain and http_status come from code via pp/core/errors.py; neither is
+    domain and http_status come from code via src/contracts/errors.py; neither is
     a parameter here, because both were free strings at this raise site before and
     that is how AUTH_TOKEN_INVALID came to be served with domain: "backend" -- an
     invalid token is not a Backend fault.
@@ -75,13 +74,13 @@ class DesktopAuth:
         self._bootstrap_secret = bootstrap_secret or None
         self._token: str | None = None
         if required and not self._bootstrap_secret:
-            # DESKTOP-FIRST-DEPLOYMENT.md section 7: "Backend ... requires the
+            # docs/design/THREE-REPOSITORY-ARCHITECTURE.md: "Backend ... requires the
             # bootstrap token." A missing secret is a startup-time configuration
             # error, not a state that implicitly grants access. We log it loudly
             # here (never crash the process): crashing at import time would take
             # every route, including public health checks, down with it, and
             # would reproduce the exact "collection/import aborts everything"
-            # failure mode REMAINING-DESIGNS.md section 0.3 flags elsewhere.
+            # failure mode docs/STATUS.md flags elsewhere.
             # Instead `configured` below is permanently False, so
             # `authenticate()` rejects every protected request for the rest of
             # the process's life -- the Backend starts, but nothing protected

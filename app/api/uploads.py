@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, File, UploadFile
 
 from src.contracts import TreeEntry
 from src.execution_runtime.storage import get_storage
-from app.core.errors import ErrorCode, TDEaseError
+from src.contracts.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/v2/uploads", tags=["uploads"])
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")

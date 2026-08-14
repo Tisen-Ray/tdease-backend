@@ -4,8 +4,7 @@ A flat-layout template names its products in `rule all`, at the run-folder root
 rather than under `results/`. The Result surface must reflect what the workflow
 declared it would produce -- not whatever a `results/**` glob happens to catch --
 so a SUCCEEDED Run whose declared table came back empty still lists that table
-(and is therefore distinguishable from a Run that produced nothing at all;
-docs/design/EVIDENCE-AND-KNOWLEDGE.md 2.6).
+(and is therefore distinguishable from a Run that produced nothing at all).
 
 This module is a small, dependency-free parser over the *stored* Snakefile text
 and the Run's `config`. It never imports or runs Snakemake: it reads the

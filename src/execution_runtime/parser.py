@@ -9,17 +9,12 @@ Provenance: provenance/source-ledger.json — prov-001
 
 from __future__ import annotations
 
-import re
 import tokenize
 from dataclasses import dataclass, field
 from io import StringIO
-from typing import Any, Callable, Generator, Optional
+from typing import Optional
 
-from src.execution_runtime.errors import (
-    ExecutionError,
-    invalid_workflow,
-    ambiguous_rule,
-)
+from src.contracts.errors import ErrorCode, TDEaseError
 
 
 @dataclass
@@ -88,7 +83,7 @@ def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
 
     Raises:
         SyntaxError: Python 语法错误
-        ExecutionError: 语义错误
+        TDEaseError: 语义错误
     """
     wf = Workflow(snakefile=source)
     tokens = list(tokenize.generate_tokens(StringIO(source).readline))
@@ -99,12 +94,24 @@ def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
     for block in rule_blocks:
         rule = _parse_rule_block(block, path)
         if rule.name in wf.rule_index:
-            raise ambiguous_rule(rule.name, 2)
+            raise TDEaseError(
+                code=ErrorCode.ENGINE_AMBIGUOUS_RULE,
+                message=f"规则歧义: {rule.name} (2 matches)",
+                remedy="Rename the conflicting rules in the Snakefile.",
+                retryable=False,
+                details={"rule": rule.name, "matches": 2},
+            )
         wf.rules.append(rule)
         wf.rule_index[rule.name] = rule
 
     if not wf.rules:
-        raise invalid_workflow("No rules found in Snakefile")
+        raise TDEaseError(
+            code=ErrorCode.ENGINE_INVALID_WORKFLOW,
+            message="无效工作流: No rules found in Snakefile",
+            remedy="Add at least one rule to the Snakefile.",
+            retryable=False,
+            details={"reason": "No rules found in Snakefile"},
+        )
 
     return wf
 

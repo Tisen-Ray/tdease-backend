@@ -13,20 +13,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import time
-from threading import Event
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from threading import Event
 
 from src.contracts import RunCommit, RunStatus
+from src.contracts.errors import ErrorCode, TDEaseError
 from src.execution_runtime import execute, get_storage
 from src.execution_runtime.events import EventEmitter
-from src.execution_runtime.errors import runtime_internal
 from src.execution_runtime.storage import StorageLayout
-
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +58,7 @@ def _prepare_worker(storage: StorageLayout) -> None:
     get_run_index().reconcile(storage)
 
 
-def _dequeue() -> Optional[dict]:
+def _dequeue() -> dict | None:
     """Claim the oldest queued Run globally, independent of tenant identity."""
     runs_dir = _data_root() / "runs"
     if not runs_dir.exists():
@@ -194,7 +191,12 @@ def execute_run(run_data: dict) -> None:
             storage.verify_local_inputs(run_id)
     except Exception as exc:
         from src.execution_runtime.runtime import ExecutionResult
-        error = runtime_internal(str(exc))
+        error = TDEaseError(
+            code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
+            message=f"运行时内部错误: {exc}",
+            remedy="Inspect the Backend log for the underlying exception, then retry the Run.",
+            retryable=False,
+        )
         result = ExecutionResult(success=False, exit_code=-1, error=error)
         # execute() raises only from inside its own try/except, which
         # always appends a terminal event first -- but the local-input

@@ -11,7 +11,7 @@ returned. Restarting the process is the only way the document changes.
 
 This module intentionally does not wire itself into the app: it exports `router`
 only. Router registration (`app/main.py`) and the auth public-path allowlist
-(`app/core/auth.py::PUBLIC_PATHS`) are owned by the agent responsible for wiring
+(`app/auth.py::PUBLIC_PATHS`) are owned by the agent responsible for wiring
 (see `docs/spec/CAPABILITIES.md` §3): `GET /api/capabilities` must be reachable
 without a Bearer token or a bootstrap deadlock results.
 """
@@ -21,8 +21,16 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter
-from pydantic import BaseModel, ConfigDict
 
+from app.schemas.capabilities import (
+    AuthCapability,
+    CapabilitiesResponse,
+    EngineCapability,
+    FeatureCapability,
+    LimitsCapability,
+    MaterializationCapability,
+    MaterializationStrategy,
+)
 from src.backend_settings import (
     BACKEND_SETTINGS,
     CAPABILITY_REGISTRY,
@@ -37,68 +45,6 @@ from src.execution_runtime.resource_budget import RESOURCE_BUDGET, ResourceBudge
 # meaning, narrowed limit). Additive changes never bump this. See
 # docs/spec/CAPABILITIES.md §5.
 PROTOCOL_VERSION: Literal[3] = 3
-
-MaterializationStrategy = Literal["local_workspace_hardlink", "blob_store"]
-
-
-class AuthCapability(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    scheme: Literal["none", "bearer"]
-    bootstrap: Literal["desktop"] | None
-
-
-class MaterializationCapability(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    strategies: tuple[MaterializationStrategy, ...]
-
-
-class LimitsCapability(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    max_cores: int
-    max_memory_mb: int
-    total_logical_cpus: int
-    reserved_service_cpus: int
-    total_memory_mb: int
-    reserved_service_memory_mb: int
-    max_concurrent_runs: Literal[1]
-    dry_run_timeout_seconds: int
-    log_tail_default_lines: int
-    log_tail_max_lines: int
-
-
-class EngineCapability(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    name: str
-    version: str
-    execution_profile: str
-
-
-class FeatureCapability(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    run_definition: bool
-    published_results: bool
-    native_dry_run_projection: bool
-    mutable_run_title: bool
-    cursor_logs: bool
-
-
-class CapabilitiesResponse(BaseModel):
-    """The frozen Backend capability document. See docs/spec/CAPABILITIES.md."""
-
-    model_config = ConfigDict(frozen=True)
-
-    protocol_version: Literal[3]
-    auth: AuthCapability
-    materialization: MaterializationCapability
-    limits: LimitsCapability
-    engine: EngineCapability
-    features: FeatureCapability
-    multi_user: bool
 
 
 def build_capabilities(

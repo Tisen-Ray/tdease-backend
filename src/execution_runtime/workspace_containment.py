@@ -2,13 +2,13 @@
 Workspace root containment -- validate against *approved* roots, never a
 caller-supplied one.
 
-REMAINING-DESIGNS.md section 1 P0 "Workspace root registration", evidence:
+docs/STATUS.md P0 "Workspace root registration", evidence:
 `src/execution_runtime/storage.py` containment (`materialize_local_run_files`)
 validated a submitted path against the root supplied in the *request*
 itself. That makes the check meaningless -- a caller can approve its own
 escape by naming a different root in the next request. Electron registers
 the user-picked root with Backend after the native picker; Backend
-(`app/core/workspace_roots.py`, owned by Track B2) stores approved roots per
+(`src/services/workspace_roots.py`, owned by Track B2) stores approved roots per
 Principal. This module owns the other half: validating a candidate path
 against whatever that store currently approves, never against a value that
 arrived in the same request as the path.
@@ -22,7 +22,7 @@ closed -- until something calls `set_approved_roots_checker()`.
 
 What B2 supplies
 ----------------
-`app/core/workspace_roots.py`'s `WorkspaceRootRegistry.is_within_approved_root`
+`src/services/workspace_roots.py`'s `WorkspaceRootRegistry.is_within_approved_root`
 already matches the callable shape this module expects exactly:
 
     (user_id: str, candidate_path: str) -> bool
@@ -35,7 +35,7 @@ an unresolvable or malformed path is simply not contained.
 Wiring required (owned by whoever assembles `app/main.py` -- not this
 module, which must not import `app/**`):
 
-    from app.core.workspace_roots import get_workspace_root_registry
+    from src.services.workspace_roots import get_workspace_root_registry
     from src.execution_runtime.workspace_containment import set_approved_roots_checker
 
     set_approved_roots_checker(get_workspace_root_registry().is_within_approved_root)
@@ -61,13 +61,12 @@ import os
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-from src.contracts.enums import ErrorCode
-from src.execution_runtime.errors import ExecutionError
+from src.contracts.errors import ErrorCode, TDEaseError
 
 PathLike = Union[Path, str]
 
 # (user_id, candidate_path) -> bool. Matches
-# app.core.workspace_roots.WorkspaceRootRegistry.is_within_approved_root exactly,
+# src.services.workspace_roots.WorkspaceRootRegistry.is_within_approved_root exactly,
 # so the real store can be wired in with zero adaptation.
 ApprovedRootsChecker = Callable[[str, str], bool]
 
@@ -117,7 +116,7 @@ def validate_root_containment(
     approved -- there is no Principal to check against.
 
     Returns the canonicalised candidate path on success. Raises
-    `ExecutionError(ErrorCode.WORKSPACE_PATH_ESCAPE)` otherwise -- never
+    `TDEaseError(ErrorCode.WORKSPACE_PATH_ESCAPE)` otherwise -- never
     trusts a root supplied alongside `candidate` in the same request; the
     only thing consulted is whatever the checker currently approves.
     """
@@ -125,10 +124,12 @@ def validate_root_containment(
     canonical_candidate = canonicalize(candidate)
     if user_id and resolved_checker(user_id, str(canonical_candidate)):
         return canonical_candidate
-    raise ExecutionError(
-        ErrorCode.WORKSPACE_PATH_ESCAPE,
-        f"路径解析到已批准的 Workspace 根目录之外: {candidate}",
-        {"path": str(candidate)},
+    raise TDEaseError(
+        code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+        message=f"路径解析到已批准的 Workspace 根目录之外: {candidate}",
+        remedy="Register the Workspace root with this Backend, then retry.",
+        retryable=False,
+        details={"path": str(candidate)},
     )
 
 

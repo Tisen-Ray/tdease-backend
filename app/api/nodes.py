@@ -3,7 +3,7 @@ from fastapi import APIRouter
 
 from src.execution_runtime.storage import get_tools_root
 from src.services.node_catalog import scan_node_catalog
-from app.core.errors import ErrorCode, TDEaseError
+from src.contracts.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
 
