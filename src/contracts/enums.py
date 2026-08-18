@@ -1,5 +1,5 @@
 """
-TDEase-zero 状态枚举 — 系统中唯一的生命周期字段及其辅助类型。
+TDEase-nexus 状态枚举 — 系统中唯一的生命周期字段及其辅助类型。
 
 设计约束（FIRST-PRINCIPLES-AUDIT.md §二）：
 - 整个系统有且仅有一个生命周期字段：runs.status

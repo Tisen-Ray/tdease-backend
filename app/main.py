@@ -1,5 +1,5 @@
 """
-TDEase-zero API Server — 极简 FastAPI 后端。
+TDEase-nexus API Server — 极简 FastAPI 后端。
 
 只做四件事：
 1. 接收 Run commit 并入库排队
@@ -62,7 +62,7 @@ from src.services.workspace_roots import get_workspace_root_registry
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("TDEase-zero starting (env=%s)", BACKEND_SETTINGS.environment)
+    logger.info("TDEase-nexus starting (env=%s)", BACKEND_SETTINGS.environment)
     from src.execution_runtime.storage import get_storage
     storage = get_storage()
     storage.bootstrap()
@@ -98,9 +98,9 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    logger.info("TDEase-zero ready")
+    logger.info("TDEase-nexus ready")
     yield
-    logger.info("TDEase-zero shutting down")
+    logger.info("TDEase-nexus shutting down")
 
 # ---------------------------------------------------------------------------
 # App
@@ -111,7 +111,7 @@ _service_generation = BACKEND_SETTINGS.backend_generation or _service_instance_i
 _service_started_at = datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(
-    title="TDEase-zero",
+    title="TDEase-nexus",
     description="Zero-architecture mass spectrometry workflow backend",
     version="0.2.0",
     docs_url=None if _is_prod else "/docs",
@@ -177,7 +177,7 @@ register_error_handlers(app)
 @app.get("/")
 async def root():
     return {
-        "name": "TDEase-zero",
+        "name": "TDEase-nexus",
         "version": "0.2.0",
         "environment": BACKEND_SETTINGS.environment,
     }

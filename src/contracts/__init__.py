@@ -1,4 +1,4 @@
-"""TDEase-zero 契约层 — 系统中所有实体类型的权威定义。"""
+"""TDEase-nexus 契约层 — 系统中所有实体类型的权威定义。"""
 
 from .enums import (
     CANCELLABLE_STATUSES,
