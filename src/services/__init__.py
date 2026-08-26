@@ -1,4 +1,4 @@
-"""TDEase-nexus 服务层 — 执行。
+"""TDEase-nexus service layer — execution.
 
 Byte custody (CAS blobs, digests, path containment) is NOT here: it lives in
 `src.execution_runtime.storage.StorageLayout` and

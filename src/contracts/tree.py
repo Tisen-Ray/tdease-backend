@@ -1,10 +1,11 @@
 """
-Tree Manifest — 不可丢失的路径树真相。
+Tree Manifest — the lossless path-tree truth.
 
-Blob 是内容寻址的字节，Tree manifest 是 path→blob 的映射。
-不能从裸 blob store 反推 tree：文件名、目录结构、权限都在 tree 里。
+Blobs are content-addressed bytes; a Tree manifest is the path→blob mapping.
+A tree cannot be reconstructed from a bare blob store: file names, directory
+structure, and permissions live in the tree.
 
-类比：Git tree objects。Blob = 文件内容，Tree = 文件名+模式。
+Analogy: Git tree objects. Blob = file content, Tree = file name + mode.
 """
 
 from __future__ import annotations
@@ -16,25 +17,26 @@ from pydantic import BaseModel, Field, field_validator
 
 
 def _validate_path_no_traversal(v: str) -> str:
-    """拒绝路径穿越模式。"""
+    """Reject path traversal patterns."""
     if v.startswith("/") or v.startswith("\\"):
-        raise ValueError(f"绝对路径不允许: {v}")
+        raise ValueError(f"Absolute paths are not allowed: {v}")
     if v.startswith("../") or v.startswith("..\\") or v == "..":
-        raise ValueError(f"路径穿越不允许: {v}")
+        raise ValueError(f"Path traversal is not allowed: {v}")
     if "/../" in v or "\\..\\" in v:
-        raise ValueError(f"路径穿越不允许: {v}")
+        raise ValueError(f"Path traversal is not allowed: {v}")
     return v
 
 
 class TreeEntry(BaseModel):
     """
-    Tree 中的一个条目 — 文件或符号链接。
+    One entry in a Tree — a file or symbolic link.
 
-    目录不由条目表示；目录结构由 path 的 / 分隔隐式表达。
+    Directories are not represented by entries; directory structure is implied
+    by the / separators in path.
     """
 
     path: str = Field(
-        description="相对于 workspace root 的路径，使用 / 分隔符。",
+        description="Path relative to the workspace root, using / separators.",
         min_length=1,
         max_length=4096,
     )
@@ -43,45 +45,45 @@ class TreeEntry(BaseModel):
         description="sha256 hex digest (64 hex chars)",
         pattern=r"^[a-f0-9]{64}$",
     )
-    size: int = Field(description="文件大小（字节）", ge=0)
+    size: int = Field(description="File size in bytes", ge=0)
     mode: Literal["file", "symlink"] = Field(
         default="file",
-        description="条目类型",
+        description="Entry type",
     )
-    executable: bool = Field(default=False, description="可执行位")
+    executable: bool = Field(default=False, description="Executable bit")
 
 
 class TreeManifest(BaseModel):
     """
-    不可变 tree manifest。
+    Immutable tree manifest.
 
-    存储位置: data-root/store/<tree_hash>  (内容寻址)
-    引用关系: Run commit → tree_hash（锁定 workspace 在提交时刻的状态）
+    Storage: data-root/store/<tree_hash>  (content-addressed)
+    Reference: Run commit → tree_hash (locks the workspace state at submission time)
     """
 
     tree_hash: str = Field(
         default="",
-        description="sha256(sorted(json(entries)))，填充于 freeze()",
+        description="sha256(sorted(json(entries))), populated by freeze()",
     )
-    workspace_id: str = Field(description="所属 workspace")
+    workspace_id: str = Field(description="Owning workspace")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
     )
     entries: list[TreeEntry] = Field(
-        description="排序后的条目列表",
+        description="Sorted entry list",
     )
     parent_tree_hash: Optional[str] = Field(
         default=None,
-        description="上一版 tree hash，形成链式历史",
+        description="Previous tree hash, forming a chained history",
     )
 
     def freeze(self) -> str:
         """
-        计算 tree hash 并固化。
+        Compute and freeze the tree hash.
 
-        hash = sha256(entries 的规范化 JSON)。
-        规范化规则：按 path 排序，每个 entry 序列化为
-        {path,blob_hash,size,mode,executable} 的紧凑 JSON。
+        hash = sha256(canonical JSON of entries).
+        Canonicalization: sort by path, serialize each entry as compact JSON
+        {path,blob_hash,size,mode,executable}.
         """
         import hashlib
         import json
@@ -104,8 +106,9 @@ class TreeManifest(BaseModel):
 
 class TreeDiff(BaseModel):
     """
-    两个 tree 之间的差异 — 前端 diff 视图的数据模型。
-    不由后端计算；前端/CLI 比对两个 tree manifest 后生成。
+    Difference between two trees — the data model for the frontend diff view.
+    Not computed by the backend; the frontend/CLI generates it by comparing two
+    tree manifests.
     """
 
     added: list[TreeEntry] = Field(default_factory=list)

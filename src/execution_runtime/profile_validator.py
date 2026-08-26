@@ -2,7 +2,7 @@
 TDEase Snakefile Profile Validator (§4.3).
 
 Validates that a Snakefile conforms to the statically-parseable subset
-guaranteeing frontend DAG parity: "能提交的工作流 = 前端能画 DAG 的工作流".
+guaranteeing frontend DAG parity: "a submittable workflow = a workflow the frontend can draw as a DAG".
 
 Profile rules (the ONLY things that matter for static DAG topology):
   - input/output positions contain literal patterns only

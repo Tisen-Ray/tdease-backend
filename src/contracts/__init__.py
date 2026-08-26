@@ -1,4 +1,4 @@
-"""TDEase-nexus 契约层 — 系统中所有实体类型的权威定义。"""
+"""TDEase-nexus contract layer — authoritative definitions of all entity types in the system."""
 
 from .enums import (
     CANCELLABLE_STATUSES,

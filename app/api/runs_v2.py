@@ -1,10 +1,10 @@
 """
-Runs API v2 — SSE 事件流 + 状态查询。
+Runs API v2 — SSE event stream + status queries.
 
-后端只做四件事：接受 commit、排队、执行、流出文件事件。
-使用 SSE + Last-Event-ID 推送。
+The backend does exactly four things: accept commits, queue, execute, stream file events.
+Pushed via SSE + Last-Event-ID.
 
-所有写入通过 Storage Layout（Route 不直接 open/write/mkdir）。
+All writes go through the Storage Layout (routes never open/write/mkdir directly).
 """
 
 from __future__ import annotations
@@ -564,9 +564,9 @@ async def create_run(body: RunCreateRequest, request: Request):
 
 def _create_run(body: RunCreateRequest, request: Request):
     """
-    提交 Run commit。
+    Submit a Run commit.
 
-    使用 Storage Layout 原子写入 run.json + 初始事件。
+    Atomically writes run.json + initial events via the Storage Layout.
     """
     commit = _schedule_commit(body.commit, request.state.principal.user_id)
     storage = get_storage()
@@ -586,7 +586,7 @@ def _create_run(body: RunCreateRequest, request: Request):
         if not _is_same_workspace_run(existing, commit):
             raise TDEaseError(
                 code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
-                message=f"幂等键 {commit.idempotency_key} 已存在 (run: {commit.run_id})",
+                message=f"Idempotency key {commit.idempotency_key} already exists (run: {commit.run_id})",
                 remedy="A Backend Run id belongs to one Workspace Run and cannot be reused elsewhere.",
                 retryable=False,
             )
@@ -790,7 +790,7 @@ def purge_trashed_run(
 
 @router.get("/{run_id}", response_model=RunStatusResponse)
 def get_run(run_id: str, data: dict = Depends(_owned_run)):
-    """查询 Run 状态 — 从 run.json + events.jsonl 投影。"""
+    """Query run status — projected from run.json + events.jsonl."""
     storage = get_storage()
     return _run_status_response(data, storage)
 
@@ -1271,11 +1271,11 @@ async def get_events_sse(
     last_event_id: Optional[int] = Query(default=None, alias="last_event_id"),
     _owned: dict = Depends(_owned_run),
 ):
-    """SSE 事件流 — events.jsonl 尾部 → SSE。Last-Event-ID 断点续传。"""
+    """SSE event stream — tail of events.jsonl to SSE. Last-Event-ID resumes the stream."""
     storage = get_storage()
 
     async def event_generator():
-        # query param 优先，其次读标准 SSE Last-Event-ID header
+        # Query param takes precedence; otherwise read the standard SSE Last-Event-ID header
         cursor = last_event_id
         if cursor is None:
             header_val = request.headers.get("Last-Event-ID")
@@ -1414,13 +1414,13 @@ def list_runs(
 
 @router.post("/{run_id}/cancel", response_model=RunActionResponse)
 def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
-    """取消 Run — 通过 Storage Layout 写入 cancel 标记。"""
+    """Cancel a run — writes the cancel flag through the Storage Layout."""
     storage = get_storage()
     status = _run_status_value(run_id, storage)
     if status not in (RunStatus.QUEUED, RunStatus.RUNNING):
         raise TDEaseError(
             code=ErrorCode.RUN_NOT_QUEUED,
-            message=f"Run {run_id} 状态为 {status.value}，不可取消",
+            message=f"Run {run_id} is {status.value} and cannot be cancelled",
             remedy="Only a queued or running Run can be cancelled.",
             retryable=False,
         )

@@ -1,8 +1,8 @@
 """
-TDEase Workflow Parser — Snakefile 解析。
+TDEase Workflow Parser — Snakefile parsing.
 
-基于 Python tokenize 的状态机解析器。
-解析结果为瞬态 Workflow 对象 — 不持久化，不在 DB/HTTP/frontend 中。
+State-machine parser built on Python tokenize.
+The parse result is a transient Workflow object — not persisted, never crosses DB/HTTP/frontend.
 
 Provenance: provenance/source-ledger.json — prov-001
 """
@@ -19,7 +19,7 @@ from src.contracts.errors import ErrorCode, TDEaseError
 
 @dataclass
 class Rule:
-    """TDEase 解析后的 rule — 瞬态对象。"""
+    """Parsed TDEase rule — transient object."""
     name: str
     lineno: int
     snakefile: str
@@ -36,7 +36,7 @@ class Rule:
 
 @dataclass
 class Workflow:
-    """TDEase 解析后的 workflow — 瞬态对象。"""
+    """Parsed TDEase workflow — transient object."""
     snakefile: str
     rules: list[Rule] = field(default_factory=list)
     rule_index: dict[str, Rule] = field(default_factory=dict)
@@ -74,21 +74,21 @@ def _unquote(s: str) -> str:
 
 def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
     """
-    解析 Snakefile 为 Workflow 对象。
+    Parse a Snakefile into a Workflow object.
 
-    使用 Python tokenize 模块解析 Snakefile (Python-like DSL)。
+    Uses the Python tokenize module to parse the Snakefile (a Python-like DSL).
 
     Returns:
-        Workflow (瞬态，不持久化)
+        Workflow (transient, not persisted)
 
     Raises:
-        SyntaxError: Python 语法错误
-        TDEaseError: 语义错误
+        SyntaxError: Python syntax error
+        TDEaseError: semantic error
     """
     wf = Workflow(snakefile=source)
     tokens = list(tokenize.generate_tokens(StringIO(source).readline))
 
-    # 按 rule 关键字分段
+    # Split into segments at rule keywords
     rule_blocks = _split_rules(tokens, path)
 
     for block in rule_blocks:
@@ -96,7 +96,7 @@ def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
         if rule.name in wf.rule_index:
             raise TDEaseError(
                 code=ErrorCode.ENGINE_AMBIGUOUS_RULE,
-                message=f"规则歧义: {rule.name} (2 matches)",
+                message=f"Ambiguous rule: {rule.name} (2 matches)",
                 remedy="Rename the conflicting rules in the Snakefile.",
                 retryable=False,
                 details={"rule": rule.name, "matches": 2},
@@ -107,7 +107,7 @@ def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
     if not wf.rules:
         raise TDEaseError(
             code=ErrorCode.ENGINE_INVALID_WORKFLOW,
-            message="无效工作流: No rules found in Snakefile",
+            message="Invalid workflow: No rules found in Snakefile",
             remedy="Add at least one rule to the Snakefile.",
             retryable=False,
             details={"reason": "No rules found in Snakefile"},
@@ -117,7 +117,7 @@ def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
 
 
 def _split_rules(tokens: list, path: str) -> list[list]:
-    """在 rule/checkpoint 关键字处分段。"""
+    """Split into segments at rule/checkpoint keywords."""
     blocks: list[list] = []
     current: list = []
     in_rule = False
@@ -156,14 +156,14 @@ def _split_rules(tokens: list, path: str) -> list[list]:
 
 
 def _parse_rule_block(tokens: list, path: str) -> Rule:
-    """解析单个 rule 的 token 序列。"""
+    """Parse the token sequence of a single rule."""
     rule = Rule(name="", lineno=tokens[0].start[0], snakefile=path)
 
-    # 检测 checkpoint
+    # Detect checkpoint
     if tokens[0].string == "checkpoint":
         rule.is_checkpoint = True
 
-    # 提取 rule 名
+    # Extract rule name
     idx = 1
     while idx < len(tokens):
         tok = tokens[idx]
@@ -250,7 +250,7 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
 # ── Section parsers ──
 
 def _parse_io(tokens: list, start: int, rule: Rule, kind: str) -> int:
-    """解析 input:/output: — 收集字符串（支持缩进子块）。"""
+    """Parse input:/output: — collect strings (indented sub-blocks supported)."""
     idx = start + 1
     while idx < len(tokens) and _is(tokens[idx], OP) and tokens[idx].string == ":":
         idx += 1
@@ -303,7 +303,7 @@ def _parse_io(tokens: list, start: int, rule: Rule, kind: str) -> int:
 
 
 def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
-    """解析单字符串 section (shell, script, message)。
+    """Parse a single-string section (shell, script, message).
 
     For shell commands, collects the ENTIRE line (first string + subsequent
     tokens up to NEWLINE/DEDENT) so that arguments are preserved.  Without
@@ -369,7 +369,7 @@ def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> in
 
 
 def _parse_int_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
-    """解析整数 section (threads, priority)。"""
+    """Parse integer sections (threads, priority)."""
     idx = start + 1
     while idx < len(tokens) and _is(tokens[idx], OP) and tokens[idx].string == ":":
         idx += 1
@@ -409,7 +409,7 @@ def _parse_int_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
 
 
 def _parse_string_list_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
-    """解析字符串列表 section (log)。"""
+    """Parse a string-list section (log)."""
     idx = start + 1
     while idx < len(tokens) and _is(tokens[idx], OP) and tokens[idx].string == ":":
         idx += 1
@@ -437,7 +437,7 @@ def _parse_string_list_section(tokens: list, start: int, rule: Rule, attr: str) 
 
 
 def _skip_section(tokens: list, start: int) -> int:
-    """跳过不支持的 section,正确消费其 block (INDENT...DEDENT)。
+    """Skip an unsupported section, correctly consuming its block (INDENT...DEDENT).
 
     Previously this returned at the first NEWLINE, leaving the section's
     INDENT/DEDENT and body tokens for the main loop to mis-parse. For a

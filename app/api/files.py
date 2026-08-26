@@ -66,8 +66,8 @@ _PROTECTED_WRITE_PREFIXES = _PROTECTED_READ_PREFIXES + ("nodes/",)
 
 # ── Helpers ──
 
-# Root directory for file operations — 单一解析点 get_storage()
-# （src/execution_runtime/storage.py），不再散落运行时根目录解析逻辑。
+# Root directory for file operations — single resolution point get_storage()
+# (src/execution_runtime/storage.py); runtime root-resolution logic is no longer scattered.
 def _data_root() -> Path:
     from src.execution_runtime.storage import get_storage
     return get_storage().data

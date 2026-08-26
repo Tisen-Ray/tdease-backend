@@ -193,7 +193,7 @@ def execute_run(run_data: dict) -> None:
         from src.execution_runtime.runtime import ExecutionResult
         error = TDEaseError(
             code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
-            message=f"运行时内部错误: {exc}",
+            message=f"Internal runtime error: {exc}",
             remedy="Inspect the Backend log for the underlying exception, then retry the Run.",
             retryable=False,
         )

@@ -1,9 +1,9 @@
 """
-Run Commit — 不可变的一次运行快照。
+Run Commit — an immutable snapshot of a single run.
 
-Run 是系统中唯一有生命周期状态轴的实体。
-Run commit 包含执行一次 workflow 所需的全部信息：
-workspace 状态锁定、Snakefile、配置、packages、节点映射。
+Run is the only entity in the system with a lifecycle status axis.
+A Run commit contains everything needed to execute a workflow once:
+locked workspace state, Snakefile, configuration, packages, and node bindings.
 """
 
 from __future__ import annotations
@@ -18,50 +18,52 @@ from .tree import TreeEntry, _validate_path_no_traversal
 
 
 class PackageLock(BaseModel):
-    """Run commit 中锁定的 package 版本。"""
+    """A package version locked in the run commit."""
 
-    name: str = Field(description="package 名称")
-    version: str = Field(description="锁定版本")
+    name: str = Field(description="Package name")
+    version: str = Field(description="Locked version")
     digest: str = Field(
-        description="package 内容 sha256",
+        description="Package content sha256",
         pattern=r"^[a-f0-9]{64}$",
     )
 
 
 class NodeBinding(BaseModel):
-    """Run commit 中锁定的服务端 Node package identity。"""
+    """Server-side Node package identity locked in the run commit."""
 
     id: str = Field(description="Node ID (e.g. topfd)", pattern=r"^[a-zA-Z0-9_.-]+$")
     version: str = Field(description="Node package version")
     digest: str = Field(
-        description="完整 Node package sha256",
+        description="Full Node package sha256",
         pattern=r"^[a-f0-9]{64}$",
     )
-    rules: list[str] = Field(default_factory=list, description="本 Run 使用的公开 rule 名")
+    rules: list[str] = Field(default_factory=list, description="Public rule names used by this run")
 
 
 class ResultSpec(BaseModel):
     """
-    一条声明的 Published Result — 冻结进 RunCommit.result_specs。
+    A declared Published Result — frozen into RunCommit.result_specs.
 
-    语义见 docs/design/CORE-ARCHITECTURE.md 3、docs/spec/WORKFLOW-RUN.md：
-    这是可选的 Published Result 语义元数据。未提供时，Backend 从 Snakemake 的默认
-    target 声明生成中性的 workflow_output 条目；模型不会从文件名猜测语义。就绪状态是
-    output 与 Run 文件清单 join (3.1)，不是独立的状态机；未就绪不代表被吞掉，必须投影为
-    "declared"。
+    Semantics: see docs/design/CORE-ARCHITECTURE.md 3 and docs/spec/WORKFLOW-RUN.md.
+    This is optional Published Result semantic metadata. When absent, the Backend
+    generates a neutral workflow_output entry from Snakemake's default target
+    declaration; the model never guesses semantics from file names. Readiness is
+    a join between output and the Run file manifest (3.1), not a separate state
+    machine; not-ready does not mean swallowed — it must be projected as
+    "declared".
     """
 
     result_id: str = Field(
-        description="Result 在本 Run 内的稳定标识 (如 'feature-table:sample-a')",
+        description="Stable identifier of the Result within this Run (e.g. 'feature-table:sample-a')",
         pattern=r"^[a-zA-Z0-9_.:-]+$",
     )
-    name: str = Field(description="展示名称")
-    kind: str = Field(description="Result 种类 (如 feature_table)，用于分组与选择器")
+    name: str = Field(description="Display name")
+    kind: str = Field(description="Result kind (e.g. feature_table), used for grouping and selectors")
     dimensions: dict[str, str] = Field(
         default_factory=dict,
-        description="声明的维度取值 (如 {sample: sample-a})；键为稳定标识，值为字符串",
+        description="Declared dimension values (e.g. {sample: sample-a}); keys are stable identifiers, values are strings",
     )
-    output: str = Field(description="Run-root-relative 的产物路径，用于与文件清单 join")
+    output: str = Field(description="Run-root-relative artifact path, used to join with the file manifest")
     _validate_output = field_validator("output")(_validate_path_no_traversal)
 
 
@@ -84,35 +86,37 @@ class WorkflowProjection(BaseModel):
 
 class RunCommit(BaseModel):
     """
-    不可变 Run commit — 前端/CLI/Agent 提交，后端只做机械校验。
+    Immutable Run commit — submitted by frontend/CLI/Agent; the backend only
+    performs mechanical validation.
 
-    提交后 run_id 固定，commit 内容永不修改。
-    存储位置: data-root/runs/<run_id>/run.json
+    After submission the run_id is fixed and the commit content is never
+    modified.
+    Storage: data-root/runs/<run_id>/run.json
     """
 
     run_id: str = Field(
-        description="运行唯一标识",
+        description="Unique run identifier",
         pattern=r"^[a-zA-Z0-9_-]+$",
     )
     idempotency_key: str = Field(
-        description="客户端生成的幂等键，UNIQUE 约束",
+        description="Client-generated idempotency key, UNIQUE constraint",
     )
-    workspace_id: str = Field(description="所属 workspace")
+    workspace_id: str = Field(description="Owning workspace")
     workspace_tree_hash: str = Field(
-        description="提交时刻的 workspace tree hash，锁定文件状态",
+        description="Workspace tree hash at submission time; locks the file state",
         pattern=r"^[a-f0-9]{64}$",
     )
     workspace_files: list[TreeEntry] = Field(
         default_factory=list,
-        description="客户端冻结的 path→blob 映射；服务端据此物化隔离运行快照",
+        description="Frozen client-side path→blob mapping; the server materializes the isolated run snapshot from it",
     )
     local_root_id: Optional[str] = Field(
         default=None,
-        description="Desktop local materialization 使用的 Backend-issued root capability",
+        description="Backend-issued root capability used for desktop local materialization",
     )
     local_run_path: Optional[str] = Field(
         default=None,
-        description="相对于已授权 Workspace root 的 Run 路径；remote 必须为空",
+        description="Run path relative to the authorized Workspace root; must be empty for remote",
     )
     workspace_run_path: Optional[str] = Field(
         default=None,
@@ -124,71 +128,76 @@ class RunCommit(BaseModel):
     def validate_workspace_run_path(cls, value: Optional[str]) -> Optional[str]:
         return _validate_path_no_traversal(value) if value is not None else None
 
-    # Snakemake 执行参数
-    snakefile: str = Field(description="Snakefile 完整内容（提交时固化）")
+    # Snakemake execution parameters
+    snakefile: str = Field(description="Full Snakefile content (frozen at submission)")
     config: dict = Field(
         default_factory=dict,
-        description="Snakemake --config 参数",
+        description="Snakemake --config parameters",
     )
-    cores: int = Field(default=4, description="CPU 核心数", ge=1, le=256)
+    cores: int = Field(default=4, description="CPU core count", ge=1, le=256)
     memory_mb: Optional[int] = Field(
         default=None,
         ge=128,
-        description="Snakemake 调度内存声明 (MB)；null 时由 Backend 取当前计算预算",
+        description="Declared Snakemake scheduling memory (MB); null = backend uses the current compute budget",
     )
     targets: list[str] = Field(
         default_factory=list,
-        description="Snakemake target rules/files，空 = 默认 target",
+        description="Snakemake target rules/files; empty = default target",
     )
 
-    # 依赖锁定
+    # Dependency locks
     packages: list[PackageLock] = Field(
         default_factory=list,
-        description="锁定的 package 列表",
+        description="Locked package list",
     )
     nodes: list[NodeBinding] = Field(
         default_factory=list,
-        description="锁定的节点二进制映射",
+        description="Locked node binary mapping",
     )
 
-    # Published Results — 声明"答案"，见 docs/design/CORE-ARCHITECTURE.md 3
+    # Published Results — declared "answers"; see docs/design/CORE-ARCHITECTURE.md 3
     result_specs: list[ResultSpec] = Field(
         default_factory=list,
         description=(
-            "可选的 Published Result 语义元数据；为空时由 Snakemake 默认 target 声明"
-            "生成中性结果。GET /api/v2/runs/{run_id}/results 将其与实际产物清单 join 后投影。"
+            "Optional Published Result semantic metadata; when empty, neutral "
+            "results are generated from the Snakemake default target declaration. "
+            "GET /api/v2/runs/{run_id}/results joins these with the actual "
+            "artifact manifest before projection."
         ),
     )
 
-    # 元信息
-    user_id: str = Field(description="提交者 user_id")
+    # Metadata
+    user_id: str = Field(description="Submitting user_id")
     materialization_strategy: Optional[str] = Field(
         default=None,
         description=(
-            "服务端解析并记录的物化策略 (如 local_workspace_hardlink | blob_store)。"
-            "调用方不得声明部署模式——见 docs/spec/CAPABILITIES.md 7 与 "
-            "docs/STATUS.md；Backend 在 app/api/runs_v2.py "
-            "中根据 commit 形状 (是否携带 local_root_id) 匹配自身启动时解析的 "
-            "capabilities.materialization.strategies 来选定该值，并覆盖任何调用方提交的值。"
-            "此前的 mode 字段已从调用方可提交的 commit 面中移除；调用方若仍提交 "
-            "mode 会被显式拒绝 (RUN_MODE_MISMATCH)，而不是被静默忽略。"
+            "Materialization strategy resolved and recorded by the server "
+            "(e.g. local_workspace_hardlink | blob_store). Callers must not "
+            "declare a deployment mode — see docs/spec/CAPABILITIES.md 7 and "
+            "docs/STATUS.md. In app/api/runs_v2.py the Backend selects this "
+            "value by matching the commit shape (whether local_root_id is "
+            "present) against the capabilities.materialization.strategies "
+            "resolved at startup, overriding any caller-submitted value. "
+            "The former mode field has been removed from the caller-submittable "
+            "commit surface; a caller that still submits mode is explicitly "
+            "rejected (RUN_MODE_MISMATCH) rather than silently ignored."
         ),
     )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
-        description="提交时间 (UTC)",
+        description="Submission time (UTC)",
     )
     labels: dict[str, str] = Field(
         default_factory=dict,
-        description="用户自定义标签，用于搜索和分组",
+        description="User-defined labels for search and grouping",
     )
 
 class RunCreateRequest(BaseModel):
     """
-    提交 Run 的请求体。
+    Request body for submitting a Run.
 
-    由前端/CLI/Agent 构建，包含完整 commit。
-    后端只校验，不修改。
+    Built by frontend/CLI/Agent; contains the full commit.
+    The backend only validates, never modifies.
     """
 
     commit: RunCommit
@@ -220,11 +229,13 @@ class RunWorkflowGraphResponse(BaseModel):
 
 class ResultRef(BaseModel):
     """
-    Published Result 的寻址引用 (docs/design/CORE-ARCHITECTURE.md 3.2)。
+    Addressing reference to a Published Result (docs/design/CORE-ARCHITECTURE.md 3.2).
 
-    digest 缺省 = 引用该 Result 的当前值 (未 pin，随 Recompute 自动更新)；
-    digest 存在 = 精确指向该字节内容 (pin，用于 Evidence/溯源)。两种读法都合法，
-    区别只在调用方是否携带 digest —— 本模型故不强制 digest 必填。
+    digest absent = reference the Result's current value (unpinned, follows
+    Recompute automatically); digest present = point at exactly those bytes
+    (pinned, for Evidence/provenance). Both readings are legal; the only
+    difference is whether the caller carries a digest — hence this model does
+    not make digest required.
     """
 
     workspace_id: str
@@ -235,13 +246,16 @@ class ResultRef(BaseModel):
 
 class RunResultEntry(BaseModel):
     """
-    单条 Published Result 投影 —— result_specs 中的一条声明与文件清单 join 后的结果。
+    A single Published Result projection — one declared entry from result_specs
+    joined against the file manifest.
 
-    status 是 join 的结果，不是独立状态机 (CORE-ARCHITECTURE.md 3.1)：
-    声明的 output 在文件清单中不存在 -> "declared"；存在 -> "ready"，携带当前 digest。
-    一个声明了但从未就绪的 Result 必须出现在这里 (status="declared")，不能被静默省略；
-    反过来，任何未被 result_specs 声明的文件都不会出现在这里 —— 它只是 Technical
-    Artifact，只能经由 GET /api/v2/runs/{run_id}/files 访问。
+    status is the outcome of that join, not a separate state machine
+    (CORE-ARCHITECTURE.md 3.1): a declared output missing from the manifest ->
+    "declared"; present -> "ready", carrying the current digest. A Result that
+    was declared but never became ready must appear here (status="declared"),
+    never be silently omitted; conversely, any file not declared in
+    result_specs will never appear here — it is merely a Technical Artifact,
+    reachable only via GET /api/v2/runs/{run_id}/files.
     """
 
     result_id: str
@@ -256,7 +270,7 @@ class RunResultEntry(BaseModel):
 
 
 class RunResultsResponse(BaseModel):
-    """GET /api/v2/runs/{run_id}/results 的响应体。"""
+    """Response body for GET /api/v2/runs/{run_id}/results."""
 
     run_id: str
     results: list[RunResultEntry]
@@ -290,8 +304,8 @@ class RunTrashListResponse(BaseModel):
 
 class RunStatusResponse(BaseModel):
     """
-    Run 状态查询响应 — 从 run.json + events.jsonl 衍生的投影。
-    不是独立存储，是每次查询时的快照视图。
+    Run status query response — a projection derived from run.json + events.jsonl.
+    Not stored independently; a snapshot view computed per query.
     """
 
     run_id: str
@@ -302,7 +316,7 @@ class RunStatusResponse(BaseModel):
     status: RunStatus
     materialization_strategy: str = Field(
         default="local_workspace_hardlink",
-        description="服务端记录的物化策略，见 RunCommit.materialization_strategy。",
+        description="Materialization strategy recorded by the server; see RunCommit.materialization_strategy.",
     )
     cores: int
     pid: Optional[int] = None
@@ -316,12 +330,12 @@ class RunStatusResponse(BaseModel):
     finished_at: Optional[datetime] = None
     event_seq_last: int = Field(
         default=0,
-        description="当前最后事件序号，用于 SSE Last-Event-ID",
+        description="Last event sequence number, used for SSE Last-Event-ID",
     )
 
 
 class RunListResponse(BaseModel):
-    """Run 列表响应 — 分页、可重建。"""
+    """Run list response — paginated, rebuildable."""
 
     runs: list[RunStatusResponse]
     total: int

@@ -1,14 +1,14 @@
 """
-TDEase Execution Runtime — 程序化入口。
+TDEase Execution Runtime — programmatic entry point.
 
-Worker 调用:
+Called by the worker:
   preflight(commit) -> PreflightResult
   execute(commit) -> ExecutionResult
   cancel(run_id)   -> bool
 
-preflight 和 execute 共用 parser.py 的 parse_snakefile 作为唯一解析入口。
-execute 在 task 之间检查 storage.check_cancelled(run_id)。
-错误分类：TDEaseError 原样传递，未知异常 → ENGINE_RUNTIME_INTERNAL。
+preflight and execute share parse_snakefile from parser.py as the single parse entry point.
+execute checks storage.check_cancelled(run_id) between tasks.
+Error classification: TDEaseError passes through unchanged; unknown exceptions map to ENGINE_RUNTIME_INTERNAL.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from src.execution_runtime.storage import get_storage
 
 @dataclass
 class PreflightResult:
-    """preflight() 返回 — 临时 view model，不持久化。"""
+    """preflight() return value — transient view model, not persisted."""
     valid: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -41,7 +41,7 @@ class PreflightResult:
 
 @dataclass
 class ExecutionResult:
-    """execute() 返回。"""
+    """execute() return value."""
     success: bool
     exit_code: int | None = None
     error: TDEaseError | None = None
@@ -54,8 +54,8 @@ class ExecutionResult:
 
 def preflight(commit: RunCommit) -> PreflightResult:
     """
-    校验 Run commit 的可执行性。
-    统一使用 parser.py 的 parse_snakefile 作为唯一解析入口。
+    Validate that a Run commit is executable.
+    Uses parse_snakefile from parser.py as the single parse entry point.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -134,11 +134,11 @@ def execute(
     rerun_mode: str = "resume",
 ) -> ExecutionResult:
     """
-    执行 Run commit。
+    Execute a Run commit.
 
-    1. parse_snakefile（统一解析入口，与 preflight 共用）
-    2. Popen-based task execution（流式日志 + cancel 检查）
-    3. 错误分类：TDEaseError 原样保留，未知异常 → ENGINE_RUNTIME_INTERNAL
+    1. parse_snakefile (single parse entry point, shared with preflight)
+    2. Popen-based task execution (streamed logs + cancel checks)
+    3. Error classification: TDEaseError kept as-is; unknown exceptions map to ENGINE_RUNTIME_INTERNAL
     """
     storage = get_storage()
     run_id = commit.run_id
@@ -197,7 +197,7 @@ def execute(
             exit_code=engine_result.exit_code,
             error=TDEaseError(
                 code=ErrorCode.ENGINE_CANCELLED,
-                message=f"执行已取消: {run_id}",
+                message=f"Execution cancelled: {run_id}",
                 remedy="Resubmit the Run to start a fresh execution.",
                 retryable=False,
                 details={"run_id": run_id},
@@ -211,7 +211,7 @@ def execute(
         total_elapsed = time.perf_counter() - start
         error = TDEaseError(
             code=ErrorCode.ENGINE_TASK_FAILED,
-            message=f"Task 失败: engine (exit {engine_result.exit_code})",
+            message=f"Task failed: engine (exit {engine_result.exit_code})",
             remedy="Inspect the engine log for the failed task's stderr, then fix and rerun.",
             retryable=False,
             details={"task_id": "engine", "exit_code": engine_result.exit_code,
@@ -238,7 +238,7 @@ def execute(
 
 
 def cancel(run_id: str) -> bool:
-    """标记 run 为已取消。worker 在 task 之间和 task 内检查此标记。"""
+    """Mark a run as cancelled. The worker checks this flag between tasks and inside a task."""
     storage = get_storage()
     storage.mark_cancelled(run_id)
     return True

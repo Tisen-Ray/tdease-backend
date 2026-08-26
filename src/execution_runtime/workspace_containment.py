@@ -126,7 +126,7 @@ def validate_root_containment(
         return canonical_candidate
     raise TDEaseError(
         code=ErrorCode.WORKSPACE_PATH_ESCAPE,
-        message=f"路径解析到已批准的 Workspace 根目录之外: {candidate}",
+        message=f"Path resolves outside the approved Workspace root: {candidate}",
         remedy="Register the Workspace root with this Backend, then retry.",
         retryable=False,
         details={"path": str(candidate)},

@@ -1,11 +1,11 @@
 """
-TDEase-nexus API Server — 极简 FastAPI 后端。
+TDEase-nexus API Server — a minimal FastAPI backend.
 
-只做四件事：
-1. 接收 Run commit 并入库排队
-2. 提供 run.json + events.jsonl 状态查询
-3. SSE 事件流推送
-4. 文件路径校验与下载
+Does exactly four things:
+1. Accept Run commits and enqueue them
+2. Serve status queries from run.json + events.jsonl
+3. Push the SSE event stream
+4. Validate file paths and serve downloads
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from app.database.init_db import check_database_health
 from app.database.lifecycle import migrate_database
 
 # ---------------------------------------------------------------------------
-# 日志
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=BACKEND_SETTINGS.log_level,
@@ -44,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 路由
+# Routes
 # ---------------------------------------------------------------------------
 from app.api.runs_v2 import router as runs_v2_router
 from app.api.files import router as files_router
@@ -58,7 +58,7 @@ from src.contracts.errors import ErrorCode, TDEaseError
 from src.services.workspace_roots import get_workspace_root_registry
 
 # ---------------------------------------------------------------------------
-# 生命周期
+# Lifecycle
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):

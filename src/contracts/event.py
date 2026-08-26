@@ -1,14 +1,15 @@
 """
-Event Stream — 不可变更的事件日志。
+Event Stream — an immutable, append-only event log.
 
-真相来源：events.jsonl（每行一个 JSON 对象，只追加）。
-SQLite 状态可从此文件重建。SSE 直接从该文件尾部流出。
+Source of truth: events.jsonl (one JSON object per line, append-only).
+SQLite state can be rebuilt from this file. SSE streams directly from its tail.
 
-所有事件含:
+Every event contains:
   schema_version, seq, timestamp, run_id, type, level, message,
   runtime_ref, data
 
-seq 单调递增，append + fsync 后才能 SSE 发布。
+seq increases monotonically; an event is published over SSE only after
+append + fsync.
 """
 
 from __future__ import annotations
@@ -23,26 +24,26 @@ from .lifecycle_declaration import LIFECYCLE_SCHEMA_VERSION
 
 
 class RuntimeRef(BaseModel):
-    """执行上下文引用 — 用于诊断关联，不是持久实体。"""
+    """Execution context reference — for diagnostic correlation, not a persistent entity."""
 
-    task_id: Optional[str] = Field(default=None, description="Task 标识")
-    step_label: Optional[str] = Field(default=None, description="人类可读步骤名")
+    task_id: Optional[str] = Field(default=None, description="Task identifier")
+    step_label: Optional[str] = Field(default=None, description="Human-readable step name")
 
 
 class Event(BaseModel):
     """
-    events.jsonl 中的一行。所有事件共享此结构。
+    One line of events.jsonl. All events share this structure.
 
     fields:
-      schema_version: 事件契约版本
-      seq: 单调递增序号 (same-run)
-      timestamp: UTC 发生时间
-      run_id: 所属 Run
-      type: EventType 枚举值
+      schema_version: event contract version
+      seq: monotonically increasing sequence number (per run)
+      timestamp: UTC occurrence time
+      run_id: owning Run
+      type: EventType enum value
       level: info | warn | error
-      message: 人类可读简述
-      runtime_ref: 执行上下文 (task/step)
-      data: 按 type 不同的负载
+      message: human-readable summary
+      runtime_ref: execution context (task/step)
+      data: payload varying by type
     """
 
     schema_version: int = Field(
@@ -51,28 +52,28 @@ class Event(BaseModel):
         le=LIFECYCLE_SCHEMA_VERSION,
         description="Event schema version",
     )
-    run_id: str = Field(description="所属 Run")
-    seq: int = Field(description="事件序号，从 1 开始，单调递增", ge=1)
+    run_id: str = Field(description="Owning Run")
+    seq: int = Field(description="Event sequence number, starting at 1, monotonically increasing", ge=1)
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
-        description="UTC 发生时间",
+        description="UTC occurrence time",
     )
-    type: EventType = Field(description="事件类型")
+    type: EventType = Field(description="Event type")
     level: str = Field(default="info", description="info | warn | error")
-    message: str = Field(default="", description="人类可读简述")
-    runtime_ref: Optional[RuntimeRef] = Field(default=None, description="执行上下文引用")
-    data: dict[str, Any] = Field(default_factory=dict, description="按 type 不同的负载")
+    message: str = Field(default="", description="Human-readable summary")
+    runtime_ref: Optional[RuntimeRef] = Field(default=None, description="Execution context reference")
+    data: dict[str, Any] = Field(default_factory=dict, description="Payload varying by type")
 
 
 class EventBatch(BaseModel):
-    """一次 SSE 推送的事件批次。"""
+    """One batch of events pushed over SSE."""
 
-    events: list[Event] = Field(description="按 seq 升序")
+    events: list[Event] = Field(description="Ascending by seq")
     run_id: str
-    last_seq: int = Field(description="本批次最大 seq → Last-Event-ID")
+    last_seq: int = Field(description="Max seq in this batch → Last-Event-ID")
 
 
-# --- 各产品事件 data schema ---
+# --- Per-product event data schemas ---
 
 class RunSubmittedData(BaseModel):
     """Records the creation of a Run identity and its initial revision."""
@@ -101,8 +102,8 @@ class RunStartedData(BaseModel):
 
 class TaskStartedData(BaseModel):
     task_id: str
-    step: str = Field(description="人类可读步骤名")
-    command: str = Field(default="", description="脱敏后的命令")
+    step: str = Field(description="Human-readable step name")
+    command: str = Field(default="", description="Redacted command")
 
 
 class TaskProgressData(BaseModel):
@@ -135,7 +136,7 @@ class RunTerminatedData(BaseModel):
 
 
 class RuntimeMessageData(BaseModel):
-    """无法结构化的诊断信息。"""
+    """Diagnostic information that cannot be structured."""
     level: str = Field(default="debug", description="debug | info | warn | error")
     message: str
     runtime_ref: Optional[RuntimeRef] = Field(default=None)

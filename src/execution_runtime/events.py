@@ -1,8 +1,8 @@
 """
-TDEase Event Emitter — 从 Execution Runtime 内部直接发出 typed event。
+TDEase Event Emitter — emits typed events directly from inside the Execution Runtime.
 
-Seq 由 Storage Layout 的 append_event 原子分配（单写者，monotonic）。
-EventEmitter 初始化时从 events.jsonl 恢复起始序号。
+Seq values are allocated atomically by the Storage Layout append_event (single writer, monotonic).
+On init the EventEmitter restores its starting sequence number from events.jsonl.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from src.execution_runtime.storage import get_storage
 
 
 class EventEmitter:
-    """执行引擎的事件发射器。seq 由 storage 原子分配。"""
+    """Event emitter for the execution engine. seq is allocated atomically by storage."""
 
     def __init__(self, run_id: str):
         self.run_id = run_id

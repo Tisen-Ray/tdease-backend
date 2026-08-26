@@ -118,7 +118,7 @@ def _apply_compute_isolation(process, psutil_module) -> None:
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    """终止进程组：SIGTERM → 短暂等待 → SIGKILL。"""
+    """Terminate the process group: SIGTERM, brief wait, then SIGKILL."""
     if proc is None or proc.poll() is not None:
         return
     try:
