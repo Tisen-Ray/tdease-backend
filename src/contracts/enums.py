@@ -2,7 +2,7 @@
 TDEase-nexus status enums — the system's single lifecycle field and its
 auxiliary types.
 
-Design constraints (FIRST-PRINCIPLES-AUDIT.md §2):
+Design constraints:
 - The whole system has exactly one lifecycle field: runs.status
 - No sub-states, no state-transition diagram
 - Transitions are driven by process lifecycle, not business code
