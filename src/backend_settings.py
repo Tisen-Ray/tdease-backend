@@ -113,7 +113,10 @@ def load_backend_settings(
     raw, data_root = _read_config(config_path)
     configured_node_root = raw.get("nodeRoot")
     if configured_node_root is None:
-        node_root = Path(__file__).resolve().parents[1] / "nodes"
+        # One deployment root: the node catalog hangs off the data root.
+        # Deployments that keep read-only assets elsewhere (packaged desktop)
+        # set nodeRoot explicitly.
+        node_root = data_root / "nodes"
     elif isinstance(configured_node_root, str) and configured_node_root.strip():
         config_base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
         node_root = (config_base / configured_node_root).resolve()

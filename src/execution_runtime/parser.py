@@ -180,7 +180,15 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
             break
         idx += 1
 
-    # Parse keyword sections
+    # Parse keyword sections.
+    #
+    # Accounting invariant: a section parser that consumes its block's INDENT
+    # must also consume the matching closing DEDENT before returning, so the
+    # main loop's indent_depth only ever tracks the RULE BODY level. The
+    # previous code let inner DEDENTs reach the main loop's depth arithmetic
+    # (and "compensated" with a sync loop), so any rule with two or more
+    # indented sections before `shell:` drifted negative and section parsing
+    # exited early — silently dropping `shellcmd` for every real workflow.
     indent_depth = 0
     while idx < len(tokens):
         tok = tokens[idx]
@@ -192,7 +200,7 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
             continue
         if _is(tok, DEDENT):
             indent_depth -= 1
-            if indent_depth < 0:
+            if indent_depth <= 0:
                 break
             idx += 1
             continue
@@ -201,7 +209,6 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
             continue
         if _is(tok, NAME) and tok.line.strip().startswith(tok.string):
             keyword = tok.string
-            prev_depth = indent_depth
             if keyword == "input":
                 idx = _parse_io(tokens, idx, rule, "input")
             elif keyword == "output":
@@ -214,14 +221,16 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
             elif keyword == "threads":
                 idx = _parse_int_section(tokens, idx, rule, "threads")
             elif keyword == "params":
-                rule.unsupported.append("params")
+                # Snakemake executes params:/resources: -- every real workflow
+                # and every node rules.smk uses them. Flagging them here would
+                # make preflight reject valid Snakemake, which WORKFLOW-RUN.md
+                # §3 forbids ("prepare must not reject valid Snakemake").
                 idx = _skip_section(tokens, idx)
             elif keyword == "log":
                 idx = _parse_string_list_section(tokens, idx, rule, "log")
             elif keyword == "message":
                 idx = _parse_string_section(tokens, idx, rule, "message")
             elif keyword == "resources":
-                rule.unsupported.append("resources")
                 idx = _skip_section(tokens, idx)
             elif keyword == "priority":
                 idx = _parse_int_section(tokens, idx, rule, "priority")
@@ -235,11 +244,6 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
                 rule.unsupported.append(keyword)
                 idx = _skip_section(tokens, idx)
             else:
-                idx += 1
-            # Section parser may have consumed inner INDENT/DEDENT.
-            # Sync indent_depth: skip any trailing DEDENTs the section left behind.
-            while idx < len(tokens) and _is(tokens[idx], DEDENT):
-                indent_depth -= 1
                 idx += 1
         else:
             idx += 1
@@ -265,6 +269,9 @@ def _parse_io(tokens: list, start: int, rule: Rule, kind: str) -> int:
             continue
         if _is(tok, DEDENT):
             if in_block:
+                # Consume the section's closing DEDENT — the main loop only
+                # accounts for the rule-body level (see parse invariant).
+                idx += 1
                 break
             idx += 1
             continue
@@ -315,12 +322,14 @@ def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> in
 
     found = False
     cmd_parts: list[str] = []  # for shell: accumulate the full command line
+    consumed_block = False
 
     while idx < len(tokens):
         tok = tokens[idx]
         if _is(tok, INDENT):
             if found and attr == "shellcmd":
                 pass  # keep collecting inside indent block
+            consumed_block = True
             idx += 1
             continue
         if _is(tok, DEDENT):
@@ -329,9 +338,25 @@ def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> in
             break
         if _is(tok, NEWLINE) or _is(tok, NL):
             if found:
-                if cmd_parts and attr == "shellcmd":
-                    setattr(rule, attr, " ".join(cmd_parts))
-                break
+                # Snakemake v9 joins adjacent string literals across lines
+                # (implicit continuation) — every real workflow formats shell
+                # commands that way. Keep collecting while the next meaningful
+                # token is another string literal; finalize otherwise.
+                peek = idx + 1
+                while peek < len(tokens) and _is(tokens[peek], (COMMENT, NL)):
+                    peek += 1
+                continues = attr == "shellcmd" and peek < len(tokens) and _is(tokens[peek], STRING)
+                if not continues:
+                    if cmd_parts and attr == "shellcmd":
+                        setattr(rule, attr, " ".join(cmd_parts))
+                    # A block section owns its closing DEDENT (parse invariant).
+                    if consumed_block:
+                        idx += 1
+                        if idx < len(tokens) and _is(tokens[idx], DEDENT):
+                            idx += 1
+                    break
+                idx += 1
+                continue
             idx += 1
             continue
         if _is(tok, COMMENT):
@@ -375,15 +400,23 @@ def _parse_int_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
         idx += 1
 
     found = False
+    consumed_block = False
     while idx < len(tokens):
         tok = tokens[idx]
         if _is(tok, INDENT):
+            consumed_block = True
             idx += 1
             continue
         if _is(tok, DEDENT):
             break
         if _is(tok, NEWLINE) or _is(tok, NL):
             if found:
+                # A block section owns its closing DEDENT; consume it so the
+                # main loop's indent_depth only tracks the rule-body level.
+                if consumed_block:
+                    idx += 1
+                    if idx < len(tokens) and _is(tokens[idx], DEDENT):
+                        idx += 1
                 break
             idx += 1
             continue
@@ -415,13 +448,20 @@ def _parse_string_list_section(tokens: list, start: int, rule: Rule, attr: str) 
         idx += 1
 
     items: list[str] = []
+    consumed_block = False
     while idx < len(tokens):
         tok = tokens[idx]
         if _is(tok, INDENT):
+            consumed_block = True
             idx += 1
             continue
         if _is(tok, DEDENT):
-            break
+            if consumed_block:
+                # Consume the section's closing DEDENT (parse invariant).
+                idx += 1
+                break
+            idx += 1
+            continue
         if _is(tok, NEWLINE) or _is(tok, NL):
             idx += 1
             continue

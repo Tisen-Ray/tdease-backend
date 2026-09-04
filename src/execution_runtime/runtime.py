@@ -52,6 +52,25 @@ class ExecutionResult:
     final_seq: int = 0
 
 
+# Shell builtins / constructs that never need PATH resolution: they exist as
+# builtins or keywords in at least one supported execution shell (cmd.exe on
+# Windows, POSIX sh elsewhere). POSIX-only EXTERNAL binaries (cp, mv, rm,
+# grep, sed, ...) are deliberately absent — on Windows they would only fail
+# at execution time, after minutes of compute. Leaving them out makes the
+# which() check in preflight fail fast with that answer.
+_SHELL_BUILTINS = frozenset({
+    "echo", "python", "python3", "mkdir", "cd", "true", "false",
+    "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
+    "case", "esac", "in", "export", "source", ".", "set", "unset",
+    "exec", "find", "printf", "date", "time", "test", "[",
+})
+# Proteomics tools — checked against PATH; .exe stripped on Windows
+_KNOWN_PROTEO_TOOLS = frozenset({
+    "topfd", "toppic", "topindex", "topmg", "topdiff", "topdia",
+    "msconvert",
+})
+
+
 def preflight(commit: RunCommit) -> PreflightResult:
     """
     Validate that a Run commit is executable.
@@ -71,21 +90,6 @@ def preflight(commit: RunCommit) -> PreflightResult:
 
     unsupported: set[str] = set()
 
-    # Shell builtins / constructs that don't need PATH resolution
-    _SHELL_BUILTINS = frozenset({
-        "echo", "python", "python3", "ls", "cat", "mkdir", "cd", "true", "false",
-        "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
-        "case", "esac", "in", "wc", "export", "source", ".", "set", "unset",
-        "env", "exec", "xargs", "find", "grep", "sed", "awk", "sort", "uniq",
-        "cut", "tr", "head", "tail", "tee", "basename", "dirname", "printf",
-        "date", "time", "test", "[", "cp", "mv", "rm", "chmod", "ln",
-    })
-    # Proteomics tools — checked against PATH; .exe stripped on Windows
-    _KNOWN_PROTEO_TOOLS = frozenset({
-        "topfd", "toppic", "topindex", "topmg", "topdiff", "topdia",
-        "msconvert",
-    })
-
     for rule in wf.rules:
         step_labels.append(rule.name)
         if rule.unsupported:
@@ -102,6 +106,10 @@ def preflight(commit: RunCommit) -> PreflightResult:
         # Absolute paths (contain / or \) are trusted as-is
         if "/" in first or "\\" in first:
             continue
+        # Snakemake placeholders (e.g. "{params.toppic_bin}") resolve at
+        # runtime from node bindings; resolve_bindings validates those.
+        if "{" in first:
+            continue
         # Strip .exe suffix on Windows
         first_name = first.rsplit(".", 1)[0] if "." in first else first
         if first_name in _SHELL_BUILTINS or first_name in _KNOWN_PROTEO_TOOLS:
@@ -111,7 +119,11 @@ def preflight(commit: RunCommit) -> PreflightResult:
     import shutil
     for tool in sorted(tools):
         if shutil.which(tool) is None and shutil.which(tool + ".exe") is None:
-            errors.append(f"tool not found: {tool}")
+            errors.append(
+                f"tool not found: {tool} (the execution shell is "
+                f"cmd.exe on Windows — do file operations with a "
+                f"'python -c' one-liner instead of POSIX commands)"
+            )
 
     if unsupported:
         errors.insert(0, f"unsupported directives: {', '.join(sorted(unsupported))}")

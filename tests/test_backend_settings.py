@@ -39,7 +39,8 @@ def test_settings_are_frozen_from_one_json_document(tmp_path) -> None:
     assert settings.bind_port == 43123
     assert settings.log_level == logging.WARNING
     assert settings.data_root == (tmp_path / "runtime").resolve()
-    assert settings.node_root == (Path(__file__).resolve().parents[1] / "nodes").resolve()
+    # node root defaults under the data root — no separate wiring to forget.
+    assert settings.node_root == (tmp_path / "runtime" / "nodes").resolve()
     assert settings.reserved_logical_cpus == "3"
     assert settings.reserved_memory_mb == "4096"
 

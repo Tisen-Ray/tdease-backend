@@ -45,10 +45,13 @@ def _projection_from_dag(dag) -> dict:
             for job in jobs
         ],
         "edges": [
+            # Every DAG dependency keeps its edge, including the ones from
+            # already-completed jobs (needrun=False). Filtering those severed
+            # completed nodes from the graph on every resume: the node list
+            # keeps them, so dropping their edges left them isolated.
             {"source": engine_dag.jobid(dependency), "target": engine_dag.jobid(job)}
             for job in jobs
             for dependency in engine_dag._dependencies[job]
-            if engine_dag.needrun(dependency)
         ],
     }
 

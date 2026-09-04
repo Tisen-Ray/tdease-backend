@@ -225,10 +225,13 @@ def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[st
     (by id + content digest). Rule-name lists on bindings are no longer
     enforced — the capabilities are derived from rules.smk at scan time, so
     a binding just pins identity.
+
+    A malformed package somewhere in the catalog (missing rules.smk,
+    unreadable, …) is deployment noise, not a Run blocker: GET /api/nodes
+    reports it in `errors[]`, and here it only matters if a Run actually
+    binds it — that binding alone fails with `node not found`.
     """
-    nodes, errors = scan_nodes(root)
-    if errors:
-        raise ValueError(f"invalid node catalog: {errors}")
+    nodes, _catalog_errors = scan_nodes(root)
     by_id = {node["id"]: node for node in nodes}
     resolved = []
     for binding in bindings:

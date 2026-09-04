@@ -12,7 +12,7 @@ mass-spectrometry analysis platform.
 | `src/` | Execution runtime: Snakemake engine, storage layer, workspace containment, backend settings |
 
 The backend consumes [tdease-ai-capability](https://github.com/Tisen-Ray/tdease-ai-capability)
-for scientific computation (Rust `tdease-ms` CLI + Agent Skills) but **does not
+for scientific computation (Rust `tdnexus-toolbox` CLI + Agent Skills) but **does not
 contain** scientific algorithms itself — those live in the capability toolkit.
 
 ## Quick start
@@ -33,9 +33,10 @@ Runtime data is external to this repository. The service owns its data layout an
 consume the Scientific System only through public commands or protocols; it never imports
 Desktop implementation paths.
 
-`nodes/` is the Backend's read-only packaged execution asset. `dataRoot` contains only
-runtime deployment data. The optional JSON `nodeRoot` field is for an explicit deployment
-override; production does not use environment-variable path discovery.
+The node catalog lives at `<dataRoot>/nodes/` — one deployment root, no separate
+wiring to forget. The optional JSON `nodeRoot` field is for deployments that keep
+read-only assets away from the data root (the packaged desktop pins it to its
+resources tree); production does not use environment-variable path discovery.
 
 Minimal `backend.json`:
 
