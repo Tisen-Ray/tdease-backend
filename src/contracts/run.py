@@ -3,7 +3,7 @@ Run Commit — an immutable snapshot of a single run.
 
 Run is the only entity in the system with a lifecycle status axis.
 A Run commit contains everything needed to execute a workflow once:
-locked workspace state, Snakefile, configuration, packages, and node bindings.
+locked workspace state, Snakefile, configuration, and node bindings.
 """
 
 from __future__ import annotations
@@ -15,17 +15,6 @@ from pydantic import BaseModel, Field, field_validator
 
 from .enums import RunStatus
 from .tree import TreeEntry, _validate_path_no_traversal
-
-
-class PackageLock(BaseModel):
-    """A package version locked in the run commit."""
-
-    name: str = Field(description="Package name")
-    version: str = Field(description="Locked version")
-    digest: str = Field(
-        description="Package content sha256",
-        pattern=r"^[a-f0-9]{64}$",
-    )
 
 
 class NodeBinding(BaseModel):
@@ -146,10 +135,6 @@ class RunCommit(BaseModel):
     )
 
     # Dependency locks
-    packages: list[PackageLock] = Field(
-        default_factory=list,
-        description="Locked package list",
-    )
     nodes: list[NodeBinding] = Field(
         default_factory=list,
         description="Locked node binary mapping",

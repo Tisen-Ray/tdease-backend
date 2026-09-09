@@ -13,7 +13,6 @@ _EXECUTION_FIELDS = (
     "snakefile",
     "config",
     "targets",
-    "packages",
     "nodes",
     "result_specs",
 )

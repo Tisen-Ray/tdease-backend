@@ -23,9 +23,45 @@ from src.contracts import RunCommit, RunStatus
 from src.contracts.errors import ErrorCode, TDEaseError
 from src.execution_runtime import execute, get_storage
 from src.execution_runtime.events import EventEmitter
-from src.execution_runtime.storage import StorageLayout
+from src.execution_runtime.storage import (
+    StorageLayout,
+    get_tools_root,
+    process_identity,
+    process_identity_alive,
+)
+from src.services.node_catalog import materialize_bindings, resolve_bindings
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_run(commit: RunCommit, storage: StorageLayout) -> None:
+    """Expose the committed definition in the run directory, immediately before execution.
+
+    Submission validates and writes nothing; this is the one place a Run's
+    working files and node links are created. It therefore always reflects the
+    revision being started -- an edit made while a previous execution was still
+    running cannot leak into it, and a re-submitted definition is picked up by
+    the next execution. Inputs are hardlinked and node packages are linked; a
+    link that the platform refuses fails the Run instead of silently copying.
+    """
+    if commit.materialization_strategy == "local_workspace_hardlink":
+        from src.services.workspace_roots import get_workspace_root_registry
+
+        workspace = get_workspace_root_registry().resolve(
+            commit.user_id, commit.local_root_id, commit.local_run_path or "."
+        )
+        if workspace is None:
+            raise ValueError(
+                "Workspace root capability is missing, revoked, or the Run path escapes it"
+            )
+        storage.materialize_local_run_files(
+            storage.allocate_run(commit.run_id), workspace, commit.workspace_files,
+            user_id=commit.user_id,
+        )
+    else:
+        storage.materialize_run_files(commit.run_id, commit.workspace_files)
+    resolved = resolve_bindings(get_tools_root(), commit.nodes)
+    materialize_bindings(storage.resolve(commit.run_id), resolved, storage.link_node_package)
 
 
 def _index_run(data: dict, storage: StorageLayout) -> None:
@@ -158,7 +194,6 @@ def execute_run(run_data: dict) -> None:
         cores=run_data.get("cores", 4),
         user_id=run_data.get("user_id", "worker"),
         materialization_strategy=run_data.get("materialization_strategy"),
-        packages=run_data.get("packages", []),
         nodes=run_data.get("nodes", []),
         targets=run_data.get("targets", []),
         memory_mb=run_data.get("memory_mb"),
@@ -179,8 +214,7 @@ def execute_run(run_data: dict) -> None:
     revision_id = projection.current_revision_id
     _index_run(run_data, storage)
     try:
-        if commit.materialization_strategy == "local_workspace_hardlink":
-            storage.verify_local_inputs(run_id)
+        _materialize_run(commit, storage)
         result = execute(
             commit,
             revision_id=revision_id,
@@ -250,15 +284,26 @@ def run_loop(
     poll_interval: float = 1.0,
     once: bool = False,
     stop_event: Event | None = None,
+    parent_pid: int | None = None,
 ) -> None:
-    """Worker main loop."""
+    """Worker main loop.
+
+    `parent_pid` is the supervising `serve` process. When it is given and the
+    parent is gone, the loop returns: a hard-killed Client must not leave a
+    worker polling the same data root forever (the orphan would keep competing
+    for the execution slot and holding stale claims).
+    """
     storage = get_storage()
     storage.bootstrap()
     _prepare_worker(storage)
     storage.reconcile_orphaned_runs()
+    parent_identity = process_identity(parent_pid) if parent_pid else None
 
     while True:
         if stop_event and stop_event.is_set():
+            return
+        if parent_identity and not process_identity_alive(parent_identity):
+            logger.warning("Worker parent process is gone; exiting to avoid an orphan poller")
             return
         try:
             # An idle worker must not monopolize the Backend-wide execution

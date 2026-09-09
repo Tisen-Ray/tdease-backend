@@ -10,6 +10,8 @@ A node package is a self-contained directory under the configured Backend node r
   - bin/, *.exe, *.dll, …   — the actual binaries.
 
 No manifest file. Directory name = node id. Directory content sha256 = digest.
+Directory names starting with `_` are not nodes: they hold templates and
+drafts and are skipped by the scanner.
 The scanner derives everything else from rules.smk by reusing the same
 text-slicing logic the Profile validator uses (so node capabilities and the
 submittable Profile stay in lockstep).
@@ -19,23 +21,74 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
 from src.execution_runtime.profile_validator import _extract_sections, _split_rules
 
 
-def package_digest(root: Path) -> str:
-    """sha256 over every file's relative path + bytes in the package dir."""
-    digest = hashlib.sha256()
+def _package_files(root: Path) -> list[Path]:
+    """Every file in the package, sorted; a symlink is a malformed package."""
+    files: list[Path] = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         if path.is_symlink():
             raise ValueError(f"node package cannot contain symlinks: {path.relative_to(root)}")
+        files.append(path)
+    return files
+
+
+def _package_signature(root: Path, files: list[Path]) -> str:
+    """Cheap tree identity: relative path + size + mtime_ns per file.
+
+    Not an identity of the package -- an invalidation key for the content digest
+    below. Same (path, size, mtime) triple per file means the digest cannot have
+    changed, which is what makes the memo safe to serve.
+    """
+    signature = hashlib.sha256()
+    for path in files:
+        stat = path.stat()
+        signature.update(path.relative_to(root).as_posix().encode("utf-8"))
+        signature.update(f":{stat.st_size}:{stat.st_mtime_ns}\n".encode("ascii"))
+    return signature.hexdigest()
+
+
+# Content digests are the node identity every Run binds, and the catalog is read
+# on every GET /api/nodes, prepare and dry-run. Hashing the full tree each time
+# costs ~500 MB of I/O for the shipped nodes; the tree signature costs one stat
+# per file and changes whenever any byte changes. Per-process by design: each
+# process (API, worker) hashes once.
+_DIGEST_MEMO: dict[str, tuple[str, str]] = {}
+_DIGEST_MEMO_LOCK = threading.Lock()
+
+
+def package_digest(root: Path) -> str:
+    """sha256 over every file's relative path + bytes in the package dir.
+
+    Memoized by tree signature: repeated reads reuse the digest while no file's
+    (path, size, mtime) changed. The returned digest is always a content digest
+    -- a stale one is impossible unless a file changed without its size or
+    mtime changing.
+    """
+    root = Path(root)
+    files = _package_files(root)
+    key = os.path.normcase(str(root))
+    signature = _package_signature(root, files)
+    with _DIGEST_MEMO_LOCK:
+        cached = _DIGEST_MEMO.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    digest = hashlib.sha256()
+    for path in files:
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    with _DIGEST_MEMO_LOCK:
+        _DIGEST_MEMO[key] = (signature, value)
+    return value
 
 
 # ── Rule contract extraction ─────────────────────────────────────────────────
@@ -161,11 +214,16 @@ def project_package(package_dir: Path) -> dict[str, Any]:
 
 
 def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Scan <root>/<id>/ directories. Malformed packages go to errors[], not raise."""
+    """Scan <root>/<id>/ directories. Malformed packages go to errors[], not raise.
+
+    Names starting with `_` are reserved for templates and drafts and are
+    skipped: a copyable starting point (`_template/`) must be able to sit in
+    the node root without appearing in the catalog or failing a Run.
+    """
     if not root.is_dir():
         return [], []
     nodes, errors = [], []
-    for package_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+    for package_dir in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("_")):
         try:
             nodes.append(project_package(package_dir))
         except (OSError, ValueError) as exc:
@@ -244,18 +302,27 @@ def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[st
     return resolved
 
 
-def materialize_bindings(target_root: Path, resolved: list[tuple[Any, dict[str, Any]]], atomic_copy) -> None:
-    """Freeze each complete bound package under <target>/nodes/<id>/.
+def materialize_bindings(
+    target_root: Path,
+    resolved: list[tuple[Any, dict[str, Any]]],
+    link_package,
+) -> None:
+    """Expose each bound package at <target>/nodes/<id>/ as a link onto the catalog.
 
-    Rules and their binaries/resources cross the execution boundary together. A Run
-    therefore executes only its digest-pinned snapshot and needs no Backend path ENV.
+    A Run resolves its nodes through the SAME directory the catalog deploys —
+    `<target>/nodes/<id>` is a directory junction (Windows) or symlink (POSIX)
+    onto the package, so the rules' relative `nodes/<id>...` paths work without
+    duplicating hundreds of megabytes per Run. The binding's digest still names
+    the identity that was resolved. A platform that refuses the link fails the
+    Run with a clear error instead of silently storing a private copy.
     """
     for binding, node in resolved:
         package_dir = node["package_dir"]
-        for source in sorted(path for path in package_dir.rglob("*") if path.is_file()):
-            if source.is_symlink():
-                raise ValueError(
-                    f"node package cannot contain symlinks: {source.relative_to(package_dir)}"
-                )
-            relative = source.relative_to(package_dir)
-            atomic_copy(source, target_root / "nodes" / binding.id / relative)
+        destination = target_root / "nodes" / binding.id
+        if link_package is not None and link_package(package_dir, destination):
+            continue
+        raise ValueError(
+            f"node package {binding.id} cannot be linked into the Run directory; a Run "
+            "never stores its own copy of a node package -- check that the node catalog "
+            "and the Backend data root are on a filesystem that supports directory links"
+        )

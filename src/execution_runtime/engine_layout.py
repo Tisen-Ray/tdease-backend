@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import stat
-import subprocess
 import sys
 from pathlib import Path
 
@@ -34,12 +33,17 @@ def prepare_engine_layout(root: Path) -> Path:
 
 
 def create_engine_alias(target: Path, alias: Path) -> None:
+    """Point the upstream compatibility name at the TDEase-owned engine state.
+
+    A junction is created through `_winapi.CreateJunction` rather than
+    `cmd /c mklink /J`: no shell, no argument quoting, and therefore no path
+    character (space, `&`, `%`, non-ASCII) can change the outcome. Windows
+    junctions need no privilege, unlike symlinks.
+    """
     if sys.platform == "win32":
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
-            check=True,
-            capture_output=True,
-        )
+        import _winapi  # Windows-only; junction creation needs no privilege
+
+        _winapi.CreateJunction(str(target), str(alias))
     else:
         os.symlink(str(target), str(alias), target_is_directory=True)
 

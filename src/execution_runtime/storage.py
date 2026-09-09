@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -49,6 +50,21 @@ from src.execution_runtime.run_projector import RunProjection, project_run
 logger = logging.getLogger(__name__)
 
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """True for a Windows junction / mount point (and for POSIX symlinks).
+
+    Python reports junctions through `st_reparse_tag`, not `S_ISLNK`, so a
+    plain `os.path.islink` check would miss them and a recursive delete would
+    follow the link into the node catalog.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_reparse_tag", 0))
+
 
 _TERMINAL_EVENT_BY_STATUS = {
     "SUCCEEDED": "run.succeeded",
@@ -86,6 +102,41 @@ def _project_lifecycle_metadata(events: list[dict[str, Any]], status: object) ->
         projected["exit_code"] = data.get("exit_code")
         projected["error"] = data.get("error_message") or terminal.get("message")
     return projected
+
+
+def process_identity(pid: int) -> str:
+    """`<pid>:<create_time>` -- a pid alone is not an identity on Windows.
+
+    Windows recycles pids aggressively; a stale claim or engine record whose pid
+    now belongs to an unrelated process must never be treated as alive.
+    """
+    import psutil
+
+    try:
+        return f"{pid}:{psutil.Process(pid).create_time():.6f}"
+    except Exception:
+        return f"{pid}:"
+
+
+def process_identity_alive(identity: str) -> bool:
+    """Whether the process recorded as `identity` is still the same process."""
+    import psutil
+
+    pid_text, _, created = identity.partition(":")
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return False
+    try:
+        process = psutil.Process(pid)
+    except Exception:
+        return False
+    if not created:
+        return True  # legacy record: pid liveness is all it captured
+    try:
+        return abs(process.create_time() - float(created)) < 1.0
+    except Exception:
+        return False
 
 
 class StorageLayout:
@@ -227,12 +278,80 @@ class StorageLayout:
             except OSError:
                 pass
             raise
+        # Fsync parent directory for durability (Unix only -- Windows rejects dir fsync)
         if os.name != "nt":
             dfd = os.open(str(target.parent), os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
+
+    def link_node_package(self, source: Path, target: Path) -> bool:
+        """Point `target` at the deployed node package `source` without copying it.
+
+        A Run's `nodes/<id>` is a directory junction (Windows) or a symlink
+        (POSIX) onto the catalog package, so a Run executes the catalog's own
+        bytes: no per-Run 200 MB duplicate, and the rules' relative
+        `nodes/<id>/...` paths keep resolving exactly as before. The package
+        digest pinned on the Run still names the identity that was bound.
+        Returns False when the platform refuses the link (non-NTFS volume,
+        missing privilege); the caller falls back to a real copy.
+        """
+        source = Path(source).resolve()
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._drop_link(target)
+        try:
+            if os.name == "nt":
+                import _winapi  # Windows-only; junction creation needs no privilege
+
+                _winapi.CreateJunction(str(source), str(target))
+            else:
+                os.symlink(source, target, target_is_directory=True)
+            return True
+        except (OSError, ImportError, AttributeError):
+            return False
+
+    def _drop_link(self, target: Path) -> None:
+        """Remove `target` if it is a reparse point, a link, or a stale tree."""
+        if _is_reparse_point(target) or target.is_symlink():
+            try:
+                os.rmdir(target)
+            except OSError:
+                target.unlink(missing_ok=True)
+        elif target.is_dir():
+            self.remove_tree(target)
+        elif target.exists():
+            target.unlink()
+
+    def remove_tree(self, target: Path, *, ignore_errors: bool = False) -> None:
+        """Remove a Backend-owned tree WITHOUT following a node junction.
+
+        `shutil.rmtree` descends through a directory junction, so deleting a
+        Run would delete the catalog package it points at. Unlink every reparse
+        point top-down first, then remove what remains.
+        """
+        target = Path(target)
+        if _is_reparse_point(target):
+            # The tree itself is a link (a Run's `nodes/<id>`): drop the link,
+            # never the package it points at.
+            try:
+                os.rmdir(target)
+            except OSError:
+                target.unlink(missing_ok=True)
+            return
+        if not target.exists():
+            return
+        for root, dirs, _files in os.walk(target, topdown=True):
+            for name in list(dirs):
+                candidate = Path(root) / name
+                if _is_reparse_point(candidate):
+                    try:
+                        os.rmdir(candidate)
+                    except OSError:
+                        candidate.unlink(missing_ok=True)
+                    dirs.remove(name)
+        shutil.rmtree(target, ignore_errors=ignore_errors)
 
     def read_json(self, path: Path) -> Optional[dict]:
         if not path.exists():
@@ -268,22 +387,22 @@ class StorageLayout:
 
         Run claims prevent duplicate execution of one Run. This second lock
         prevents different workers or Backend processes from executing two
-        Runs concurrently on the same deployment.
+        Runs concurrently on the same deployment. The claim records the owner's
+        process identity (pid + creation time), so a pid recycled by Windows
+        cannot make a dead owner look alive and wedge the queue forever.
         """
         claim = self.data / ".runtime" / "execution.claim"
         claim.parent.mkdir(parents=True, exist_ok=True)
-        payload = f"{os.getpid()}\n".encode("ascii")
+        payload = f"{process_identity(os.getpid())}\n".encode("ascii")
         try:
             fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             try:
-                owner = int(claim.read_text(encoding="ascii").strip())
-                import psutil
-                if psutil.pid_exists(owner):
+                if process_identity_alive(claim.read_text(encoding="ascii").strip()):
                     return False
                 claim.unlink(missing_ok=True)
                 fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileNotFoundError, FileExistsError, ValueError, OSError):
+            except (FileNotFoundError, FileExistsError, OSError):
                 return False
         try:
             os.write(fd, payload)
@@ -296,10 +415,10 @@ class StorageLayout:
         """Release this process's Backend-wide execution slot."""
         claim = self.data / ".runtime" / "execution.claim"
         try:
-            owner = int(claim.read_text(encoding="ascii").strip())
-        except (FileNotFoundError, ValueError, OSError):
+            owner = claim.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError):
             return
-        if owner == os.getpid():
+        if owner.split(":", 1)[0] == str(os.getpid()):
             claim.unlink(missing_ok=True)
 
     # -- Events (JSONL append, single-writer) --
@@ -656,7 +775,9 @@ class StorageLayout:
         try:
             yield Path(td)
         finally:
-            shutil.rmtree(td, ignore_errors=True)
+            # A dry-run root holds node junctions; remove_tree unlinks them
+            # before deleting so the catalog is never touched.
+            self.remove_tree(Path(td), ignore_errors=True)
 
     # -- Blob store --
 
@@ -731,25 +852,26 @@ class StorageLayout:
                 raise FileNotFoundError(f"missing blob for {path}: {digest}")
             self.atomic_write(target, self.blob_get(digest))
 
-    def materialize_local_run_files(self, run_id: str, workspace_root: Path,
-                                    entries: list[Any], *, user_id: str) -> None:
-        """Freeze controls and share large local inputs without network/CAS transfer.
+    def _local_sources(self, workspace_root: Path, entries: list[Any], *,
+                       user_id: str) -> list[tuple[str, Path, str, bool]]:
+        """Resolve every frozen local entry to its approved, digest-matching source.
 
-        workspace_root is validated against the Backend approved roots for
-        `user_id` (src.execution_runtime.workspace_containment), never
-        trusted merely because this request named it -- docs/STATUS.md
-        "Workspace root registration". `user_id` is keyword-only and
-        required -- the caller (app/api/runs_v2.py) must pass
-        `RunCommit.user_id`, never omit it. Until Backend startup wires a
-        real checker in via set_approved_roots_checker, no root is approved
-        for anyone and every call here raises WORKSPACE_PATH_ESCAPE
+        Read-only: containment, existence and digest only. Submission's check and
+        execution's materialization both go through here, so the two can never
+        disagree about which bytes a Run is defined over.
+
+        `workspace_root` is validated against the Backend approved roots for
+        `user_id` (src.execution_runtime.workspace_containment), never trusted
+        merely because a request named it -- docs/STATUS.md "Workspace root
+        registration". `user_id` is keyword-only and required. Until Backend
+        startup wires a real checker in via set_approved_roots_checker, no root
+        is approved for anyone and every call here raises WORKSPACE_PATH_ESCAPE
         (fail-closed default).
         """
         from src.execution_runtime.workspace_containment import validate_root_containment
 
         workspace_root = validate_root_containment(Path(workspace_root), user_id)
-        run_dir = self.allocate_run(run_id).resolve()
-        shared: list[dict[str, Any]] = []
+        resolved: list[tuple[str, Path, str, bool]] = []
         for entry in entries:
             rel = entry.path if hasattr(entry, "path") else entry["path"]
             expected = entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
@@ -760,21 +882,49 @@ class StorageLayout:
                 raise ValueError(f"local source escapes workspace: {rel}") from exc
             if self.file_digest(source) != expected:
                 raise ValueError(f"local source digest changed: {rel}")
-            target = (run_dir / rel).resolve(strict=False)
-            target.relative_to(run_dir)
-            target.parent.mkdir(parents=True, exist_ok=True)
             is_control = rel == "Snakefile" or rel.endswith(".smk") or rel == "config.yaml" or rel.startswith("scripts/")
+            resolved.append((rel, source, expected, is_control))
+        return resolved
+
+    def verify_local_run_files(self, workspace_root: Path, entries: list[Any], *, user_id: str) -> None:
+        """Submission-time check that the frozen mapping still matches its sources.
+
+        Writes nothing: a submission never copies inputs. The run directory is
+        materialized by the worker when the Run is dequeued.
+        """
+        self._local_sources(workspace_root, entries, user_id=user_id)
+
+    def materialize_local_run_files(self, target_dir: Path, workspace_root: Path,
+                                    entries: list[Any], *, user_id: str) -> None:
+        """Expose frozen local inputs in `target_dir` WITHOUT copying them.
+
+        One implementation for both the real run directory and a dry-run's
+        temporary root. Control files (Snakefile, *.smk, config.yaml, scripts/)
+        are written as real files: the engine reads them and they are tiny.
+        Every other input is a hardlink to the Workspace file, so a Run stores no
+        input bytes. A source that cannot be linked (another volume, a filesystem
+        without hardlinks) is refused instead of silently copied -- a multi-GB
+        duplicate the user never asked for is worse than a clear failure.
+        """
+        target_dir = Path(target_dir).resolve()
+        shared: list[dict[str, Any]] = []
+        for rel, source, expected, is_control in self._local_sources(workspace_root, entries, user_id=user_id):
+            target = (target_dir / rel).resolve(strict=False)
+            target.relative_to(target_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
             if is_control:
                 self.atomic_write(target, source.read_bytes())
-            else:
-                try:
-                    os.link(source, target)
-                    strategy = "hardlink"
-                except OSError:
-                    shutil.copy2(source, target)
-                    strategy = "copy"
-                shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": strategy})
-        self.atomic_write_json(self.resolve(run_id, ".tdease", "local-inputs.json"), shared)
+                continue
+            try:
+                os.link(source, target)
+            except OSError as exc:
+                raise ValueError(
+                    f"input {rel} cannot be linked into the Run directory "
+                    f"({exc.strerror or exc}); a Run never copies inputs -- keep the "
+                    "Workspace on the same volume as the Backend data root"
+                ) from exc
+            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "hardlink"})
+        self.atomic_write_json(target_dir / ".tdease" / "local-inputs.json", shared)
 
     def verify_local_inputs(self, run_id: str) -> None:
         manifest = self.read_json(self.resolve(run_id, ".tdease", "local-inputs.json")) or []
@@ -941,11 +1091,13 @@ class StorageLayout:
         return self.data / "store" / digest[:2] / digest
 
     def _engine_pid_alive(self, run_id: str) -> bool:
-        """Whether the disposable Snakemake process record is still alive."""
-        import psutil
+        """Whether the recorded Snakemake process is still the same process."""
         process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
         engine_pid = process.get("engine_pid")
-        return bool(engine_pid) and psutil.pid_exists(int(engine_pid))
+        if not engine_pid:
+            return False
+        created = process.get("engine_create_time")
+        return process_identity_alive(f"{engine_pid}:{created if created else ''}")
 
     def _kill_engine_pid(self, run_id: str) -> None:
         import psutil
@@ -953,6 +1105,9 @@ class StorageLayout:
         engine_pid = process.get("engine_pid")
         if not engine_pid:
             return
+        created = process.get("engine_create_time")
+        if created and not process_identity_alive(f"{engine_pid}:{created}"):
+            return  # the pid was recycled: this is not our engine
         try:
             proc = psutil.Process(int(engine_pid))
             proc.terminate()
@@ -1099,7 +1254,7 @@ class StorageLayout:
         target = self.trash / "runs" / run_id
         if not target.is_dir():
             raise FileNotFoundError(run_id)
-        shutil.rmtree(target)
+        self.remove_tree(target)
 
     def trashed_run_dirs(self) -> list[Path]:
         root = self.trash / "runs"

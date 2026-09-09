@@ -23,7 +23,6 @@ from .event import (
 )
 from .run import (
     NodeBinding,
-    PackageLock,
     ResultRef,
     ResultSpec,
     RunActionResponse,
@@ -58,7 +57,7 @@ __all__ = [
     "RunRerunRequest", "RunActionResponse", "RunStatusResponse", "RunListResponse",
     "RunTrashEntry", "RunTrashListResponse",
     "RunWorkflowGraphResponse", "WorkflowProjection",
-    "PackageLock", "NodeBinding", "ResultSpec", "ResultRef", "RunResultEntry", "RunResultsResponse",
+    "NodeBinding", "ResultSpec", "ResultRef", "RunResultEntry", "RunResultsResponse",
     # event
     "Event", "EventBatch", "RuntimeRef",
     "RunSubmittedData", "RunQueueRequestedData", "RunStartedData", "RunTerminatedData",

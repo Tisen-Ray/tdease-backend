@@ -282,14 +282,25 @@ class SnakemakeAdapter:
             stop.wait(0.1)
 
     def _record_engine_pid(self, pid: int) -> None:
-        """Persist disposable process identity for cancellation/reconciliation."""
+        """Persist disposable process identity for cancellation/reconciliation.
+
+        The creation time travels with the pid: a recycled pid must never make a
+        dead engine look alive (or point a kill at an unrelated process).
+        """
         try:
+            import psutil
+
+            try:
+                created = psutil.Process(pid).create_time()
+            except Exception:
+                created = None
             self.storage.atomic_write_json(
                 self.run_root / self.PROCESS_RECORD_PATH,
                 {
                     "schema_version": 1,
                     "role": "snakemake-engine",
                     "engine_pid": pid,
+                    "engine_create_time": created,
                     "started_at_unix": time.time(),
                 },
             )
@@ -305,24 +316,22 @@ class SnakemakeAdapter:
             raise RuntimeError(f"workflow-engine lock state could not be inspected: {exc}") from exc
 
     def _stale_lock_recovery_error(self) -> str | None:
+        from src.execution_runtime.storage import process_identity_alive
+
         claim = self.storage.data / ".runtime" / "execution.claim"
         try:
-            owner = int(claim.read_text(encoding="ascii").strip())
-        except (FileNotFoundError, ValueError, OSError):
+            owner = claim.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError):
             return "stale workflow-engine lock recovery requires the global execution lease"
-        if owner != os.getpid():
+        if owner.split(":", 1)[0] != str(os.getpid()):
             return "stale workflow-engine lock recovery lease belongs to another process"
 
         process = self.storage.read_json(self.run_root / self.PROCESS_RECORD_PATH) or {}
         engine_pid = process.get("engine_pid")
         if engine_pid:
-            try:
-                import psutil
-
-                if psutil.pid_exists(int(engine_pid)):
-                    return "stale workflow-engine lock recovery refused: engine process is still active"
-            except (TypeError, ValueError):
-                return "stale workflow-engine lock recovery refused: invalid engine process record"
+            created = process.get("engine_create_time")
+            if process_identity_alive(f"{engine_pid}:{created if created else ''}"):
+                return "stale workflow-engine lock recovery refused: engine process is still active"
         return None
 
 

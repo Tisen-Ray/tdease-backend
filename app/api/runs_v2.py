@@ -108,6 +108,45 @@ def _indexed_files(run_id: str, revision_id: str) -> list[dict] | None:
         return None
 
 
+def _read_text_verbatim(path: Path) -> str:
+    """Read a Run file's exact text, with no newline translation.
+
+    `Path.read_text()` opens in universal-newline mode: it turns CRLF into LF.
+    The plan freezes the Snakefile's raw text (the Client reads the file's bytes
+    as UTF-8), so a Snakefile written with Windows line endings — every copy
+    made from a CRLF template, or saved by an editor that uses CRLF — would
+    never equal the frozen text and every prepare/dry-run would fail with
+    RUN_PLAN_STALE, deterministically and on every retry. Compare bytes to
+    bytes instead.
+    """
+    return path.read_bytes().decode("utf-8")
+
+
+def _snakefile_mismatch_detail(commit_text: str, file_text: str) -> str:
+    """Say how the frozen text and the file on disk differ, in one line.
+
+    A bare "the texts differ" is a black box: the caller cannot tell a real edit
+    from a newline translation, and the incident of 2026-09-09 shows what that
+    costs — a Run that "cannot be registered". Naming the difference (lengths,
+    first divergence, or the newline case outright) turns the error into the
+    diagnosis.
+    """
+    if commit_text.replace("\r\n", "\n") == file_text.replace("\r\n", "\n"):
+        return (
+            "the texts differ only in line endings "
+            f"(commit {commit_text.count(chr(13) + chr(10))} CRLF line(s), "
+            f"file {file_text.count(chr(13) + chr(10))} CRLF line(s))"
+        )
+    limit = min(len(commit_text), len(file_text))
+    offset = next((i for i in range(limit) if commit_text[i] != file_text[i]), limit)
+    line = commit_text.count("\n", 0, offset) + 1
+    return (
+        f"commit {len(commit_text)} chars, file {len(file_text)} chars; "
+        f"first difference at char {offset} (line {line}): "
+        f"commit {commit_text[offset:offset + 12]!r} vs file {file_text[offset:offset + 12]!r}"
+    )
+
+
 def _validate_compute_budget(cores: int) -> None:
     if cores > RESOURCE_BUDGET.compute_cpus:
         raise TDEaseError(
@@ -154,11 +193,18 @@ def _schedule_commit(commit, user_id: str):
     })
 
 
-async def _reject_legacy_mode_field(request: Request) -> None:
-    """Reject a caller-declared `mode` on the commit explicitly (docs/STATUS.md):
-    `mode` has left the Run commit surface. Ignoring it silently would be
-    a mysterious behaviour change for a caller that still believes it controls
-    materialization; a caller must be told to stop sending it.
+async def _reject_removed_commit_fields(request: Request) -> None:
+    """Reject commit fields that have left the Run surface, by name.
+
+    Ignoring a removed field silently would be a mysterious behaviour change for
+    a caller that still believes it controls that part of the definition; a
+    caller must be told to stop sending it (docs/STATUS.md):
+    - `local_workspace_root`: the Client absolute path; replaced by the opaque
+      `local_root_id` capability.
+    - `mode`: the caller-declared materialization choice; the Backend selects it
+      from its own capabilities and records it.
+    - `packages`: the pre-Node tool-lock list; a Run locks executables through
+      `nodes` (id + content digest) only.
 
     Reads the already-buffered request body (Starlette caches it after FastAPI's own
     pydantic parsing), so this is not a second read of the wire and not an
@@ -166,14 +212,16 @@ async def _reject_legacy_mode_field(request: Request) -> None:
     """
     raw = await request.json()
     commit_raw = raw.get("commit") if isinstance(raw, dict) else None
-    if isinstance(commit_raw, dict) and "local_workspace_root" in commit_raw:
+    if not isinstance(commit_raw, dict):
+        return
+    if "local_workspace_root" in commit_raw:
         raise TDEaseError(
             code=ErrorCode.RUN_MODE_MISMATCH,
             message="the Run commit no longer accepts a Client absolute local_workspace_root",
             remedy="Attach the Workspace once, then submit local_root_id and local_run_path.",
             retryable=False,
         )
-    if isinstance(commit_raw, dict) and "mode" in commit_raw:
+    if "mode" in commit_raw:
         raise TDEaseError(
             code=ErrorCode.RUN_MODE_MISMATCH,
             message="the Run commit no longer accepts a caller-declared 'mode' field",
@@ -184,6 +232,72 @@ async def _reject_legacy_mode_field(request: Request) -> None:
             ),
             retryable=False,
         )
+    if "packages" in commit_raw:
+        raise TDEaseError(
+            code=ErrorCode.RUN_MODE_MISMATCH,
+            message="the Run commit no longer accepts a 'packages' field",
+            remedy=(
+                "Remove 'packages' from the commit. Executable identity is locked by "
+                "'nodes' (node id + package digest), which is what the Backend resolves "
+                "and executes."
+            ),
+            retryable=False,
+        )
+
+
+def _approved_local_run_root(commit) -> Path:
+    """Resolve a local commit's Workspace root through the durable capability.
+
+    Containment resolves against *this Principal's* approved Workspace roots
+    (src.services.workspace_roots.is_within_approved_root), never a root the
+    request itself asserts -- see
+    src/execution_runtime/workspace_containment.py's module docstring.
+    """
+    from src.services.workspace_roots import get_workspace_root_registry
+
+    root = get_workspace_root_registry().resolve(
+        commit.user_id, commit.local_root_id, commit.local_run_path or "."
+    )
+    if root is None:
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+            message="Workspace root capability is missing, revoked, or the Run path escapes it.",
+            remedy="Register the Workspace root with this Backend, then retry.",
+            retryable=False,
+        )
+    return root
+
+
+def _require_uploaded_blobs(storage, entries) -> None:
+    """Submission check for the content-addressed strategy: the bytes must exist.
+
+    Submission stores nothing in the run directory; the worker materializes the
+    definition it starts, so the blobs must already be uploaded.
+    """
+    missing = sorted({entry.blob_hash for entry in entries if not storage.blob_exists(entry.blob_hash)})
+    if missing:
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_BLOB_NOT_FOUND,
+            message="Some workspace files are not present in the blob store.",
+            remedy="Upload the missing blobs, then resubmit.",
+            retryable=False,
+            details={"missing_blobs": missing},
+        )
+
+
+def _snakefile_text_from_source(commit, storage, local_run_root) -> str:
+    """The verbatim Snakefile the commit is defined over, read from its source.
+
+    The frozen mapping names the file; this reads it where it actually lives --
+    the Workspace file for a local Run, the content store for an uploaded one --
+    so the agreement check does not depend on a materialized copy.
+    """
+    entry = next((item for item in commit.workspace_files if item.path == "Snakefile"), None)
+    if entry is None:
+        raise ValueError("The Run mapping does not contain its root Snakefile")
+    if local_run_root is not None:
+        return _read_text_verbatim(Path(local_run_root) / entry.path)
+    return storage.blob_get(entry.blob_hash).decode("utf-8")
 
 
 def _select_materialization_strategy(commit) -> str:
@@ -386,7 +500,7 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
 @router.post("/dry-run", response_model=RunDryRunResponse)
 async def dry_run(payload: RunDryRunRequest, request: Request):
     """Validate an immutable client snapshot with the real workflow engine."""
-    await _reject_legacy_mode_field(request)
+    await _reject_removed_commit_fields(request)
     commit = _schedule_commit(payload.commit, request.state.principal.user_id)
     inline_blobs = payload.inline_blobs
     storage = get_storage()
@@ -431,42 +545,10 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                     remedy="Attach the Workspace root, then submit its root_id and relative Run path.",
                     retryable=False,
                 )
-            from src.services.workspace_roots import get_workspace_root_registry
-            workspace = get_workspace_root_registry().resolve(
-                commit.user_id, commit.local_root_id, commit.local_run_path or "."
-            )
-            if workspace is None:
-                raise TDEaseError(
-                    code=ErrorCode.WORKSPACE_PATH_ESCAPE,
-                    message="Workspace root capability is missing, revoked, or the Run path escapes it.",
-                    remedy="Register the Workspace root with this Backend, then retry.",
-                    retryable=False,
-                )
-            for entry in commit.workspace_files:
-                source = (workspace / entry.path).resolve(strict=True)
-                try:
-                    source.relative_to(workspace)
-                except ValueError as exc:
-                    raise TDEaseError(
-                        code=ErrorCode.WORKSPACE_PATH_ESCAPE,
-                        message=f"Local input {entry.path} resolves outside the Workspace root.",
-                        remedy="Move the file inside the registered Workspace root and refreeze the mapping.",
-                        retryable=False,
-                    ) from exc
-                if storage.file_digest(source) != entry.blob_hash:
-                    raise TDEaseError(
-                        code=ErrorCode.WORKSPACE_DIGEST_MISMATCH,
-                        message=f"Local input {entry.path} changed after the Workspace was frozen.",
-                        remedy="Refreeze the Workspace so the mapping matches the files on disk, then resubmit.",
-                        retryable=False,
-                    )
-                target = root / entry.path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.link(source, target)
-                except OSError:
-                    import shutil
-                    shutil.copy2(source, target)
+            workspace = _approved_local_run_root(commit)
+            # The same materialization the worker uses for a real Run: control
+            # files written, every other input hardlinked, never copied.
+            storage.materialize_local_run_files(root, workspace, commit.workspace_files, user_id=commit.user_id)
         else:
             missing = [entry.blob_hash for entry in commit.workspace_files
                        if not storage.blob_exists(entry.blob_hash) and entry.blob_hash not in inline_blobs]
@@ -518,15 +600,21 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                 retryable=False,
             )
         snake_target = (root / snake_entry.path).resolve()
-        snake_text = snake_target.read_text(encoding="utf-8")
+        snake_text = _read_text_verbatim(snake_target)
         if commit.snakefile != snake_text:
             raise TDEaseError(
                 code=ErrorCode.RUN_PLAN_STALE,
-                message="The commit embedded snakefile differs from the mapped Run file.",
-                remedy="Refreeze the Run so both Snakefile views agree, then retry dry-run.",
+                message=(
+                    "The commit embedded snakefile differs from the mapped Run file: "
+                    f"{_snakefile_mismatch_detail(commit.snakefile, snake_text)}."
+                ),
+                remedy=(
+                    "Re-read runs/<run>/Snakefile and submit its current text "
+                    "(the file changed since the plan froze it), then retry dry-run."
+                ),
                 retryable=False,
             )
-        materialize_bindings(root, resolved_nodes, storage.atomic_copy)
+        materialize_bindings(root, resolved_nodes, storage.link_node_package)
         engine_request = WorkflowEngineRequest(
             mode="dry-run",
             snakefile="Snakefile",
@@ -558,7 +646,7 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
 @router.post("", status_code=201, response_model=RunCreateResponse)
 async def create_run(body: RunCreateRequest, request: Request):
     """Validate the request envelope, then perform durable submission off-loop."""
-    await _reject_legacy_mode_field(request)
+    await _reject_removed_commit_fields(request)
     return await asyncio.to_thread(_create_run, body, request)
 
 
@@ -590,14 +678,13 @@ def _create_run(body: RunCreateRequest, request: Request):
                 remedy="A Backend Run id belongs to one Workspace Run and cannot be reused elsewhere.",
                 retryable=False,
             )
-        status = _run_status_value(commit.run_id, storage)
-        if status not in TERMINAL_STATUSES:
-            raise TDEaseError(
-                code=ErrorCode.RUN_NOT_TERMINAL,
-                message=f"Run {commit.run_id} is {status.value}; its definition cannot change while executing.",
-                remedy="Wait for the Run to become terminal, then submit the edited Workspace Run as a new revision.",
-                retryable=False,
-            )
+        # No status gates a new definition. A Run is always editable and always
+        # continuable: the submission appends a new revision and a queue request
+        # (the Journal accepts both from any status), and the worker materializes
+        # the newest definition when it starts. If an execution is in flight, the
+        # new definition is queued behind it; the finished execution keeps its own
+        # journal range and results manifest, so provenance is recorded rather
+        # than locked away.
 
     if not commit.workspace_files:
         raise TDEaseError(
@@ -608,42 +695,30 @@ def _create_run(body: RunCreateRequest, request: Request):
         )
     strategy = _select_materialization_strategy(commit)
     commit = commit.model_copy(update={"materialization_strategy": strategy})
+    # Submission validates the frozen definition against its sources and writes
+    # nothing into the run directory. The worker materializes (links) the
+    # definition it starts, so an edit is never blocked by a Run that happens to
+    # be executing, and no input is ever copied.
+    local_run_root = None
     try:
-        resolved_nodes = resolve_bindings(get_tools_root(), commit.nodes)
+        resolve_bindings(get_tools_root(), commit.nodes)
         if strategy == LOCAL_WORKSPACE_HARDLINK:
             if not commit.local_root_id:
                 raise ValueError("local_root_id is required for the local_workspace_hardlink strategy")
-            # user_id is passed so containment resolves against *this Principal's*
-            # approved Workspace roots (src.services.workspace_roots.is_within_approved_root),
-            # never a root the request itself asserts -- see
-            # src/execution_runtime/workspace_containment.py's module docstring,
-            # "the one call site that currently invokes materialize_local_run_files
-            # without a user_id ... must start passing one" (owned by agent B4;
-            # this is the B2-owned call site that docstring names).
-            from src.services.workspace_roots import get_workspace_root_registry
-            local_run_root = get_workspace_root_registry().resolve(
-                commit.user_id, commit.local_root_id, commit.local_run_path or "."
-            )
-            if local_run_root is None:
-                raise TDEaseError(
-                    code=ErrorCode.WORKSPACE_PATH_ESCAPE,
-                    message="Workspace root capability is missing, revoked, or the Run path escapes it.",
-                    remedy="Register the Workspace root with this Backend, then retry.",
-                    retryable=False,
-                )
-            storage.materialize_local_run_files(
-                commit.run_id, local_run_root, commit.workspace_files,
-                user_id=commit.user_id,
-            )
+            local_run_root = _approved_local_run_root(commit)
+            storage.verify_local_run_files(local_run_root, commit.workspace_files, user_id=commit.user_id)
         else:
             if commit.local_root_id or commit.local_run_path:
                 raise ValueError("local root references are forbidden for the blob_store strategy")
-            storage.materialize_run_files(commit.run_id, commit.workspace_files)
+            _require_uploaded_blobs(storage, commit.workspace_files)
     except (FileNotFoundError, ValueError) as exc:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
-            message=f"The Run snapshot could not be materialized: {exc}",
-            remedy="Check that every workspace file is reachable and its digest still matches, then resubmit.",
+            message=f"The Run definition could not be prepared: {exc}",
+            remedy=(
+                "Check that every workspace file is reachable, unchanged, and on the same "
+                "volume as the Backend data root, then resubmit."
+            ),
             retryable=False,
         ) from exc
 
@@ -651,15 +726,20 @@ def _create_run(body: RunCreateRequest, request: Request):
         snake_entry = next((item for item in commit.workspace_files if item.path == "Snakefile"), None)
         if snake_entry is None:
             raise ValueError("The Run mapping does not contain its root Snakefile")
-        snake_text = storage.resolve(commit.run_id, "Snakefile").read_text(encoding="utf-8")
+        snake_text = _snakefile_text_from_source(commit, storage, local_run_root)
         if commit.snakefile and commit.snakefile != snake_text:
             raise TDEaseError(
                 code=ErrorCode.RUN_PLAN_STALE,
-                message="The commit embedded Snakefile differs from the mapped Run file.",
-                remedy="Prepare the Run again so both Snakefile views agree, then resubmit.",
+                message=(
+                    "The commit embedded Snakefile differs from the mapped Run file: "
+                    f"{_snakefile_mismatch_detail(commit.snakefile, snake_text)}."
+                ),
+                remedy=(
+                    "Re-read runs/<run>/Snakefile and submit its current text "
+                    "(the file changed since the plan froze it), then resubmit."
+                ),
                 retryable=False,
             )
-        materialize_bindings(storage.resolve(commit.run_id), resolved_nodes, storage.atomic_copy)
     except TDEaseError:
         raise
     except (FileNotFoundError, ValueError) as exc:

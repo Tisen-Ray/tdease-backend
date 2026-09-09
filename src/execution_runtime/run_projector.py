@@ -164,11 +164,15 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
             raise ValueError(f"{event_type} missing required data: revision_id")
         if event_type == RUN_QUEUE_REQUESTED:
             mode = str(data["mode"]) if data.get("mode") else (queued_mode or "execute")
-            status = next_status
             current_revision_id = revision_id
             queued_mode = mode
             queued_at_seq = seq
             pending_queue = (seq, revision_id, mode)
+            if open_range_index is None:
+                # No execution in flight: the Run is queued now. Otherwise the
+                # request is pending and the projected status stays RUNNING
+                # until the open range terminates.
+                status = next_status
             continue
 
         if event_type == RUN_STARTED:
@@ -192,13 +196,18 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
             queued_at_seq = None
             continue
 
-        if current_revision_id is not None and revision_id != current_revision_id:
+        # A terminal event belongs to the execution range that is open (or, for a
+        # journal without ranges, to the active revision). A newer definition
+        # submitted while that range ran must not invalidate its terminal event.
+        had_open_range = open_range_index is not None
+        active_revision = (
+            ranges[open_range_index].revision_id
+            if had_open_range
+            else current_revision_id
+        )
+        if active_revision is not None and revision_id != active_revision:
             raise ValueError(f"{event_type} revision does not match the active revision")
-        status = next_status
-        queued_mode = None
-        queued_at_seq = None
-        pending_queue = None
-        if open_range_index is not None:
+        if had_open_range:
             active = ranges[open_range_index]
             ranges[open_range_index] = ExecutionRange(
                 start_seq=active.start_seq,
@@ -209,6 +218,18 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
                 terminal_type=event_type,
             )
             open_range_index = None
+        if had_open_range and pending_queue is not None:
+            # A definition was queued while this execution ran: the Run is queued
+            # for it, not terminal. The finished execution's own result stays in
+            # the journal and its results manifest. A queue request with no
+            # execution in flight (pre-launch validation) keeps the ordinary
+            # terminal projection below.
+            status = STATUS_BY_EVENT[RUN_QUEUE_REQUESTED]
+            continue
+        status = next_status
+        queued_mode = None
+        queued_at_seq = None
+        pending_queue = None
 
     return RunProjection(
         status=status,
