@@ -227,6 +227,14 @@ def execute_run(run_data: dict) -> None:
     stage = "startup"
     try:
         projection, _snapshot = storage.project_run_snapshot(run_id)
+        if projection.status == RunStatus.CANCELLED.value:
+            # Cancel landed inside the claim window (after claim_run, before
+            # this read): the journal already holds the terminal fact. Falling
+            # through to the failure handler below would append run.failed
+            # from CANCELLED -- an illegal lifecycle transition that poisons
+            # every future projection of this Run. There is nothing to execute.
+            wlog(f"[q?] {run_id} was cancelled inside the claim window; nothing to execute")
+            return
         if projection.status != RunStatus.QUEUED.value or not projection.current_revision_id:
             raise RuntimeError(
                 f"Run {run_id} is not backed by a queued Journal revision "

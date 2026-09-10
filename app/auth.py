@@ -11,7 +11,7 @@ import logging
 import secrets
 from dataclasses import dataclass
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from src.backend_settings import BACKEND_SETTINGS
 from src.contracts.errors import ErrorCode, TDEaseError
@@ -30,6 +30,18 @@ class Principal:
 LOCAL_OWNER = Principal(
     user_id="local-owner",
     role="owner",
+    scopes=("desktop", "workspace:read", "workspace:write", "run:execute", "run:purge"),
+    auth_source="desktop-bootstrap",
+)
+
+# The AI agent harness runs as a second launch-time principal with the same
+# working scopes but WITHOUT the irreversible ones: a hallucinated call loop
+# must never be able to purge (or otherwise destroy) the user's Runs. The
+# Desktop launcher exchanges one bootstrap secret for both tokens and hands
+# each to its own client.
+DESKTOP_AGENT = Principal(
+    user_id="local-agent",
+    role="agent",
     scopes=("desktop", "workspace:read", "workspace:write", "run:execute"),
     auth_source="desktop-bootstrap",
 )
@@ -62,17 +74,21 @@ def _rejection(*, code: ErrorCode, message: str, remedy: str) -> HTTPException:
     )
 
 class DesktopAuth:
-    """Mints and enforces the single process-lifetime Desktop Bearer token.
+    """Mints and enforces the process-lifetime Desktop Bearer tokens.
 
     There is exactly one way to become authenticated: exchange the bootstrap
-    secret once for a token, then present that token as `Authorization: Bearer
-    <token>`. Everything else is rejected, including the case where no secret
-    was ever configured.
+    secret once for the launch's token pair, then present a token as
+    `Authorization: Bearer <token>`. The single-use exchange mints TWO tokens
+    from one secret -- the owner token (full scopes) and the agent token
+    (no irreversible scopes) -- because one launch owns two clients with
+    different blast radii: the Desktop UI and the AI agent harness.
+    Everything else is rejected, including the case where no secret was ever
+    configured.
     """
 
     def __init__(self, bootstrap_secret: str | None, *, required: bool = True) -> None:
         self._bootstrap_secret = bootstrap_secret or None
-        self._token: str | None = None
+        self._tokens: dict[str, Principal] = {}
         if required and not self._bootstrap_secret:
             # docs/design/THREE-REPOSITORY-ARCHITECTURE.md: "Backend ... requires the
             # bootstrap token." A missing secret is a startup-time configuration
@@ -99,9 +115,9 @@ class DesktopAuth:
         transition back to a working state short of restarting the process.
         """
 
-        return bool(self._bootstrap_secret or self._token)
+        return bool(self._bootstrap_secret or self._tokens)
 
-    def exchange(self, candidate: str) -> str:
+    def exchange(self, candidate: str) -> dict[str, str]:
         if not self._bootstrap_secret:
             raise _rejection(
                 code=ErrorCode.AUTH_BOOTSTRAP_UNAVAILABLE,
@@ -123,9 +139,16 @@ class DesktopAuth:
                     "startup as the 'X-TDEase-Bootstrap' header."
                 ),
             )
-        self._token = secrets.token_urlsafe(32)
+        tokens = {
+            "access_token": secrets.token_urlsafe(32),
+            "agent_token": secrets.token_urlsafe(32),
+        }
+        self._tokens = {
+            tokens["access_token"]: LOCAL_OWNER,
+            tokens["agent_token"]: DESKTOP_AGENT,
+        }
         self._bootstrap_secret = None
-        return self._token
+        return tokens
 
     def authenticate(self, authorization: str | None) -> Principal:
         if not self.configured:
@@ -142,8 +165,7 @@ class DesktopAuth:
                 ),
             )
         scheme, _, credential = (authorization or "").partition(" ")
-        token = self._token
-        if scheme.lower() != "bearer" or not token or not credential or not secrets.compare_digest(credential, token):
+        if scheme.lower() != "bearer" or not credential:
             raise _rejection(
                 code=ErrorCode.AUTH_TOKEN_INVALID,
                 message=(
@@ -155,7 +177,44 @@ class DesktopAuth:
                     "it as 'Authorization: Bearer <token>'."
                 ),
             )
-        return LOCAL_OWNER
+        for token, principal in self._tokens.items():
+            if secrets.compare_digest(credential, token):
+                return principal
+        raise _rejection(
+            code=ErrorCode.AUTH_TOKEN_INVALID,
+            message=(
+                "The Authorization header is missing, malformed, or does not "
+                "match the active Bearer token."
+            ),
+            remedy=(
+                "Exchange the bootstrap secret for a Bearer token and send "
+                "it as 'Authorization: Bearer <token>'."
+            ),
+        )
+
+
+def require_scope(scope: str):
+    """Route dependency: the authenticated principal must hold `scope`.
+
+    Scopes are the ceiling on a principal's blast radius -- the agent token
+    deliberately lacks the irreversible ones (e.g. run:purge), so a
+    hallucinated destructive call loop fails closed at the route.
+    """
+
+    def _checker(request: Request) -> None:
+        principal = getattr(request.state, "principal", None)
+        if scope not in getattr(principal, "scopes", ()):
+            raise TDEaseError(
+                code=ErrorCode.AUTH_SCOPE_DENIED,
+                message=(
+                    f"this action requires the '{scope}' scope, which the "
+                    "authenticated principal does not hold"
+                ),
+                remedy="Perform the action from the Desktop client, whose token holds every scope.",
+                retryable=False,
+            )
+
+    return Depends(_checker)
 
 
 desktop_auth = DesktopAuth(
@@ -167,14 +226,22 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 @router.post("/bootstrap")
 async def bootstrap(request: Request) -> dict[str, object]:
-    token = desktop_auth.exchange(request.headers.get("X-TDEase-Bootstrap", ""))
+    tokens = desktop_auth.exchange(request.headers.get("X-TDEase-Bootstrap", ""))
     return {
-        "access_token": token,
+        "access_token": tokens["access_token"],
+        # The agent token is handed to the AI agent harness only; it holds the
+        # working scopes but not the irreversible ones (run:purge).
+        "agent_token": tokens["agent_token"],
         "token_type": "bearer",
         "principal": {
             "user_id": LOCAL_OWNER.user_id,
             "role": LOCAL_OWNER.role,
             "scopes": list(LOCAL_OWNER.scopes),
+        },
+        "agent_principal": {
+            "user_id": DESKTOP_AGENT.user_id,
+            "role": DESKTOP_AGENT.role,
+            "scopes": list(DESKTOP_AGENT.scopes),
         },
     }
 

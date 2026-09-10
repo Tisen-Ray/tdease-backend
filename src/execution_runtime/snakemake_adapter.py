@@ -157,13 +157,21 @@ class SnakemakeAdapter:
             if stream is None:
                 return
             for line in iter(stream.readline, ""):
-                branded = _brand_engine_output(line)
-                self.storage.append_task_output(
-                    self.run_id,
-                    self.TASK_ID,
-                    stream_name,
-                    branded,
-                )
+                try:
+                    branded = _brand_engine_output(line)
+                    self.storage.append_task_output(
+                        self.run_id,
+                        self.TASK_ID,
+                        stream_name,
+                        branded,
+                    )
+                except OSError:
+                    # Disk full while persisting output. Keep READING the pipe
+                    # and discard: if this thread died instead, the engine's
+                    # 64KB stdout buffer would fill, the engine would block on
+                    # print() forever, and the global execution slot would be
+                    # held until the multi-day deadline.
+                    continue
                 if stream_name == "stderr":
                     stderr_lines.append(branded)
                     if len(stderr_lines) > 200:

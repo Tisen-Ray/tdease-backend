@@ -46,6 +46,7 @@ router = APIRouter(prefix="/api/v2/files", tags=["files"])
 # "The backend files API (api/v2/files) is NOT used by the frontend.").
 _PROTECTED_READ_PREFIXES = (
     "runs/",
+    "trash/",
     "database/",
     "store/",
     "blobs/",

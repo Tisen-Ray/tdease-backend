@@ -38,7 +38,9 @@ import json
 import logging
 import os
 import shutil
+import signal
 import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -1265,7 +1267,14 @@ class StorageLayout:
         return process_identity_alive(f"{engine_pid}:{created if created else ''}")
 
     def _kill_engine_pid(self, run_id: str) -> None:
-        import psutil
+        """Kill the recorded engine AND its tool children.
+
+        A bare terminate() on the engine pid leaves Snakemake's job children
+        (topfd/toppic/...) running unsupervised: they keep file handles open
+        inside the run dir and burn CPU after the projection says terminal.
+        The engine is started in its own session/process group precisely so
+        the whole tree can be taken down in one shot.
+        """
         process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
         engine_pid = process.get("engine_pid")
         if not engine_pid:
@@ -1274,14 +1283,32 @@ class StorageLayout:
         if created and not process_identity_alive(f"{engine_pid}:{created}"):
             return  # the pid was recycled: this is not our engine
         try:
-            proc = psutil.Process(int(engine_pid))
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except psutil.TimeoutExpired:
-                proc.kill()
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(engine_pid)), "/T", "/F"],
+                    capture_output=True, timeout=5,
+                )
+            else:
+                try:
+                    os.killpg(os.getpgid(int(engine_pid)), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
         except Exception:
-            pass  # best-effort; reconciliation proceeds regardless
+            logger.exception("Engine tree kill failed for run %s (pid %s)", run_id, engine_pid)
+
+    def execution_slot_has_live_owner(self) -> bool:
+        """Read-only liveness check of the global execution slot holder.
+
+        Reconciliation runs in the API process too (lifespan) -- while the
+        worker may legitimately be executing with a live engine. A live slot
+        owner means that engine has an owner; nobody else may kill it.
+        """
+        claim = self.data / ".runtime" / "execution.claim"
+        try:
+            owner = claim.read_text(encoding="ascii").strip()
+        except (FileNotFoundError, OSError):
+            return False
+        return bool(owner) and process_identity_alive(owner)
 
     def reconcile_orphaned_runs(self) -> list[str]:
         """Recover Runs whose worker died from Journal and runtime facts.
@@ -1350,7 +1377,16 @@ class StorageLayout:
 
             if projection.status == "RUNNING":
                 has_open_range = any(r.is_open for r in projection.ranges)
-                if has_open_range and not self._engine_pid_alive(run_id):
+                if has_open_range:
+                    # An engine still alive here belongs to a worker that died
+                    # (this is a startup pass). Two cases: a live process holds
+                    # the global execution slot -- that engine has a living
+                    # owner who will terminalize the Run itself, so leave it
+                    # alone; or nobody owns it -- the engine is an orphan no
+                    # one will ever wait on, which previously wedged the Run at
+                    # RUNNING forever. Kill the whole tree and close the range.
+                    if self._engine_pid_alive(run_id) and self.execution_slot_has_live_owner():
+                        continue
                     self._kill_engine_pid(run_id)
                     from src.execution_runtime.events import EventEmitter
                     active_range = next(r for r in reversed(projection.ranges) if r.is_open)

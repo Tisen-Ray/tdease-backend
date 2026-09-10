@@ -34,6 +34,51 @@ from src.execution_runtime.engine_layout import (
 
 ENGINE_REQUEST = Path(".tdease") / "engine-request.json"
 
+# Internal or derived entries that never belong in a product-facing resource
+# projection: tmpdir/_cores/_nodes are engine-injected, mem/disk and *_mib are
+# human-readable duplicates snakemake expands from mem_mb/disk_mb.
+_NON_DECLARED_RESOURCES = frozenset({"tmpdir", "_cores", "_nodes", "mem", "disk"})
+
+
+def _declared_resources(job) -> dict:
+    resources = {}
+    for name, value in job.resources.items():
+        value = getattr(value, "value", value)
+        if name in _NON_DECLARED_RESOURCES or name.endswith("_mib"):
+            continue
+        if isinstance(value, (int, float, str)):
+            resources[name] = value
+    return resources
+
+
+def _run_resource_limits(request: WorkflowEngineRequest) -> dict[str, int]:
+    return {"mem_mb": request.memory_mb, "toppic_slots": 1}
+
+
+def _resource_violations(jobs, limits: dict[str, int]) -> list[str]:
+    """Assert the declared resource envelope fits the Run budget.
+
+    The engine natively scales every declared integer resource down to the Run
+    limits at DAG build time -- threads AND mem_mb. For threads that is the
+    contract (appetite, degraded but correct); for memory it would silently
+    under-provision the scheduler while the tool OOMs mid-run. This guard
+    compares the RAW declaration (rule.resources, pre-clamp) against the
+    Backend-capped limits and rejects before any job starts. Lambda-declared
+    resources cannot be statically judged and stay under the engine's runtime
+    clamp.
+    """
+    violations = []
+    for job in jobs:
+        for name, ceiling in limits.items():
+            declared = job.rule.resources.get(name)
+            needed = getattr(declared, "value", declared)
+            if isinstance(needed, int) and needed > ceiling:
+                violations.append(
+                    f"rule '{job.rule.name}' needs {name}={needed} "
+                    f"but this Run's budget is {name}={ceiling}"
+                )
+    return violations
+
 
 def _projection_from_dag(dag) -> dict:
     engine_dag = dag.workflow_api._workflow.dag
@@ -41,7 +86,12 @@ def _projection_from_dag(dag) -> dict:
     return {
         "nodes": [
             {"id": engine_dag.jobid(job), "rule": job.rule.name, "label": job.rule.name,
-             "initial_status": "waiting" if engine_dag.needrun(job) else "up_to_date"}
+             "initial_status": "waiting" if engine_dag.needrun(job) else "up_to_date",
+             # The engine already clamped rule threads to the Run core budget
+             # (min(rule threads, cores)) when the DAG was built; projecting the
+             # resolved values keeps that degradation observable, not silent.
+             "threads": job.threads,
+             "resources": _declared_resources(job)}
             for job in jobs
         ],
         "edges": [
@@ -164,7 +214,7 @@ def main() -> int:
             workflow = api.workflow(
                 resource_settings=ResourceSettings(
                     cores=request.cores,
-                    resources={"mem_mb": request.memory_mb, "toppic_slots": 1},
+                    resources=_run_resource_limits(request),
                 ),
                 config_settings=ConfigSettings(config=request.config),
                 snakefile=snakefile,
@@ -179,28 +229,43 @@ def main() -> int:
             )
             if request.unlock_before_execute:
                 dag.unlock()
-            needs_graph = bool(request.projection_path or (request.mode == "execute" and request.job_event_path))
-            projection = None
-            if needs_graph:
-                dag.workflow_api._workflow._prepare_dag(
-                    forceall=dag.dag_settings.forceall, ignore_incomplete=True, lock_warn_only=True
+            # The DAG is always built: the resource feasibility assertion and
+            # the projection both read resolved per-job values off it.
+            dag.workflow_api._workflow._prepare_dag(
+                forceall=dag.dag_settings.forceall, ignore_incomplete=True, lock_warn_only=True
+            )
+            dag.workflow_api._workflow._build_dag()
+            projection = _projection_from_dag(dag)
+            violations = _resource_violations(
+                dag.workflow_api._workflow.dag.jobs, _run_resource_limits(request)
+            )
+            if violations:
+                for violation in violations:
+                    print(f"TDEase resource budget exceeded: {violation}", file=sys.stderr)
+                print(
+                    "Remedy: lower the node's declared resource floor "
+                    "(rules.smk resources) or raise this machine's budget.",
+                    file=sys.stderr,
                 )
-                dag.workflow_api._workflow._build_dag()
-                projection = _projection_from_dag(dag)
-            if request.projection_path and projection is not None:
+                return 1
+            if request.projection_path:
                 projection_target = (root / request.projection_path).resolve(strict=False)
                 projection_target.relative_to(root)
                 projection_target.parent.mkdir(parents=True, exist_ok=True)
-                projection_target.write_text(
-                    json.dumps(projection, ensure_ascii=False), encoding="utf-8"
-                )
+                # Atomic replace: a bare write_text killed mid-way (disk full,
+                # hard kill) leaves a partial file that the dry-run route would
+                # otherwise parse as a raw 500 instead of an invalid plan.
+                payload = json.dumps(projection, ensure_ascii=False)
+                tmp_target = projection_target.with_suffix(projection_target.suffix + ".tmp")
+                tmp_target.write_text(payload, encoding="utf-8")
+                os.replace(tmp_target, projection_target)
             if request.mode == "execute" and request.job_event_path:
                 from snakemake.logging import logger as engine_logger
                 event_target = (root / request.job_event_path).resolve(strict=False)
                 event_target.relative_to(root)
                 event_target.parent.mkdir(parents=True, exist_ok=True)
                 with event_target.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"type": "workflow.graph", **(projection or {"nodes": [], "edges": []})}) + "\n")
+                    stream.write(json.dumps({"type": "workflow.graph", **projection}) + "\n")
                 engine_logger.addHandler(_JobEventHandler(event_target))
             dag.execute_workflow(
                 executor="dryrun" if request.mode == "dry-run" else "local",

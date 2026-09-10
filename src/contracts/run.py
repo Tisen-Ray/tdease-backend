@@ -124,11 +124,15 @@ class RunCommit(BaseModel):
         default_factory=dict,
         description="Snakemake --config parameters",
     )
-    cores: int = Field(default=4, description="CPU core count", ge=1, le=256)
+    # Compute envelope — Backend-owned. `_schedule_commit` injects the startup
+    # compute budget; callers who send these fields are rejected by name
+    # (`_reject_removed_commit_fields`). Kept on the model because the worker,
+    # the engine request, and run.json all consume the injected values.
+    cores: int = Field(default=4, description="Backend-injected CPU core budget", ge=1, le=256)
     memory_mb: Optional[int] = Field(
         default=None,
         ge=128,
-        description="Declared Snakemake scheduling memory (MB); null = backend uses the current compute budget",
+        description="Backend-injected scheduling memory budget (MB)",
     )
     targets: list[str] = Field(
         default_factory=list,

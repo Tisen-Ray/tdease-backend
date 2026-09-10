@@ -17,6 +17,7 @@ import base64
 import os
 import sys
 import fnmatch
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -58,6 +59,7 @@ from src.services.run_definition import freeze_definition
 # reading TDEASE_DEPLOYMENT_MODE per request. See docs/spec/CAPABILITIES.md section 7
 # ("Materialization selection rule (resolves 0.2)") and docs/STATUS.md.
 from app.api.capabilities import _CAPABILITIES
+from app.auth import require_scope
 from src.contracts.errors import ErrorCode, TDEaseError
 
 router = APIRouter(prefix="/api/v2/runs", tags=["runs"])
@@ -147,38 +149,6 @@ def _snakefile_mismatch_detail(commit_text: str, file_text: str) -> str:
     )
 
 
-def _validate_compute_budget(cores: int) -> None:
-    if cores > RESOURCE_BUDGET.compute_cpus:
-        raise TDEaseError(
-            code=ErrorCode.RUN_PLAN_INVALID,
-            message=(
-                f"Run requests {cores} cores, but this Backend permits at most "
-                f"{RESOURCE_BUDGET.compute_cpus}; "
-                f"{RESOURCE_BUDGET.reserved_service_cpus} of "
-                f"{RESOURCE_BUDGET.logical_cpus} logical CPUs are reserved for services."
-            ),
-            remedy="Lower commit.cores to GET /api/capabilities limits.max_cores and retry.",
-            retryable=False,
-        )
-
-
-def _resolve_memory_budget(memory_mb: int | None) -> int:
-    requested = memory_mb if memory_mb is not None else RESOURCE_BUDGET.compute_memory_mb
-    if requested > RESOURCE_BUDGET.compute_memory_mb:
-        raise TDEaseError(
-            code=ErrorCode.RUN_PLAN_INVALID,
-            message=(
-                f"Run requests {requested} MB, but this Backend permits at most "
-                f"{RESOURCE_BUDGET.compute_memory_mb} MB; "
-                f"{RESOURCE_BUDGET.reserved_service_memory_mb} MB of "
-                f"{RESOURCE_BUDGET.total_memory_mb} MB is reserved for services."
-            ),
-            remedy="Lower commit.memory_mb to GET /api/capabilities limits.max_memory_mb and retry.",
-            retryable=False,
-        )
-    return requested
-
-
 def _schedule_commit(commit, user_id: str):
     """Apply the Backend-owned scheduling envelope to an accepted definition.
 
@@ -205,6 +175,9 @@ async def _reject_removed_commit_fields(request: Request) -> None:
       from its own capabilities and records it.
     - `packages`: the pre-Node tool-lock list; a Run locks executables through
       `nodes` (id + content digest) only.
+    - `cores`/`memory_mb`: the compute envelope is Backend-owned; `_schedule_commit`
+      injects the startup compute budget, so a caller-sent value was silently
+      dead. Read GET /api/capabilities limits to plan within it.
 
     Reads the already-buffered request body (Starlette caches it after FastAPI's own
     pydantic parsing), so this is not a second read of the wire and not an
@@ -243,6 +216,20 @@ async def _reject_removed_commit_fields(request: Request) -> None:
             ),
             retryable=False,
         )
+    for field in ("cores", "memory_mb"):
+        if field in commit_raw:
+            raise TDEaseError(
+                code=ErrorCode.RUN_MODE_MISMATCH,
+                message=(
+                    f"the Run commit no longer accepts a caller-declared '{field}' field; "
+                    "the compute envelope is Backend-owned"
+                ),
+                remedy=(
+                    f"Remove '{field}' from the commit. The Backend injects its startup "
+                    "compute budget; read GET /api/capabilities limits to plan within it."
+                ),
+                retryable=False,
+            )
 
 
 def _approved_local_run_root(commit) -> Path:
@@ -642,7 +629,13 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
             backend_child_env(),
         )
         output = completed.stdout + completed.stderr
-        projection = storage.read_json(root / ".tdease" / "workflow-projection.json")
+        try:
+            projection = storage.read_json(root / ".tdease" / "workflow-projection.json")
+        except (OSError, ValueError):
+            # The engine failed before writing a complete projection (or died
+            # mid-write). The dry-run verdict is already `valid=False` via the
+            # returncode; a parse error here must not turn into a raw 500.
+            projection = None
         return {"valid": completed.returncode == 0, "exit_code": completed.returncode,
                 "engine": "tdease-workflow", "output": output[-200_000:],
                 "projection": projection}
@@ -870,9 +863,15 @@ def restore_run(run_id: str, request: Request, _owned: dict = Depends(_owned_tra
 def purge_trashed_run(
     run_id: str,
     request: Request,
+    _scope=require_scope("run:purge"),
     _owned: dict = Depends(_owned_trashed_run),
 ) -> Response:
-    """Permanently remove a trashed Run and its rebuildable index projection."""
+    """Permanently remove a trashed Run and its rebuildable index projection.
+
+    Purge is the one irreversible verb on the Run surface, so it is also the
+    one scope-gated verb: the agent principal's token deliberately lacks
+    `run:purge`, capping a hallucinated destructive loop at reversible trash.
+    """
     storage = get_storage()
     storage.purge_trashed_run(run_id)
     _remove_indexed_run(run_id)
@@ -1554,6 +1553,7 @@ async def get_events_sse(
         file_offset = await asyncio.to_thread(
             storage.event_offset_after_seq, run_id, sent_seq
         )
+        last_traffic = time.monotonic()
 
         while True:
             if await request.is_disconnected():
@@ -1565,6 +1565,14 @@ async def get_events_sse(
                 if evt.get("seq", 0) > sent_seq:
                     yield f"id: {evt['seq']}\ndata: {line}\n\n"
                     sent_seq = evt["seq"]
+                    last_traffic = time.monotonic()
+            if time.monotonic() - last_traffic >= 15.0:
+                # A silent hour (one long topfd job appends nothing) must not
+                # look identical to a dead connection to every proxy and
+                # client idle timer on the wire. SSE comments are ignored by
+                # EventSource and keep the stream observably alive.
+                yield ": ping\n\n"
+                last_traffic = time.monotonic()
             projection, _snapshot = await asyncio.to_thread(
                 storage.project_run_snapshot, run_id
             )

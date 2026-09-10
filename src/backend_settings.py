@@ -140,6 +140,7 @@ def load_backend_settings(
     environment = str(raw.get("environment", "development")).strip() or "development"
     deployment = raw.get("deploymentMode", "local")
     auth_mode = auth.get("mode", "local")
+    bootstrap_secret = auth.get("bootstrapSecret")
     host = str(server.get("host", "127.0.0.1")).strip()
     port: object = server.get("port", 0)
     log_name = str(logging_config.get("level", "INFO")).strip().upper()
@@ -150,7 +151,11 @@ def load_backend_settings(
     if allow_env_overrides:
         environment = source.get("TDEASE_ENV", environment)
         deployment = source.get("TDEASE_DEPLOYMENT_MODE", str(deployment))
-        auth_mode = source.get("TDEASE_AUTH_MODE", str(auth_mode))
+        auth_mode = source.get("TDEASE_AUTH_MODE", auth_mode)
+        # The Desktop launcher generates a fresh secret per launch and hands it
+        # over through the child environment -- never a CLI arg (process lists
+        # are world-readable) and never persisted by the Backend itself.
+        bootstrap_secret = source.get("TDEASE_BOOTSTRAP_SECRET", bootstrap_secret)
         host = source.get("TDEASE_BACKEND_HOST", host)
         port = source.get("TDEASE_BACKEND_PORT", port)
         log_name = source.get("TDEASE_LOG_LEVEL", log_name).strip().upper()
@@ -161,7 +166,7 @@ def load_backend_settings(
         environment=environment,
         deployment_mode=cast(DeploymentMode, _enum(deployment, "deploymentMode", "local", {"local", "remote"})),
         auth_mode=cast(AuthMode, _enum(auth_mode, "auth.mode", "local", {"local", "bearer"})),
-        bootstrap_secret=None,
+        bootstrap_secret=str(bootstrap_secret).strip() or None if bootstrap_secret is not None else None,
         bind_host=host or "127.0.0.1",
         bind_port=_port(port),
         backend_generation=None,
