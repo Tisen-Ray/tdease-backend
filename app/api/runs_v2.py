@@ -48,7 +48,7 @@ from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.execution import run_captured_process
 from src.execution_runtime.execution import backend_child_env
 from src.services.node_catalog import (
-    materialize_bindings,
+    bound_node_paths,
     resolve_bindings,
 )
 from src.services.run_definition import freeze_definition
@@ -463,6 +463,7 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
     queue_data = queue_event.get("data") if isinstance(queue_event, dict) else {}
     if not isinstance(queue_data, dict):
         queue_data = {}
+    active_range = next((item for item in reversed(projection.ranges) if item.is_open), None)
     strategy = data.get("materialization_strategy") or LOCAL_WORKSPACE_HARDLINK
     raw_rerun_mode = queue_data.get("rerun_mode")
     rerun_mode: Literal["resume", "overwrite"] = (
@@ -481,6 +482,9 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
             if status_value == RunStatus.SUCCEEDED.value and manifest.get("revision_id")
             else projection.current_revision_id
         ),
+        active_revision=active_range.revision_id if active_range else None,
+        queued_revision=projection.current_revision_id if projection.queued_at_seq is not None else None,
+        execution_count=len(projection.ranges),
         status=RunStatus(status_value),
         materialization_strategy=strategy,
         cores=data.get("cores", 4),
@@ -547,7 +551,8 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                 )
             workspace = _approved_local_run_root(commit)
             # The same materialization the worker uses for a real Run: control
-            # files written, every other input hardlinked, never copied.
+            # files written, every other input sealed once into CAS and
+            # hardlinked from there; no per-Run input copy is made.
             storage.materialize_local_run_files(root, workspace, commit.workspace_files, user_id=commit.user_id)
         else:
             missing = [entry.blob_hash for entry in commit.workspace_files
@@ -614,11 +619,11 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                 ),
                 retryable=False,
             )
-        materialize_bindings(root, resolved_nodes, storage.link_node_package)
+        bound_paths = bound_node_paths(resolved_nodes)
         engine_request = WorkflowEngineRequest(
             mode="dry-run",
             snakefile="Snakefile",
-            config=commit.config,
+            config={**commit.config, "nodes": bound_paths} if bound_paths else commit.config,
             cores=commit.cores,
             memory_mb=commit.memory_mb,
             targets=commit.targets,
@@ -695,10 +700,9 @@ def _create_run(body: RunCreateRequest, request: Request):
         )
     strategy = _select_materialization_strategy(commit)
     commit = commit.model_copy(update={"materialization_strategy": strategy})
-    # Submission validates the frozen definition against its sources and writes
-    # nothing into the run directory. The worker materializes (links) the
-    # definition it starts, so an edit is never blocked by a Run that happens to
-    # be executing, and no input is ever copied.
+    # Submission validates and seals the frozen mapping into shared CAS without
+    # touching the Run directory. The worker later materializes links for the
+    # definition it starts, so revisions share bytes without private copies.
     local_run_root = None
     try:
         resolve_bindings(get_tools_root(), commit.nodes)
@@ -707,6 +711,9 @@ def _create_run(body: RunCreateRequest, request: Request):
                 raise ValueError("local_root_id is required for the local_workspace_hardlink strategy")
             local_run_root = _approved_local_run_root(commit)
             storage.verify_local_run_files(local_run_root, commit.workspace_files, user_id=commit.user_id)
+            # Freeze local bytes now, once into shared CAS. The Run directory
+            # remains untouched until the worker starts this exact revision.
+            storage.seal_local_run_files(local_run_root, commit.workspace_files, user_id=commit.user_id)
         else:
             if commit.local_root_id or commit.local_run_path:
                 raise ValueError("local root references are forbidden for the blob_store strategy")
@@ -762,6 +769,10 @@ def _create_run(body: RunCreateRequest, request: Request):
         run_data["created_at"] = existing.get("created_at", run_data["created_at"])
         if not run_data.get("labels"):
             run_data["labels"] = existing.get("labels", {})
+    # Definitions are immutable, small, and addressable by content digest.
+    # They are deliberately separate from the shared execution tree: a new
+    # revision never gets a second copy of intermediates or engine state.
+    storage.write_definition_snapshot(commit.run_id, run_data)
     storage.atomic_write_json(run_json, run_data)
 
     # Establish the disposable list projection before publishing lifecycle
@@ -1030,10 +1041,22 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     current digest. Any file under `results/` that no spec declares never appears
     here; it stays a Technical Artifact, reachable only through
     `GET /api/v2/runs/{run_id}/files`.
+
+    The declared specs belong to the definition the current results manifest
+    names -- the last SUCCESSFUL execution -- not to the latest pointer in
+    run.json. A new definition submitted while no newer result exists must not
+    lend its spec list to files an older execution produced.
     """
     storage = get_storage()
     workspace_id = data.get("workspace_id", "")
-    specs = data.get("result_specs") or []
+    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+    revision_id = current_manifest.get("revision_id")
+    definition_revision_id = current_manifest.get("definition_revision_id")
+    published_definition = (
+        storage.read_definition_snapshot(run_id, str(definition_revision_id))
+        if isinstance(definition_revision_id, str) else None
+    ) or data
+    specs = published_definition.get("result_specs") or []
     if not specs:
         # The agent does not classify or select outputs. When a workflow has
         # no optional product metadata, its Snakemake default targets are the
@@ -1046,15 +1069,19 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
                 "dimensions": {},
                 "output": output,
             }
-            for output in storage.declared_output_files(run_id)
+            for output in storage._declared_output_files_from_data(published_definition)
         ]
-    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
-    revision_id = current_manifest.get("revision_id")
     indexed = _indexed_files(run_id, revision_id) if isinstance(revision_id, str) else None
     indexed_by_path = {
         entry["path"]: entry for entry in (indexed or [])
         if entry.get("role") == "result" and isinstance(entry.get("path"), str)
     }
+    if not indexed_by_path and isinstance(current_manifest, dict):
+        indexed_by_path = {
+            entry["path"]: entry
+            for entry in current_manifest.get("files", [])
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
     results: list[RunResultEntry] = []
     for spec in specs:
         result_id = spec.get("result_id", "")
@@ -1063,11 +1090,22 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
         digest: Optional[str] = None
         size: Optional[int] = None
         status = "declared"
-        if path.is_file():
+        published_entry = indexed_by_path.get(output)
+        if published_entry is not None and isinstance(published_entry.get("sha256"), str):
+            # Published results are content-addressed. Their Run-relative
+            # path belongs to the shared execution tree and may be replaced or
+            # removed by a later revision without invalidating the old result.
+            blob = storage.blob_path(str(published_entry["sha256"]))
+            if blob.is_file():
+                status = "ready"
+                digest = str(published_entry["sha256"])
+                size = int(published_entry.get("size", blob.stat().st_size))
+        elif not current_manifest and path.is_file():
+            # Pre-publication/legacy projection: an active execution can still
+            # expose a materialized declared output before its manifest exists.
             status = "ready"
-            indexed_entry = indexed_by_path.get(output)
-            digest = str(indexed_entry["sha256"]) if indexed_entry else storage.file_digest(path)
-            size = int(indexed_entry["size"]) if indexed_entry else path.stat().st_size
+            digest = storage.file_digest(path)
+            size = path.stat().st_size
         results.append(RunResultEntry(
             result_id=result_id,
             name=spec.get("name", ""),
@@ -1079,7 +1117,13 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
             size=size,
             ref=ResultRef(workspace_id=workspace_id, run_id=run_id, result_id=result_id, digest=digest),
         ))
-    return RunResultsResponse(run_id=run_id, results=results)
+    return RunResultsResponse(
+        run_id=run_id,
+        results=results,
+        definition_revision_id=(
+            str(definition_revision_id) if isinstance(definition_revision_id, str) else None
+        ),
+    )
 
 
 @router.get("/{run_id}/files")
@@ -1147,24 +1191,37 @@ def list_run_files(
 
     current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
     current_revision = current_manifest.get("revision_id")
-    if _run_status_value(run_id, storage) == RunStatus.SUCCEEDED and isinstance(current_revision, str):
+    # Once a result manifest exists, it is the last published snapshot even if
+    # a newer definition is queued/running/failed. Do not fall back to the
+    # shared Run tree: a later revision is allowed to reuse and rewrite those
+    # physical paths, but must not rewrite the older revision's observation.
+    if isinstance(current_revision, str) and current_manifest.get("files"):
         indexed = _indexed_files(run_id, current_revision)
-        if indexed is not None:
-            files = [
-                {
-                    "path": entry["path"],
-                    "size": entry["size"],
-                    "sha256": entry["sha256"],
-                    "role": entry["role"],
-                }
-                for entry in indexed
-                if (include_workflow or entry.get("role") == "result")
-                and (
-                    pattern == "results/**"
-                    or fnmatch.fnmatch(str(entry.get("path", "")), pattern)
-                )
+        if indexed is None:
+            indexed = [
+                {**entry, "role": "result"}
+                for entry in current_manifest.get("files", [])
+                if isinstance(entry, dict)
+            ] + [
+                {**entry, "role": "workflow"}
+                for entry in current_manifest.get("workflow_files", [])
+                if isinstance(entry, dict)
             ]
-            return {"run_id": run_id, "revision_id": current_revision, "files": files}
+        files = [
+            {
+                "path": entry["path"],
+                "size": entry["size"],
+                "sha256": entry["sha256"],
+                "role": entry["role"],
+            }
+            for entry in indexed
+            if (include_workflow or entry.get("role") == "result")
+            and (
+                pattern == "results/**"
+                or fnmatch.fnmatch(str(entry.get("path", "")), pattern)
+            )
+        ]
+        return {"run_id": run_id, "revision_id": current_revision, "files": files}
 
     files = []
     seen: set[str] = set()
@@ -1289,6 +1346,34 @@ def download_run_file(
         digest = str(entry["sha256"])
         return FileResponse(path, filename=Path(file_path).name, headers={"ETag": f'"sha256-{digest}"'})
 
+    # The no-query form means "the last published value", not "whatever bytes
+    # currently happen to occupy this shared Run path". A later revision may
+    # reuse that path while the older result is still the public current result.
+    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
+    current_entries = [
+        *(current_manifest.get("files", []) if isinstance(current_manifest, dict) else []),
+        *(current_manifest.get("workflow_files", []) if isinstance(current_manifest, dict) else []),
+    ]
+    published = next(
+        (item for item in current_entries
+         if isinstance(item, dict) and item.get("path") == file_path),
+        None,
+    )
+    if published is not None:
+        digest = str(published.get("sha256", ""))
+        try:
+            path = storage.blob_path(digest)
+        except ValueError:
+            path = Path()
+        if not path.is_file():
+            raise TDEaseError(
+                code=ErrorCode.RUN_FILE_NOT_FOUND,
+                message=f"The retained bytes for {file_path} are unavailable.",
+                remedy="Check the Backend retention policy and revision manifest integrity.",
+                retryable=False,
+            )
+        return FileResponse(path, filename=Path(file_path).name, headers={"ETag": f'"sha256-{digest}"'})
+
     path = _run_file(run_id, file_path)
     if not path.is_file() or file_path.startswith((".runtime/", ".tdease/", ".snakemake/", "revisions/")):
         raise TDEaseError(
@@ -1298,7 +1383,6 @@ def download_run_file(
             retryable=False,
         )
     digest = None
-    current_manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
     current_revision = current_manifest.get("revision_id")
     if _run_status_value(run_id, storage) == RunStatus.SUCCEEDED and isinstance(current_revision, str):
         indexed = _indexed_files(run_id, current_revision)
@@ -1330,9 +1414,111 @@ def list_run_revisions(run_id: str, _owned: dict = Depends(_owned_run)):
     return {"run_id": run_id, "revisions": revisions}
 
 
+@router.get("/{run_id}/definitions")
+def list_run_definitions(run_id: str, _owned: dict = Depends(_owned_run)):
+    """List immutable submitted definitions, including definitions that failed.
+
+    Result revisions are a separate projection: they exist only after a
+    successful execution. A definition is still a real revision when dry-run
+    or materialization fails, so it must not disappear from Run history.
+    """
+    storage = get_storage()
+    manifests = storage.revision_manifests(run_id)
+    projection, _snapshot = storage.project_run_snapshot(run_id)
+    terminal_by_definition: dict[str, dict] = {}
+    for execution in projection.ranges:
+        if execution.terminal_type is None:
+            status = "RUNNING"
+        else:
+            status = {
+                "run.succeeded": "SUCCEEDED",
+                "run.failed": "FAILED",
+                "run.cancelled": "CANCELLED",
+            }.get(execution.terminal_type)
+        if status:
+            terminal_by_definition[execution.revision_id] = {
+                "status": status,
+                "result_revision_id": next(
+                    (item.get("revision_id") for item in manifests
+                     if item.get("definition_revision_id") == execution.revision_id),
+                    None,
+                ),
+            }
+    definitions = []
+    for definition in storage.definition_snapshots(run_id):
+        definition_id = definition.get("definition_revision_id")
+        if not isinstance(definition_id, str):
+            continue
+        manifest = next(
+            (item for item in manifests if item.get("definition_revision_id") == definition_id),
+            None,
+        )
+        details = terminal_by_definition.get(definition_id, {})
+        if not details and projection.current_revision_id == definition_id and projection.queued_at_seq is not None:
+            details = {"status": "QUEUED", "result_revision_id": None}
+        files = manifest.get("files", []) if isinstance(manifest, dict) else []
+        workflow_files = manifest.get("workflow_files", []) if isinstance(manifest, dict) else []
+        definitions.append({
+            "definition_revision_id": definition_id,
+            "created_at": definition.get("created_at"),
+            "workspace_tree_hash": definition.get("workspace_tree_hash"),
+            "status": details.get("status"),
+            "result_revision_id": details.get("result_revision_id"),
+            "file_count": len(files) if isinstance(files, list) else 0,
+            "workflow_file_count": len(workflow_files) if isinstance(workflow_files, list) else 0,
+        })
+    return {"run_id": run_id, "definitions": definitions}
+
+
+@router.get("/{run_id}/definitions/{definition_revision_id}")
+def get_run_definition(run_id: str, definition_revision_id: str, _owned: dict = Depends(_owned_run)):
+    """Read one frozen definition in full -- the exact Snakefile text, config,
+    node digests and input manifest that THIS revision ran (or will run).
+
+    This is the self-correction channel: an Agent diffs what it is about to
+    change against what an earlier revision actually executed, instead of
+    reconstructing history from memory. Content-addressed and immutable.
+    """
+    import re as _re
+
+    if not _re.fullmatch(r"def-[a-f0-9]{24}", definition_revision_id):
+        raise TDEaseError(
+            code=ErrorCode.RUN_NOT_FOUND,
+            message=f"Invalid definition revision id: {definition_revision_id}",
+            remedy="List definitions with GET /api/v2/runs/{run_id}/definitions.",
+            retryable=False,
+        )
+    storage = get_storage()
+    definition = storage.read_definition_snapshot(run_id, definition_revision_id)
+    if definition is None:
+        raise TDEaseError(
+            code=ErrorCode.RUN_NOT_FOUND,
+            message=f"No definition {definition_revision_id} for run {run_id}.",
+            remedy="List definitions with GET /api/v2/runs/{run_id}/definitions.",
+            retryable=False,
+        )
+    return {
+        "run_id": run_id,
+        "definition_revision_id": definition_revision_id,
+        "created_at": definition.get("created_at"),
+        "workspace_tree_hash": definition.get("workspace_tree_hash"),
+        "snakefile": definition.get("snakefile", ""),
+        "config": definition.get("config", {}),
+        "nodes": definition.get("nodes", []),
+        "targets": definition.get("targets", []),
+        "result_specs": definition.get("result_specs", []),
+        "workspace_files": definition.get("workspace_files", []),
+    }
+
+
 @router.get("/{run_id}/log")
 def get_run_log(run_id: str, tail: int = Query(200, ge=1, le=10000), _owned: dict = Depends(_owned_run)):
+    # The worker section comes first: a Run that died BEFORE the engine
+    # (materialize, digest gates, capability) has no engine logs at all, and
+    # without this source the log surface would read empty -- the failure
+    # stage would be invisible to the Agent.
     paths = [
+        _run_file(run_id, "logs/tasks/worker.log"),
         _run_file(run_id, "logs/tasks/engine.stdout.log"),
         _run_file(run_id, "logs/tasks/engine.stderr.log"),
     ]
@@ -1505,8 +1691,13 @@ def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
             retryable=False,
         )
 
-    # Write cancel marker — worker's task loop checks this
-    storage.mark_cancelled(run_id)
+    # Write cancel marker naming the execution it targets — the worker's task
+    # loop checks it, and a later execution must be able to tell that an older
+    # flag is not aimed at it.
+    projection, _snapshot = storage.project_run_snapshot(run_id)
+    open_range = next((item for item in reversed(projection.ranges) if item.is_open), None)
+    target_seq = open_range.queue_seq if status == RunStatus.RUNNING and open_range else projection.queued_at_seq
+    storage.mark_cancelled(run_id, target_seq)
     from src.execution_runtime.events import EventEmitter
     EventEmitter(run_id).run_action("cancel", _actor(request), previous_status=status.value)
 

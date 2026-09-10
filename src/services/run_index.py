@@ -12,7 +12,7 @@ from typing import Any, Iterator, Sequence
 from src.execution_runtime.run_projector import STATUS_BY_EVENT
 
 
-RUN_INDEX_SCHEMA_VERSION = 3
+RUN_INDEX_SCHEMA_VERSION = 4
 
 
 class ProjectionGapError(RuntimeError):
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS runs (
     search_text     TEXT NOT NULL,
     event_seq       INTEGER NOT NULL DEFAULT 0,
     projected_at_seq INTEGER NOT NULL DEFAULT 0,
+    queued_seq      INTEGER,
     definition_revision_id TEXT,
     execution_mode TEXT,
     rerun_mode TEXT,
@@ -40,7 +41,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_owner_created
     ON runs(user_id, created_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_queue
-    ON runs(status, created_at, run_id);
+    ON runs(status, queued_seq, run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_workspace
     ON runs(user_id, workspace_id, created_at DESC);
 
@@ -266,12 +267,13 @@ class RunIndex:
                     connection.execute(
                         """
                         UPDATE runs SET definition_revision_id = ?, execution_mode = ?,
-                            rerun_mode = ? WHERE run_id = ?
+                            rerun_mode = ?, queued_seq = ? WHERE run_id = ?
                         """,
                         (
                             str(data.get("revision_id", "")),
                             str(data.get("mode", "")),
                             str(data.get("rerun_mode", "resume")),
+                            seq,
                             run_id,
                         ),
                     )
@@ -475,7 +477,7 @@ class RunIndex:
             rows = connection.execute(
                 """
                 SELECT run_id FROM runs WHERE status = 'QUEUED'
-                ORDER BY created_at, run_id LIMIT ?
+                ORDER BY (queued_seq IS NULL), queued_seq, created_at, run_id LIMIT ?
                 """,
                 (limit,),
             ).fetchall()

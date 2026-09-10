@@ -80,7 +80,8 @@ class RunCommit(BaseModel):
 
     After submission the run_id is fixed and the commit content is never
     modified.
-    Storage: data-root/runs/<run_id>/run.json
+    Storage: data-root/runs/<run_id>/definitions/<definition_revision_id>.json;
+    run.json is only the latest-definition pointer used by list/status views.
     """
 
     run_id: str = Field(
@@ -259,6 +260,12 @@ class RunResultsResponse(BaseModel):
 
     run_id: str
     results: list[RunResultEntry]
+    definition_revision_id: Optional[str] = Field(
+        default=None,
+        description="Definition the current results manifest names -- the specs and "
+        "files above belong to this revision, which may be older than the newest "
+        "submitted definition.",
+    )
 
 
 class RunRerunRequest(BaseModel):
@@ -298,6 +305,18 @@ class RunStatusResponse(BaseModel):
     workspace_id: str
     workspace_run_path: Optional[str] = None
     current_revision: Optional[str] = None
+    active_revision: Optional[str] = Field(
+        default=None,
+        description="Definition revision of the currently open execution range, if any.",
+    )
+    queued_revision: Optional[str] = Field(
+        default=None,
+        description="Definition revision waiting to start, if any.",
+    )
+    execution_count: int = Field(
+        default=0,
+        description="Number of started execution ranges recorded in the Journal.",
+    )
     status: RunStatus
     materialization_strategy: str = Field(
         default="local_workspace_hardlink",

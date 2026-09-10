@@ -55,7 +55,7 @@ from app.api.workspace_roots import router as workspace_roots_router
 from app.auth import authenticate_request, router as auth_router
 from app.errors import register_error_handlers
 from src.contracts.errors import ErrorCode, TDEaseError
-from src.services.workspace_roots import get_workspace_root_registry
+from src.services.workspace_roots import configure_workspace_root_runtime
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
     db_path = str(storage.data / "database" / "db.sqlite3")
     migrate_database(db_path)
     check_database_health(db_path)
-    get_workspace_root_registry().configure(db_path)
+    configure_workspace_root_runtime(db_path)
     try:
         from src.services.run_index import get_run_index
 
@@ -81,22 +81,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Run index rebuild failed; filesystem fallbacks remain available")
     logger.info("Database ready: %s", db_path)
-
-    # Workspace root containment: until this is wired, the fail-closed default in
-    # src/execution_runtime/workspace_containment.py approves no root for anyone and
-    # every local materialization raises WORKSPACE_PATH_ESCAPE. The registry is the
-    # only thing consulted; Run commits carry an opaque root capability, not a path.
-    from src.execution_runtime.workspace_containment import set_approved_roots_checker
-
-    # Late-bound on purpose: the route handlers in app/api/workspace_roots.py
-    # resolve the registry via get_workspace_root_registry() at call time, so
-    # capturing a bound method here would let the two diverge if the singleton is
-    # ever substituted.
-    set_approved_roots_checker(
-        lambda user_id, candidate_path: get_workspace_root_registry().is_within_approved_root(
-            user_id, candidate_path
-        )
-    )
 
     logger.info("TDEase-nexus ready")
     yield

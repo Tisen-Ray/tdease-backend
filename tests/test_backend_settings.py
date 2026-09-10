@@ -39,7 +39,7 @@ def test_settings_are_frozen_from_one_json_document(tmp_path) -> None:
     assert settings.bind_port == 43123
     assert settings.log_level == logging.WARNING
     assert settings.data_root == (tmp_path / "runtime").resolve()
-    # node root defaults under the data root — no separate wiring to forget.
+    # Backend owns its compute catalog; Desktop/System is separate.
     assert settings.node_root == (tmp_path / "runtime" / "nodes").resolve()
     assert settings.reserved_logical_cpus == "3"
     assert settings.reserved_memory_mb == "4096"
@@ -66,6 +66,8 @@ def test_environment_is_ignored_without_explicit_development_opt_in(tmp_path) ->
         {"auth": {"mode": "maybe"}},
         {"server": {"port": "not-a-port"}},
         {"nodeRoot": ""},
+        # A node catalog outside Backend data breaks the Backend/System link.
+        {"nodeRoot": "../nodes"},
     ],
 )
 def test_invalid_configuration_fails_at_startup(tmp_path, overrides) -> None:

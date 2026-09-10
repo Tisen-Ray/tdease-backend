@@ -24,7 +24,7 @@ from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.parser import parse_snakefile
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.snakemake_adapter import SnakemakeAdapter
-from src.execution_runtime.storage import get_storage
+from src.execution_runtime.storage import get_storage, get_tools_root
 
 
 @dataclass
@@ -180,10 +180,18 @@ def execute(
             "engine",
         )
     effective_rerun_mode = "overwrite" if rerun_mode == "overwrite" else "resume"
+    # Tool binding: bound node packages stay in the Backend catalog; the engine
+    # reaches them through absolute paths injected into config["nodes"]. Nothing
+    # tool-related is ever written under the Run directory.
+    from src.services.node_catalog import bound_node_paths, resolve_bindings
+
+    node_paths = bound_node_paths(
+        resolve_bindings(get_tools_root(), commit.nodes)
+    )
     engine_request = WorkflowEngineRequest(
         mode="execute",
         snakefile="Snakefile",
-        config=commit.config,
+        config={**commit.config, "nodes": node_paths} if node_paths else commit.config,
         cores=effective_cores,
         memory_mb=RESOURCE_BUDGET.compute_memory_mb,
         targets=commit.targets,

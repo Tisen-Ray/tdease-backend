@@ -32,27 +32,27 @@ registered root is (symlinks resolved, Windows case folded), is equal to or
 nested beneath one of that Principal's approved roots. Never raises --
 an unresolvable or malformed path is simply not contained.
 
-Wiring required (owned by whoever assembles `app/main.py` -- not this
-module, which must not import `app/**`):
+Wiring is owned by whoever assembles `app/main.py` -- not this module, which
+must not import `app/**` -- and is performed during Backend lifespan/worker
+bootstrap:
 
     from src.services.workspace_roots import get_workspace_root_registry
     from src.execution_runtime.workspace_containment import set_approved_roots_checker
 
     set_approved_roots_checker(get_workspace_root_registry().is_within_approved_root)
 
-And the one call site that currently invokes `materialize_local_run_files`
-without a `user_id` (`app/api/runs_v2.py`, `local_workspace_hardlink`
-branch) must start passing one -- `RunCommit.user_id` already carries it:
+Every source-backed call to `materialize_local_run_files` must pass a
+`user_id` (`app/api/runs_v2.py` dry-run branch and the legacy worker fallback) --
+`RunCommit.user_id` already carries it:
 
     storage.materialize_local_run_files(
-        commit.run_id, resolved_capability_path, commit.workspace_files,
+        target_dir, resolved_capability_path, commit.workspace_files,
         user_id=commit.user_id,
     )
 
-Until both of those land, every local materialization call raises
-`WORKSPACE_PATH_ESCAPE` -- the fail-closed default is deliberate, not a bug:
-a caller-supplied root is no longer trusted, and no Principal has approved
-anything until the registry is wired in and named.
+The default remains fail-closed for isolated tests and unbootstrapped callers:
+a caller-supplied root is never trusted, and no Principal is approved until the
+Backend wires the registry.
 """
 
 from __future__ import annotations

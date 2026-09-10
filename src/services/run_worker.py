@@ -6,7 +6,8 @@ Design constraints:
 - Atomic claim (O_CREAT | O_EXCL claim file).
 - Calls Execution Runtime execute().
 - events.jsonl is the lifecycle truth. SQLite is a rebuildable queue/read
-  projection and run.json remains an immutable execution definition.
+  projection and definitions/<revision>.json remains an immutable execution
+  definition; run.json points at the latest one for management views.
 """
 
 from __future__ import annotations
@@ -25,11 +26,9 @@ from src.execution_runtime import execute, get_storage
 from src.execution_runtime.events import EventEmitter
 from src.execution_runtime.storage import (
     StorageLayout,
-    get_tools_root,
     process_identity,
     process_identity_alive,
 )
-from src.services.node_catalog import materialize_bindings, resolve_bindings
 
 logger = logging.getLogger(__name__)
 
@@ -38,30 +37,42 @@ def _materialize_run(commit: RunCommit, storage: StorageLayout) -> None:
     """Expose the committed definition in the run directory, immediately before execution.
 
     Submission validates and writes nothing; this is the one place a Run's
-    working files and node links are created. It therefore always reflects the
-    revision being started -- an edit made while a previous execution was still
-    running cannot leak into it, and a re-submitted definition is picked up by
-    the next execution. Inputs are hardlinked and node packages are linked; a
-    link that the platform refuses fails the Run instead of silently copying.
+    working files are created. It therefore always reflects the revision being
+    started -- an edit made while a previous execution was still running cannot
+    leak into it, and a re-submitted definition is picked up by the next
+    execution. Inputs are hardlinked from immutable CAS blobs; a link that the
+    platform refuses fails the Run instead of silently copying per-Run bytes.
+    Node packages are NOT materialized here: tools stay in the Backend catalog
+    and the engine reaches them through config["nodes"] absolute paths.
     """
     if commit.materialization_strategy == "local_workspace_hardlink":
-        from src.services.workspace_roots import get_workspace_root_registry
-
-        workspace = get_workspace_root_registry().resolve(
-            commit.user_id, commit.local_root_id, commit.local_run_path or "."
-        )
-        if workspace is None:
-            raise ValueError(
-                "Workspace root capability is missing, revoked, or the Run path escapes it"
+        # New submissions seal local inputs during POST /runs, so the worker
+        # does not depend on a mutable Workspace or a second root-capability
+        # lookup. Keep the source-backed path for legacy queued definitions
+        # created before input sealing was introduced.
+        if all(
+            storage.blob_exists(
+                entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
             )
-        storage.materialize_local_run_files(
-            storage.allocate_run(commit.run_id), workspace, commit.workspace_files,
-            user_id=commit.user_id,
-        )
+            for entry in commit.workspace_files
+        ):
+            storage.materialize_run_files(commit.run_id, commit.workspace_files)
+        else:
+            from src.services.workspace_roots import get_workspace_root_registry
+
+            workspace = get_workspace_root_registry().resolve(
+                commit.user_id, commit.local_root_id, commit.local_run_path or "."
+            )
+            if workspace is None:
+                raise ValueError(
+                    "Workspace root capability is missing, revoked, or the Run path escapes it"
+                )
+            storage.materialize_local_run_files(
+                storage.allocate_run(commit.run_id), workspace, commit.workspace_files,
+                user_id=commit.user_id,
+            )
     else:
         storage.materialize_run_files(commit.run_id, commit.workspace_files)
-    resolved = resolve_bindings(get_tools_root(), commit.nodes)
-    materialize_bindings(storage.resolve(commit.run_id), resolved, storage.link_node_package)
 
 
 def _index_run(data: dict, storage: StorageLayout) -> None:
@@ -87,8 +98,16 @@ def _data_root() -> Path:
 def _prepare_worker(storage: StorageLayout) -> None:
     """Prepare persistent queue state without depending on API startup."""
     from app.database.lifecycle import migrate_database
+    from src.services.workspace_roots import configure_workspace_root_runtime
 
-    migrate_database(str(storage.data / "database" / "db.sqlite3"))
+    db_path = storage.data / "database" / "db.sqlite3"
+    migrate_database(str(db_path))
+    configure_workspace_root_runtime(db_path)
+    # Rejected submissions and purged Runs can leave unreferenced shared bytes.
+    # Cleanup is reachability-based and grace-period protected, so worker
+    # startup is a safe low-frequency management boundary without another
+    # scheduler or a per-Run cleanup task.
+    storage.gc_unreferenced_blobs()
     from src.services.run_index import get_run_index
 
     get_run_index().reconcile(storage)
@@ -128,11 +147,16 @@ def _dequeue() -> dict | None:
         if projection.status != "QUEUED":
             continue
 
-        created_at = data.get("created_at")
-        try:
-            queued_at = datetime.fromisoformat(str(created_at)).timestamp()
-        except (TypeError, ValueError, OSError):
-            queued_at = rj.stat().st_mtime
+        # Order by the journal seq of the queue request itself (the same key
+        # the Run index uses): resubmission preserves created_at, so ordering
+        # by it would let an old resubmitted run jump every newer run.
+        queued_at = projection.queued_at_seq
+        if queued_at is None:
+            created_at = data.get("created_at")
+            try:
+                queued_at = datetime.fromisoformat(str(created_at)).timestamp()
+            except (TypeError, ValueError, OSError):
+                queued_at = rj.stat().st_mtime
         candidates.append((queued_at, str(data.get("run_id", rd.name)), data))
 
     for _queued_at, _run_id, data in sorted(candidates, key=lambda item: (item[0], item[1])):
@@ -172,7 +196,15 @@ def _has_queued_run() -> bool:
 
 
 def execute_run(run_data: dict) -> None:
-    """Execute one Run -- entirely through the Execution Runtime."""
+    """Execute one Run -- entirely through the Execution Runtime.
+
+    Nothing may end silently. Every wrapper stage around the engine names
+    itself in the worker log (`logs/tasks/worker.log`, part of the run-log
+    surface), and a death BEFORE the engine still leaves a terminal event
+    plus the traceback there. Letting an exception escape would bounce the
+    claim back to QUEUED with no event and no log -- an invisible crash loop
+    that, three times in a minute, takes the whole Backend down.
+    """
     run_id = run_data["run_id"]
     storage = get_storage()
     storage.bootstrap()
@@ -180,84 +212,194 @@ def execute_run(run_data: dict) -> None:
     # Idempotent -- API already created the directory and queued via Journal.
     storage.allocate_run(run_id)
 
-    commit = RunCommit(
-        run_id=run_id,
-        idempotency_key=run_data.get("idempotency_key", ""),
-        workspace_id=run_data.get("workspace_id", ""),
-        workspace_tree_hash=run_data.get("workspace_tree_hash", "0" * 64),
-        workspace_files=run_data.get("workspace_files", []),
-        local_root_id=run_data.get("local_root_id"),
-        local_run_path=run_data.get("local_run_path"),
-        workspace_run_path=run_data.get("workspace_run_path"),
-        snakefile=run_data.get("snakefile", ""),
-        config=run_data.get("config", {}),
-        cores=run_data.get("cores", 4),
-        user_id=run_data.get("user_id", "worker"),
-        materialization_strategy=run_data.get("materialization_strategy"),
-        nodes=run_data.get("nodes", []),
-        targets=run_data.get("targets", []),
-        memory_mb=run_data.get("memory_mb"),
-        labels=run_data.get("labels", {}),
-    )
-
-    projection, _snapshot = storage.project_run_snapshot(run_id)
-    if projection.status != RunStatus.QUEUED.value or not projection.current_revision_id:
-        raise RuntimeError(f"Run {run_id} is not backed by a queued Journal revision")
-    queue_event = next(
-        event for event in reversed(storage.read_events(run_id))
-        if event.get("type") == "run.queue_requested"
-    )
-    raw_queue_data = queue_event.get("data")
-    queue_data: dict = raw_queue_data if isinstance(raw_queue_data, dict) else {}
-    execution_mode = projection.queued_mode or "execute"
-    rerun_mode = str(queue_data.get("rerun_mode", "resume"))
-    revision_id = projection.current_revision_id
-    _index_run(run_data, storage)
-    try:
-        _materialize_run(commit, storage)
-        result = execute(
-            commit,
-            revision_id=revision_id,
-            execution_mode=execution_mode,
-            rerun_mode=rerun_mode,
-        )
-        if commit.materialization_strategy == "local_workspace_hardlink":
-            storage.verify_local_inputs(run_id)
-    except Exception as exc:
-        from src.execution_runtime.runtime import ExecutionResult
-        error = TDEaseError(
-            code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
-            message=f"Internal runtime error: {exc}",
-            remedy="Inspect the Backend log for the underlying exception, then retry the Run.",
-            retryable=False,
-        )
-        result = ExecutionResult(success=False, exit_code=-1, error=error)
-        # execute() raises only from inside its own try/except, which
-        # always appends a terminal event first -- but the local-input
-        # verification calls above are outside execute() and can raise
-        # with no terminal event on record at all. Append one now so the
-        # projection has a terminal fact instead of remaining RUNNING/QUEUED.
-        EventEmitter(run_id).run_failed(
-            revision_id=revision_id,
-            exit_code=-1, run_time_seconds=0.0, error_message=str(error)
-        )
-
-    manifest_path = None
-    if result.success:
+    def wlog(line: str) -> None:
         try:
-            manifest_path = storage.write_results_manifest(run_id, revision_id)
-            EventEmitter(run_id).run_succeeded(
-                revision_id=revision_id,
-                run_time_seconds=result.run_time_seconds,
-                total_tasks=result.total_tasks,
+            path = storage.resolve(run_id, "logs", "tasks", "worker.log")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{line}\n")
+        except OSError:
+            logger.exception("Worker log append failed for %s", run_id)
+
+    terminal_emitted = False
+    revision_id = str(run_data.get("definition_revision_id") or "")
+    queue_tag = "q?"
+    stage = "startup"
+    try:
+        projection, _snapshot = storage.project_run_snapshot(run_id)
+        if projection.status != RunStatus.QUEUED.value or not projection.current_revision_id:
+            raise RuntimeError(
+                f"Run {run_id} is not backed by a queued Journal revision "
+                f"(projection says {projection.status})"
             )
-        except Exception as exc:
+        revision_id = projection.current_revision_id
+        queue_tag = f"q{projection.queued_at_seq}"
+        wlog(f"[{queue_tag}] claimed definition {revision_id} "
+             f"(mode={projection.queued_mode or 'execute'})")
+        # A cancel flag left behind by an earlier execution must not self-cancel
+        # this one: the flag names the queue_seq it targets, and a flag aimed at
+        # any other (or unknown/legacy) execution is stale here and gets cleared.
+        if storage.check_cancelled(run_id) and storage.cancelled_queue_seq(run_id) != projection.queued_at_seq:
+            storage.clear_cancelled(run_id)
+            wlog(f"[{queue_tag}] cleared a stale cancel flag from another execution")
+        # run.json is only the latest pointer. The queue event identifies the
+        # definition that this execution must use, even when a newer edit arrived
+        # after the old execution was queued.
+        queued_definition = storage.read_definition_snapshot(run_id, revision_id) or run_data
+
+        commit = RunCommit(
+            run_id=run_id,
+            idempotency_key=queued_definition.get("idempotency_key", ""),
+            workspace_id=queued_definition.get("workspace_id", ""),
+            workspace_tree_hash=queued_definition.get("workspace_tree_hash", "0" * 64),
+            workspace_files=queued_definition.get("workspace_files", []),
+            local_root_id=queued_definition.get("local_root_id"),
+            local_run_path=queued_definition.get("local_run_path"),
+            workspace_run_path=queued_definition.get("workspace_run_path"),
+            snakefile=queued_definition.get("snakefile", ""),
+            config=queued_definition.get("config", {}),
+            cores=queued_definition.get("cores", 4),
+            user_id=queued_definition.get("user_id", "worker"),
+            materialization_strategy=queued_definition.get("materialization_strategy"),
+            nodes=queued_definition.get("nodes", []),
+            targets=queued_definition.get("targets", []),
+            memory_mb=queued_definition.get("memory_mb"),
+            labels=queued_definition.get("labels", {}),
+            result_specs=queued_definition.get("result_specs", []),
+        )
+
+        # The queue request that made THIS execution queued is the one at
+        # projection.queued_at_seq. Reading "the latest queue event" instead would
+        # race a definition submitted between the projection read and this read:
+        # revision A's files with revision B's rerun_mode.
+        stage = "queue-request"
+        queue_event = next(
+            (
+                event for event in storage.read_events(run_id)
+                if event.get("type") == "run.queue_requested"
+                and projection.queued_at_seq is not None
+                and int(event.get("seq") or 0) == projection.queued_at_seq
+            ),
+            None,
+        )
+        if queue_event is None:
+            raise RuntimeError(
+                f"Run {run_id} has no queue event at seq {projection.queued_at_seq}"
+            )
+        raw_queue_data = queue_event.get("data")
+        queue_data: dict = raw_queue_data if isinstance(raw_queue_data, dict) else {}
+        execution_mode = projection.queued_mode or "execute"
+        rerun_mode = str(queue_data.get("rerun_mode", "resume"))
+        _index_run(run_data, storage)
+        try:
+            stage = "materialize"
+            wlog(f"[{queue_tag}] materializing {revision_id} "
+                 f"({commit.materialization_strategy}, {len(commit.workspace_files)} input(s), "
+                 f"{len(commit.nodes)} node binding(s))")
+            _materialize_run(commit, storage)
+            stage = "engine"
+            wlog(f"[{queue_tag}] engine starting (mode={execution_mode}, rerun={rerun_mode})")
+            result = execute(
+                commit,
+                revision_id=revision_id,
+                execution_mode=execution_mode,
+                rerun_mode=rerun_mode,
+            )
+            wlog(f"[{queue_tag}] engine finished success={result.success} "
+                 f"in {result.run_time_seconds:.1f}s")
+            if commit.materialization_strategy == "local_workspace_hardlink":
+                stage = "verify-inputs"
+                storage.verify_local_inputs(run_id)
+                wlog(f"[{queue_tag}] shared inputs verified unchanged")
+        except TDEaseError as exc:
+            from src.execution_runtime.runtime import ExecutionResult
+            terminal_emitted = True
+            wlog(f"[{queue_tag}] FAILED at {stage}: {exc}")
+            EventEmitter(run_id).runtime_message("error", str(exc))
+            result = ExecutionResult(success=False, exit_code=-1, error=exc)
             EventEmitter(run_id).run_failed(
                 revision_id=revision_id,
-                exit_code=-1,
-                run_time_seconds=0.0,
-                error_message=f"result manifest finalization failed: {exc}",
+                exit_code=-1, run_time_seconds=0.0, error_message=f"[{stage}] {exc}"
             )
+        except Exception as exc:
+            from src.execution_runtime.runtime import ExecutionResult
+            terminal_emitted = True
+            wlog(f"[{queue_tag}] FAILED at {stage}: {type(exc).__name__}: {exc}")
+            import traceback
+            try:
+                with storage.resolve(run_id, "logs", "tasks", "worker.log").open(
+                    "a", encoding="utf-8"
+                ) as stream:
+                    traceback.print_exc(file=stream)
+            except OSError:
+                logger.exception("Worker traceback write failed for %s", run_id)
+            error = TDEaseError(
+                code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
+                message=f"[{stage}] {exc}",
+                remedy="Read the run log (the worker section names the failing stage "
+                       "and ends with the traceback), then retry or repair the Run.",
+                retryable=False,
+            )
+            EventEmitter(run_id).runtime_message("error", str(error))
+            result = ExecutionResult(success=False, exit_code=-1, error=error)
+            # execute() raises only from inside its own try/except, which
+            # always appends a terminal event first -- but the local-input
+            # verification calls above are outside execute() and can raise
+            # with no terminal event on record at all. Append one now so the
+            # projection has a terminal fact instead of remaining RUNNING/QUEUED.
+            EventEmitter(run_id).run_failed(
+                revision_id=revision_id,
+                exit_code=-1, run_time_seconds=0.0, error_message=f"[{stage}] {exc}"
+            )
+
+        manifest_path = None
+        if result.success:
+            stage = "manifest"
+            try:
+                manifest_path = storage.write_results_manifest(run_id, revision_id)
+                terminal_emitted = True
+                EventEmitter(run_id).run_succeeded(
+                    revision_id=revision_id,
+                    run_time_seconds=result.run_time_seconds,
+                    total_tasks=result.total_tasks,
+                )
+                wlog(f"[{queue_tag}] manifest published for {revision_id}")
+            except Exception as exc:
+                terminal_emitted = True
+                wlog(f"[{queue_tag}] FAILED at manifest finalization: {exc}")
+                EventEmitter(run_id).run_failed(
+                    revision_id=revision_id,
+                    exit_code=-1,
+                    run_time_seconds=0.0,
+                    error_message=f"result manifest finalization failed: {exc}",
+                )
+    except Exception as exc:
+        # Death outside the staged block (journal/projection/queue-request
+        # reading, or anything after a terminal event). It must still be
+        # visible: traceback to the worker log, and a terminal event when the
+        # journal has none yet. Never re-raise -- that would crash-loop the
+        # claim invisibly.
+        wlog(f"[{queue_tag}] FATAL at {stage}: {type(exc).__name__}: {exc}")
+        import traceback
+        try:
+            with storage.resolve(run_id, "logs", "tasks", "worker.log").open(
+                "a", encoding="utf-8"
+            ) as stream:
+                traceback.print_exc(file=stream)
+        except OSError:
+            logger.exception("Worker traceback write failed for %s", run_id)
+        if not terminal_emitted:
+            try:
+                EventEmitter(run_id).run_failed(
+                    revision_id=revision_id,
+                    exit_code=-1,
+                    run_time_seconds=0.0,
+                    error_message=f"worker aborted at {stage}: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                logger.exception("Worker terminal event failed for %s", run_id)
+        logger.exception("Worker execute_run failed for %s", run_id)
+        return
 
     projection, _snapshot = storage.project_run_snapshot(run_id)
     _index_run(run_data, storage)

@@ -201,3 +201,21 @@ def get_workspace_root_registry() -> WorkspaceRootRegistry:
     `WorkspaceRootRegistry()` directly instead of going through this singleton."""
 
     return _registry
+
+
+def configure_workspace_root_runtime(db_path: str | Path) -> None:
+    """Wire the durable root registry into every Backend process.
+
+    The API and the worker are separate processes. Keeping this bootstrap
+    beside the registry prevents one process from silently using the in-memory
+    fail-closed default while the other uses SQLite-backed grants.
+    """
+    registry = get_workspace_root_registry()
+    registry.configure(db_path)
+    from src.execution_runtime.workspace_containment import set_approved_roots_checker
+
+    set_approved_roots_checker(
+        lambda user_id, candidate_path: registry.is_within_approved_root(
+            user_id, candidate_path
+        )
+    )

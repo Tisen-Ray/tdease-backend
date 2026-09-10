@@ -33,10 +33,12 @@ Runtime data is external to this repository. The service owns its data layout an
 consume the Scientific System only through public commands or protocols; it never imports
 Desktop implementation paths.
 
-The node catalog lives at `<dataRoot>/nodes/` — one deployment root, no separate
-wiring to forget. The optional JSON `nodeRoot` field is for deployments that keep
-read-only assets away from the data root (the packaged desktop pins it to its
-resources tree); production does not use environment-variable path discovery.
+The node catalog belongs to Backend data. If Backend `dataRoot` is
+`<TDnexus-Data>/backend`, packages live at
+`<TDnexus-Data>/backend/nodes/`. Desktop/System remains a separate root at
+`<TDnexus-Data>/system/`. The catalog root is derived from `dataRoot` and a
+path outside it is rejected at startup. Production does not use
+environment-variable path discovery.
 
 Minimal `backend.json`:
 

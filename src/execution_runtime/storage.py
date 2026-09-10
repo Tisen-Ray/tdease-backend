@@ -24,10 +24,11 @@ P2 fixes:
 - append_runtime_record / append_task_output: deep log operations
 
 CORE-ARCHITECTURE.md Sec 1.4:
-- run.json is the frozen execution definition.
+- definitions/<definition_revision_id>.json is the frozen execution definition.
+- run.json is the latest-definition pointer for list/status views.
 - events.jsonl is the lifecycle truth and is projected in memory or into the
   rebuildable SQLite read model. Storage never writes lifecycle state back into
-  the definition.
+  a definition snapshot.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import shutil
 import stat
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -286,50 +288,12 @@ class StorageLayout:
             finally:
                 os.close(dfd)
 
-    def link_node_package(self, source: Path, target: Path) -> bool:
-        """Point `target` at the deployed node package `source` without copying it.
-
-        A Run's `nodes/<id>` is a directory junction (Windows) or a symlink
-        (POSIX) onto the catalog package, so a Run executes the catalog's own
-        bytes: no per-Run 200 MB duplicate, and the rules' relative
-        `nodes/<id>/...` paths keep resolving exactly as before. The package
-        digest pinned on the Run still names the identity that was bound.
-        Returns False when the platform refuses the link (non-NTFS volume,
-        missing privilege); the caller falls back to a real copy.
-        """
-        source = Path(source).resolve()
-        target = Path(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        self._drop_link(target)
-        try:
-            if os.name == "nt":
-                import _winapi  # Windows-only; junction creation needs no privilege
-
-                _winapi.CreateJunction(str(source), str(target))
-            else:
-                os.symlink(source, target, target_is_directory=True)
-            return True
-        except (OSError, ImportError, AttributeError):
-            return False
-
-    def _drop_link(self, target: Path) -> None:
-        """Remove `target` if it is a reparse point, a link, or a stale tree."""
-        if _is_reparse_point(target) or target.is_symlink():
-            try:
-                os.rmdir(target)
-            except OSError:
-                target.unlink(missing_ok=True)
-        elif target.is_dir():
-            self.remove_tree(target)
-        elif target.exists():
-            target.unlink()
-
     def remove_tree(self, target: Path, *, ignore_errors: bool = False) -> None:
-        """Remove a Backend-owned tree WITHOUT following a node junction.
+        """Remove a Backend-owned tree without following directory links.
 
-        `shutil.rmtree` descends through a directory junction, so deleting a
-        Run would delete the catalog package it points at. Unlink every reparse
-        point top-down first, then remove what remains.
+        `shutil.rmtree` descends through a junction (the `.snakemake` engine
+        alias), so deleting a Run would delete the state it points at. Unlink
+        every reparse point top-down first, then remove what remains.
         """
         target = Path(target)
         if _is_reparse_point(target):
@@ -756,8 +720,32 @@ class StorageLayout:
     def cancel_path(self, run_id: str) -> Path:
         return self.resolve(run_id, ".runtime", "cancelled")
 
-    def mark_cancelled(self, run_id: str) -> None:
-        self.atomic_write(self.cancel_path(run_id), "")
+    def mark_cancelled(self, run_id: str, queue_seq: int | None = None) -> None:
+        """Write the cancel flag, naming the execution it targets.
+
+        The flag outlives the execution it stops (the worker never sees the
+        cancel API), so it must carry its target: without the queue seq, a
+        cancel aimed at one execution would silently self-cancel every later
+        execution queued behind it.
+        """
+        payload = "" if queue_seq is None else json.dumps({"queue_seq": int(queue_seq)})
+        self.atomic_write(self.cancel_path(run_id), payload)
+
+    def cancelled_queue_seq(self, run_id: str) -> int | None:
+        """The queue_seq the cancel flag targets, or None when blank/legacy."""
+        try:
+            raw = self.cancel_path(run_id).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return None
+        if isinstance(value, dict) and isinstance(value.get("queue_seq"), int):
+            return value["queue_seq"]
+        return None
 
     def clear_cancelled(self, run_id: str) -> None:
         self.cancel_path(run_id).unlink(missing_ok=True)
@@ -775,8 +763,8 @@ class StorageLayout:
         try:
             yield Path(td)
         finally:
-            # A dry-run root holds node junctions; remove_tree unlinks them
-            # before deleting so the catalog is never touched.
+            # A dry-run root holds the engine state alias; remove_tree unlinks
+            # reparse points before deleting so linked targets are never touched.
             self.remove_tree(Path(td), ignore_errors=True)
 
     # -- Blob store --
@@ -850,7 +838,7 @@ class StorageLayout:
                 raise ValueError(f"run file escapes snapshot: {path}") from exc
             if not self.blob_exists(digest):
                 raise FileNotFoundError(f"missing blob for {path}: {digest}")
-            self.atomic_write(target, self.blob_get(digest))
+            self._link_blob(digest, target)
 
     def _local_sources(self, workspace_root: Path, entries: list[Any], *,
                        user_id: str) -> list[tuple[str, Path, str, bool]]:
@@ -889,10 +877,27 @@ class StorageLayout:
     def verify_local_run_files(self, workspace_root: Path, entries: list[Any], *, user_id: str) -> None:
         """Submission-time check that the frozen mapping still matches its sources.
 
-        Writes nothing: a submission never copies inputs. The run directory is
-        materialized by the worker when the Run is dequeued.
+        Writes nothing into the Run directory: a submission only verifies the
+        Workspace source. New API submissions seal the bytes into CAS in the
+        adjacent `seal_local_run_files` step.
         """
         self._local_sources(workspace_root, entries, user_id=user_id)
+
+    def seal_local_run_files(self, workspace_root: Path, entries: list[Any], *, user_id: str) -> None:
+        """Seal a verified local input mapping into CAS without touching the Run.
+
+        The definition must remain executable if the Workspace changes or is
+        temporarily unavailable before the global queue reaches it. The CAS is
+        shared by all revisions and Runs, so this is one copy per unique digest,
+        not an isolated input tree per revision.
+        """
+        for _rel, source, expected, _is_control in self._local_sources(
+            workspace_root, entries, user_id=user_id
+        ):
+            if self.blob_exists(expected):
+                continue
+            with source.open("rb") as stream:
+                self.blob_put_stream(stream, expected)
 
     def materialize_local_run_files(self, target_dir: Path, workspace_root: Path,
                                     entries: list[Any], *, user_id: str) -> None:
@@ -901,12 +906,16 @@ class StorageLayout:
         One implementation for both the real run directory and a dry-run's
         temporary root. Control files (Snakefile, *.smk, config.yaml, scripts/)
         are written as real files: the engine reads them and they are tiny.
-        Every other input is a hardlink to the Workspace file, so a Run stores no
-        input bytes. A source that cannot be linked (another volume, a filesystem
-        without hardlinks) is refused instead of silently copied -- a multi-GB
-        duplicate the user never asked for is worse than a clear failure.
+        Every other input is first sealed in the Backend CAS (one copy per
+        digest), then hardlinked from that immutable blob. A Run therefore stores
+        no private input bytes and cannot follow an in-place Workspace edit.
         """
         target_dir = Path(target_dir).resolve()
+        previous = self.read_json(target_dir / ".tdease" / "local-inputs.json") or []
+        previous_paths = {
+            item.get("path") for item in previous
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
         shared: list[dict[str, Any]] = []
         for rel, source, expected, is_control in self._local_sources(workspace_root, entries, user_id=user_id):
             target = (target_dir / rel).resolve(strict=False)
@@ -915,23 +924,65 @@ class StorageLayout:
             if is_control:
                 self.atomic_write(target, source.read_bytes())
                 continue
+            if target.exists():
+                if target.is_dir():
+                    raise ValueError(
+                        f"input target {rel} is a directory in the shared Run tree; "
+                        "refusing to remove a workflow-owned path"
+                    )
+                if rel not in previous_paths:
+                    try:
+                        if os.path.samefile(source, target):
+                            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "hardlink"})
+                            continue
+                    except OSError:
+                        pass
+                    raise ValueError(
+                        f"input target {rel} already belongs to the shared Run tree; "
+                        "refusing to overwrite an unmanaged intermediate or output"
+                    )
             try:
-                os.link(source, target)
-            except OSError as exc:
+                # Seal the source once globally, then point the Run at the
+                # immutable blob. The digest check in blob_put_stream also
+                # catches a source that changes while it is being read.
+                if not self.blob_exists(expected):
+                    with source.open("rb") as stream:
+                        self.blob_put_stream(stream, expected)
+                self._link_blob(expected, target)
+            except (OSError, ValueError) as exc:
                 raise ValueError(
-                    f"input {rel} cannot be linked into the Run directory "
-                    f"({exc.strerror or exc}); a Run never copies inputs -- keep the "
-                    "Workspace on the same volume as the Backend data root"
+                    f"input {rel} cannot be sealed into the Backend CAS "
+                    f"({getattr(exc, 'strerror', None) or exc})"
                 ) from exc
-            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "hardlink"})
+            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "cas_hardlink"})
         self.atomic_write_json(target_dir / ".tdease" / "local-inputs.json", shared)
+
+    def _link_blob(self, digest: str, target: Path) -> None:
+        """Atomically expose one immutable CAS blob at a Run-relative path."""
+        source = self.blob_path(digest)
+        if not source.is_file():
+            raise FileNotFoundError(f"missing blob for {digest}")
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.blob-{uuid.uuid4().hex}")
+        try:
+            os.link(source, temporary)
+            os.replace(temporary, target)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def verify_local_inputs(self, run_id: str) -> None:
         manifest = self.read_json(self.resolve(run_id, ".tdease", "local-inputs.json")) or []
         for item in manifest:
             path = self.resolve(run_id, item["path"])
             if not path.is_file() or self.file_digest(path) != item["sha256"]:
-                raise ValueError(f"local shared input changed: {item['path']}")
+                raise ValueError(
+                    f"local shared input changed: {item['path']} -- the workspace "
+                    "file was edited or deleted while the execution used it. Restore "
+                    "the original bytes, or submit a new revision to freeze the "
+                    "current file content."
+                )
 
     def declared_output_files(self, run_id: str) -> list[str]:
         """Run-root-relative paths the committed workflow *declared* it would produce.
@@ -949,6 +1000,10 @@ class StorageLayout:
         glob. Traversal segments and absolute paths are dropped.
         """
         data = self.read_json(self.resolve(run_id, "run.json")) or {}
+        return self._declared_output_files_from_data(data)
+
+    @staticmethod
+    def _declared_output_files_from_data(data: dict[str, Any]) -> list[str]:
         candidates: list[str] = []
         for spec in (data.get("result_specs") or []):
             if isinstance(spec, dict):
@@ -974,9 +1029,26 @@ class StorageLayout:
 
     def write_results_manifest(self, run_id: str, definition_revision_id: str) -> Path:
         run_root = self.resolve(run_id)
-        run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
+        # A newer definition may have been submitted while this execution was
+        # running. Result provenance must use the definition that actually ran,
+        # not the mutable pointer in run.json.
+        run_data = self.read_definition_snapshot(run_id, definition_revision_id)
+        if run_data is None:
+            run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
         submitted_inputs = {
             entry.get("path") for entry in (run_data.get("workspace_files") or [])
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
+        # The sweep attributes only files no earlier execution has already
+        # published: a previous revision's manifest keeps provenance for what
+        # it claimed, so a dead rule's output from an older definition is
+        # never republished under this one.
+        target = self.resolve(run_id, "results.manifest.json")
+        previous_manifest = self.read_json(target) or {}
+        previously_published = {
+            entry.get("path") for entry in (
+                previous_manifest.get("files", []) + previous_manifest.get("workflow_files", [])
+            )
             if isinstance(entry, dict) and isinstance(entry.get("path"), str)
         }
         entries: list[dict[str, Any]] = []
@@ -1000,7 +1072,7 @@ class StorageLayout:
         # Declared outputs first (rule all / result_specs), then nested results/**
         # for templates that use that layout -- so both a flat and a results/-rooted
         # template surface their actual products.
-        for rel in self.declared_output_files(run_id):
+        for rel in self._declared_output_files_from_data(run_data):
             try:
                 add(self.resolve(run_id, rel))
             except ValueError:
@@ -1019,7 +1091,9 @@ class StorageLayout:
             rel = path.relative_to(run_root).as_posix()
             if rel in submitted_inputs or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
                 continue
-            if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/")):
+            if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/", "definitions/")):
+                continue
+            if rel in previously_published:
                 continue
             if any(part.endswith("_idx") for part in Path(rel).parts):
                 continue
@@ -1043,7 +1117,6 @@ class StorageLayout:
         entries.sort(key=lambda entry: entry["path"])
         journal_seq = self.recover_seq(run_id)
         revision_id = f"rev-{journal_seq:08d}"
-        previous_manifest = self.read_json(self.resolve(run_id, "results.manifest.json")) or {}
         manifest = {
             "schema_version": 2,
             "run_id": run_id,
@@ -1055,7 +1128,6 @@ class StorageLayout:
             "files": entries,
             "workflow_files": sorted(workflow_entries, key=lambda entry: entry["path"]),
         }
-        target = self.resolve(run_id, "results.manifest.json")
         self.atomic_write_json(self.resolve(run_id, "revisions", f"{revision_id}.json"), manifest)
         self.atomic_write_json(target, manifest)
         return target
@@ -1085,10 +1157,103 @@ class StorageLayout:
             return None
         return self.read_json(self.resolve(run_id, "revisions", f"{revision_id}.json"))
 
+    def write_definition_snapshot(self, run_id: str, definition: dict[str, Any]) -> Path:
+        """Persist one small immutable definition without copying run outputs."""
+        revision_id = str(definition.get("definition_revision_id", ""))
+        if not __import__("re").fullmatch(r"def-[a-f0-9]{24}", revision_id):
+            raise ValueError(f"invalid definition revision id: {revision_id!r}")
+        target = self.resolve(run_id, "definitions", f"{revision_id}.json")
+        self.atomic_write_json(target, definition)
+        return target
+
+    def read_definition_snapshot(self, run_id: str, revision_id: str) -> Optional[dict[str, Any]]:
+        if not __import__("re").fullmatch(r"def-[a-f0-9]{24}", revision_id):
+            return None
+        return self.read_json(self.resolve(run_id, "definitions", f"{revision_id}.json"))
+
+    def definition_snapshots(self, run_id: str) -> list[dict[str, Any]]:
+        directory = self.resolve(run_id, "definitions")
+        if not directory.is_dir():
+            return []
+        snapshots = [self.read_json(path) for path in directory.glob("def-*.json")]
+        return sorted(
+            (item for item in snapshots if isinstance(item, dict)),
+            key=lambda item: str(item.get("created_at", "")),
+            reverse=True,
+        )
+
     def blob_path(self, digest: str) -> Path:
         if not __import__("re").fullmatch(r"[a-f0-9]{64}", digest):
             raise ValueError("invalid blob digest")
         return self.data / "store" / digest[:2] / digest
+
+    def referenced_blob_digests(self) -> set[str]:
+        """Return blobs reachable from active or recoverable Run records.
+
+        Definitions retain input blobs; execution manifests retain published
+        result/workflow blobs. The filesystem is the durable source here, so
+        this remains correct after SQLite/index loss or a Backend restart.
+        """
+        digests: set[str] = set()
+        run_roots = [self.data / "runs", self.trash / "runs"]
+        for runs_root in run_roots:
+            if not runs_root.is_dir():
+                continue
+            for run_dir in runs_root.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                candidates = [
+                    *run_dir.glob("definitions/def-*.json"),
+                    *run_dir.glob("revisions/rev-*.json"),
+                    run_dir / "results.manifest.json",
+                ]
+                for path in candidates:
+                    document = self.read_json(path)
+                    if not isinstance(document, dict):
+                        continue
+                    raw_entries = [
+                        *(document.get("workspace_files") or []),
+                        *(document.get("files") or []),
+                        *(document.get("workflow_files") or []),
+                    ]
+                    for entry in raw_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        for field in ("blob_hash", "sha256"):
+                            value = entry.get(field)
+                            if isinstance(value, str) and __import__("re").fullmatch(r"[a-f0-9]{64}", value):
+                                digests.add(value)
+        return digests
+
+    def gc_unreferenced_blobs(self, *, min_age_seconds: float = 300.0) -> list[str]:
+        """Delete old CAS blobs unreachable from active/trash Run records.
+
+        The grace period protects an upload that has finished but has not yet
+        been attached to its definition. Callers may use zero only while
+        holding their own higher-level upload/submission lock.
+        """
+        reachable = self.referenced_blob_digests()
+        now = time.time()
+        removed: list[str] = []
+        store = self.data / "store"
+        if not store.is_dir():
+            return removed
+        for shard in store.iterdir():
+            if not shard.is_dir() or shard.name == ".incoming":
+                continue
+            for blob in shard.iterdir():
+                if not blob.is_file() or not __import__("re").fullmatch(r"[a-f0-9]{64}", blob.name):
+                    continue
+                if blob.name in reachable:
+                    continue
+                try:
+                    if now - blob.stat().st_mtime < min_age_seconds:
+                        continue
+                    blob.unlink()
+                    removed.append(blob.name)
+                except OSError:
+                    logger.warning("CAS blob could not be collected: %s", blob)
+        return removed
 
     def _engine_pid_alive(self, run_id: str) -> bool:
         """Whether the recorded Snakemake process is still the same process."""
@@ -1255,6 +1420,10 @@ class StorageLayout:
         if not target.is_dir():
             raise FileNotFoundError(run_id)
         self.remove_tree(target)
+        # Purge is the explicit ownership boundary: only now may bytes that
+        # were reachable solely from this Run become collectible. Keep a short
+        # grace period for concurrent upload/submission races.
+        self.gc_unreferenced_blobs()
 
     def trashed_run_dirs(self) -> list[Path]:
         root = self.trash / "runs"
@@ -1293,8 +1462,8 @@ def _resolve_backend_root() -> Path:
 def get_tools_root() -> Path:
     """Compute tools root directory (topfd/toppic/msconvert etc local executables).
 
-    Node packages are part of the resolved Backend deployment and live at its
-    sibling ``nodes/`` directory. There is one path calculation for execution
+    Node packages are part of the resolved Backend deployment and live under its
+    data root's ``nodes/`` directory. There is one path calculation for execution
     and enumeration; no separate tools-root deployment variable is required.
     """
     from pathlib import Path as _Path

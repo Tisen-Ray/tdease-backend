@@ -74,7 +74,9 @@ build-backend = "hatchling.build"
 packages = ["app", "src"]
 # The composition root lives at the repository root (not inside `src/`), so it is
 # shipped as a top-level module -- docs/design/THREE-REPOSITORY-ARCHITECTURE.md §4.1.
-py-modules = ["cli"]
+# hatchling has no `py-modules` option (that is setuptools syntax, silently
+# ignored); force-include is what actually lands cli.py at the wheel root.
+force-include = { "cli.py" = "cli.py" }
 
 [tool.coverage.run]
 source = ["app", "src"]

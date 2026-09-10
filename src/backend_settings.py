@@ -84,7 +84,11 @@ def _object(value: object, name: str) -> Mapping[str, Any]:
 
 def _read_config(config_path: str | Path | None) -> tuple[Mapping[str, Any], Path]:
     if config_path is None:
-        root = Path(__file__).resolve().parents[1] / "data" / "backend"
+        # Import-time placeholder only: the CLI (`serve`/`worker`) requires
+        # --config, so no real process runs unconfigured. The placeholder still
+        # must not live inside the code tree — anything that ever executed
+        # against it would write runtime data into the installation.
+        root = Path.home() / ".tdnexus" / "backend-data"
         return {}, root.resolve()
     source = Path(config_path).expanduser().resolve()
     try:
@@ -113,15 +117,21 @@ def load_backend_settings(
     raw, data_root = _read_config(config_path)
     configured_node_root = raw.get("nodeRoot")
     if configured_node_root is None:
-        # One deployment root: the node catalog hangs off the data root.
-        # Deployments that keep read-only assets elsewhere (packaged desktop)
-        # set nodeRoot explicitly.
-        node_root = data_root / "nodes"
+        # Backend owns its compute catalog. Desktop/System remains a separate
+        # root: <TDnexus-Data>/backend/nodes vs <TDnexus-Data>/system.
+        node_root = (data_root / "nodes").resolve()
     elif isinstance(configured_node_root, str) and configured_node_root.strip():
         config_base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
         node_root = (config_base / configured_node_root).resolve()
     else:
         raise RuntimeError("nodeRoot must be a non-empty path string")
+    try:
+        node_root.relative_to(data_root)
+    except ValueError:
+        raise RuntimeError(
+            "nodeRoot must be under dataRoot: Backend compute software belongs "
+            "in TDnexus-Data/backend/nodes"
+        ) from None
     server = _object(raw.get("server"), "server")
     auth = _object(raw.get("auth"), "auth")
     resources = _object(raw.get("resources"), "resources")

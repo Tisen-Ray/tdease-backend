@@ -113,13 +113,29 @@ def _strip_inline_comment(line: str) -> str:
     return line.rstrip()
 
 
+def _split_inline_comment(line: str) -> tuple[str, str | None]:
+    """Split a line into (code, comment). The comment is the parameter's
+    usage note and feeds the AI-facing digest."""
+    in_single = in_double = False
+    for i, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i].rstrip(), line[i + 1:].strip()
+    return line.rstrip(), None
+
+
 def _split_named_fields(section_text: str) -> list[dict[str, str]]:
     """Parse a `input:` / `output:` / `params:` body into named entries.
 
-    Each entry: {name, pattern}. For unnamed entries name == pattern.
+    Each entry: {name, pattern[, comment]}. For unnamed entries name == pattern.
     Lambdas (params:) are captured verbatim as `pattern` so the AI can read
     the default value from the lambda body. Inline `# comments` are stripped
-    (quote-aware, so a `#` inside a string literal survives).
+    from the pattern (quote-aware, so a `#` inside a string literal survives)
+    but NOT discarded: a comment is attached to the entry named on the same
+    line — the parameter's usage note, surfaced verbatim in the node digest.
     """
     entries: list[dict[str, str]] = []
     # Strip inline comments line-by-line BEFORE comma-splitting, so a `#`
@@ -135,6 +151,20 @@ def _split_named_fields(section_text: str) -> list[dict[str, str]]:
             entries.append({"name": m.group(1), "pattern": m.group(2).strip()})
         else:
             entries.append({"name": line, "pattern": line})
+    # Re-attach inline comments: a comment belongs to the entry named on the
+    # same line; a continuation line's comment falls to the entry named there,
+    # else to the last entry. Additive only — parsing above is unchanged.
+    by_name: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], entry)
+    for line in section_text.split("\n"):
+        _code, comment = _split_inline_comment(line)
+        if not comment:
+            continue
+        named = [name for name in by_name if re.search(rf"\b{re.escape(name)}\s*=", line)]
+        target = by_name[named[-1]] if named else (entries[-1] if entries else None)
+        if target is not None:
+            target.setdefault("comment", comment)
     return entries
 
 
@@ -153,6 +183,10 @@ def _extract_capabilities(rules_text: str) -> list[dict[str, Any]]:
             "outputs": outputs,
             "params": params,
             "message": message,
+            # The invocation contract: HOW the executable is addressed (a
+            # `nodes/<id>/...` relative path or a quoted absolute path). Without
+            # it, a digest reader invents a bare command name and hunts PATH.
+            "shell": sections.get("shell", "").strip(),
         })
     return capabilities
 
@@ -218,12 +252,15 @@ def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
 
     Names starting with `_` are reserved for templates and drafts and are
     skipped: a copyable starting point (`_template/`) must be able to sit in
-    the node root without appearing in the catalog or failing a Run.
+    the node root without appearing in the catalog or failing a Run. Dot-prefixed
+    directories are internal state, never packages (`.snapshots` history), and
+    are skipped the same way.
     """
     if not root.is_dir():
         return [], []
     nodes, errors = [], []
-    for package_dir in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("_")):
+    for package_dir in sorted(path for path in root.iterdir()
+                              if path.is_dir() and not path.name.startswith(("_", "."))):
         try:
             nodes.append(project_package(package_dir))
         except (OSError, ValueError) as exc:
@@ -279,10 +316,12 @@ def platform_id() -> str:
 
 
 def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[str, Any]]]:
-    """Validate that each binding still resolves to the same deployed node
-    (by id + content digest). Rule-name lists on bindings are no longer
-    enforced — the capabilities are derived from rules.smk at scan time, so
-    a binding just pins identity.
+    """Validate that each binding names a deployed node, and return the pairs.
+
+    The catalog IS deployment state: a Run binds a node by id, and executions
+    use whatever bytes the catalog currently holds. The digest a definition
+    records at submit time is provenance ("authored against this content"),
+    never an enforcement — redeploying a package does not invalidate Runs.
 
     A malformed package somewhere in the catalog (missing rules.smk,
     unreadable, …) is deployment noise, not a Run blocker: GET /api/nodes
@@ -296,33 +335,18 @@ def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[st
         node = by_id.get(binding.id)
         if not node:
             raise ValueError(f"node not found: {binding.id}")
-        if node["digest"] != binding.digest:
-            raise ValueError(f"node identity changed: {binding.id}")
         resolved.append((binding, node))
     return resolved
 
 
-def materialize_bindings(
-    target_root: Path,
-    resolved: list[tuple[Any, dict[str, Any]]],
-    link_package,
-) -> None:
-    """Expose each bound package at <target>/nodes/<id>/ as a link onto the catalog.
+def bound_node_paths(resolved: list[tuple[Any, dict[str, Any]]]) -> dict[str, str]:
+    """Absolute catalog package directory per bound node id, for the engine config.
 
-    A Run resolves its nodes through the SAME directory the catalog deploys —
-    `<target>/nodes/<id>` is a directory junction (Windows) or symlink (POSIX)
-    onto the package, so the rules' relative `nodes/<id>...` paths work without
-    duplicating hundreds of megabytes per Run. The binding's digest still names
-    the identity that was resolved. A platform that refuses the link fails the
-    Run with a clear error instead of silently storing a private copy.
+    The engine request carries these as `config["nodes"] = {<id>: <abs path>}`;
+    node rules.smk files resolve their own package from that mapping. This is
+    the whole tool binding: nothing is written under the Run directory.
     """
-    for binding, node in resolved:
-        package_dir = node["package_dir"]
-        destination = target_root / "nodes" / binding.id
-        if link_package is not None and link_package(package_dir, destination):
-            continue
-        raise ValueError(
-            f"node package {binding.id} cannot be linked into the Run directory; a Run "
-            "never stores its own copy of a node package -- check that the node catalog "
-            "and the Backend data root are on a filesystem that supports directory links"
-        )
+    return {
+        binding.id: str(node["package_dir"]).replace("\\", "/")
+        for binding, node in resolved
+    }

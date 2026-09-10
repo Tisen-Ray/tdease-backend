@@ -28,7 +28,6 @@ def _config(tmp_path: Path, port: int) -> Path:
         "environment": "test",
         "deploymentMode": "local",
         "dataRoot": ".",
-        "nodeRoot": str(tmp_path / "nodes"),
         "server": {"host": "127.0.0.1", "port": port},
         "auth": {"mode": "local"},
         "logging": {"level": "INFO"},
