@@ -1,1 +1,1 @@
-"""TDEase-nexus — zero-architecture mass spectrometry backend."""
+"""TDEaseNexus — zero-architecture mass spectrometry backend."""

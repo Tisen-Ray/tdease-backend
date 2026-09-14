@@ -1,1 +1,1 @@
-"""TDEase-nexus schemas."""
+"""TDEaseNexus schemas."""

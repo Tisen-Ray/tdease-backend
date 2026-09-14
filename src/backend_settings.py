@@ -88,7 +88,7 @@ def _read_config(config_path: str | Path | None) -> tuple[Mapping[str, Any], Pat
         # --config, so no real process runs unconfigured. The placeholder still
         # must not live inside the code tree — anything that ever executed
         # against it would write runtime data into the installation.
-        root = Path.home() / ".tdnexus" / "backend-data"
+        root = Path.home() / ".tdeasenexus" / "backend-data"
         return {}, root.resolve()
     source = Path(config_path).expanduser().resolve()
     try:
@@ -118,7 +118,7 @@ def load_backend_settings(
     configured_node_root = raw.get("nodeRoot")
     if configured_node_root is None:
         # Backend owns its compute catalog. Desktop/System remains a separate
-        # root: <TDnexus-Data>/backend/nodes vs <TDnexus-Data>/system.
+        # root: <TDEaseNexus-Data>/backend/nodes vs <TDEaseNexus-Data>/system.
         node_root = (data_root / "nodes").resolve()
     elif isinstance(configured_node_root, str) and configured_node_root.strip():
         config_base = (
@@ -134,7 +134,7 @@ def load_backend_settings(
     except ValueError:
         raise RuntimeError(
             "nodeRoot must be under dataRoot: Backend compute software belongs "
-            "in TDnexus-Data/backend/nodes"
+            "in TDEaseNexus-Data/backend/nodes"
         ) from None
     server = _object(raw.get("server"), "server")
     auth = _object(raw.get("auth"), "auth")

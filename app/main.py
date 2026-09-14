@@ -1,5 +1,5 @@
 """
-TDEase-nexus API Server — a minimal FastAPI backend.
+TDEaseNexus API Server — a minimal FastAPI backend.
 
 Does exactly four things:
 1. Accept Run commits and enqueue them
@@ -62,7 +62,7 @@ from src.services.workspace_roots import configure_workspace_root_runtime
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("TDEase-nexus starting (env=%s)", BACKEND_SETTINGS.environment)
+    logger.info("TDEaseNexus starting (env=%s)", BACKEND_SETTINGS.environment)
     from src.execution_runtime.storage import get_storage
     storage = get_storage()
     storage.bootstrap()
@@ -82,9 +82,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Run index rebuild failed; filesystem fallbacks remain available")
     logger.info("Database ready: %s", db_path)
 
-    logger.info("TDEase-nexus ready")
+    logger.info("TDEaseNexus ready")
     yield
-    logger.info("TDEase-nexus shutting down")
+    logger.info("TDEaseNexus shutting down")
 
 # ---------------------------------------------------------------------------
 # App
@@ -95,7 +95,7 @@ _service_generation = BACKEND_SETTINGS.backend_generation or _service_instance_i
 _service_started_at = datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(
-    title="TDEase-nexus",
+    title="TDEaseNexus",
     description="Zero-architecture mass spectrometry workflow backend",
     version="0.2.0",
     docs_url=None if _is_prod else "/docs",
@@ -197,7 +197,7 @@ register_error_handlers(app)
 @app.get("/")
 async def root():
     return {
-        "name": "TDEase-nexus",
+        "name": "TDEaseNexus",
         "version": "0.2.0",
         "environment": BACKEND_SETTINGS.environment,
     }

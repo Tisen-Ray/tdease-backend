@@ -1,5 +1,5 @@
 """
-TDEase-nexus status enums — the system's single lifecycle field and its
+TDEaseNexus status enums — the system's single lifecycle field and its
 auxiliary types.
 
 Design constraints:

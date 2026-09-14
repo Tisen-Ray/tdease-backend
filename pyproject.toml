@@ -1,8 +1,9 @@
 [project]
 name = "tdease-backend"
 version = "0.2.0"
-description = "TDEase-nexus — Zero-architecture mass spectrometry backend"
+description = "TDEaseNexus — Zero-architecture mass spectrometry backend"
 readme = "README.md"
+license = "GPL-3.0-or-later"
 requires-python = ">=3.11,<3.15"
 dependencies = [
     # Web framework

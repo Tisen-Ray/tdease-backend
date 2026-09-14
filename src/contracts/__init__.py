@@ -1,4 +1,4 @@
-"""TDEase-nexus contract layer — authoritative definitions of all entity types in the system."""
+"""TDEaseNexus contract layer — authoritative definitions of all entity types in the system."""
 
 from .enums import (
     CANCELLABLE_STATUSES,

@@ -1,1 +1,1 @@
-"""TDEase-nexus API routes."""
+"""TDEaseNexus API routes."""

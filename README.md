@@ -12,7 +12,7 @@ mass-spectrometry analysis platform.
 | `src/` | Execution runtime: Snakemake engine, storage layer, workspace containment, backend settings |
 
 The backend consumes [tdease-ai-capability](https://github.com/Tisen-Ray/tdease-ai-capability)
-for scientific computation (Rust `tdnexus-toolbox` CLI + Agent Skills) but **does not
+for scientific computation (Rust `tdeasenexus-toolbox` CLI + Agent Skills) but **does not
 contain** scientific algorithms itself — those live in the capability toolkit.
 
 ## Quick start
@@ -34,9 +34,9 @@ consume the Scientific System only through public commands or protocols; it neve
 Desktop implementation paths.
 
 The node catalog belongs to Backend data. If Backend `dataRoot` is
-`<TDnexus-Data>/backend`, packages live at
-`<TDnexus-Data>/backend/nodes/`. Desktop/System remains a separate root at
-`<TDnexus-Data>/system/`. The catalog root is derived from `dataRoot` and a
+`<TDEaseNexus-Data>/backend`, packages live at
+`<TDEaseNexus-Data>/backend/nodes/`. Desktop/System remains a separate root at
+`<TDEaseNexus-Data>/system/`. The catalog root is derived from `dataRoot` and a
 path outside it is rejected at startup. Production does not use
 environment-variable path discovery.
 
