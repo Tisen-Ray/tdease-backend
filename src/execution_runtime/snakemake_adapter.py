@@ -128,7 +128,9 @@ class SnakemakeAdapter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt"
+                else 0,
                 start_new_session=os.name != "nt",
             )
         except OSError as exc:
@@ -253,9 +255,7 @@ class SnakemakeAdapter:
         self, start: float, exit_code: int, message: str
     ) -> SnakemakeExecutionResult:
         elapsed = time.perf_counter() - start
-        self.storage.append_task_output(
-            self.run_id, self.TASK_ID, "stderr", message
-        )
+        self.storage.append_task_output(self.run_id, self.TASK_ID, "stderr", message)
         self.emitter.task_failed(self.TASK_ID, exit_code, elapsed, message)
         return SnakemakeExecutionResult(False, exit_code, elapsed, message)
 
@@ -321,7 +321,9 @@ class SnakemakeAdapter:
         try:
             return lock_dir.is_dir() and any(lock_dir.iterdir())
         except OSError as exc:
-            raise RuntimeError(f"workflow-engine lock state could not be inspected: {exc}") from exc
+            raise RuntimeError(
+                f"workflow-engine lock state could not be inspected: {exc}"
+            ) from exc
 
     def _stale_lock_recovery_error(self) -> str | None:
         from src.execution_runtime.storage import process_identity_alive
@@ -332,7 +334,9 @@ class SnakemakeAdapter:
         except (FileNotFoundError, OSError):
             return "stale workflow-engine lock recovery requires the global execution lease"
         if owner.split(":", 1)[0] != str(os.getpid()):
-            return "stale workflow-engine lock recovery lease belongs to another process"
+            return (
+                "stale workflow-engine lock recovery lease belongs to another process"
+            )
 
         process = self.storage.read_json(self.run_root / self.PROCESS_RECORD_PATH) or {}
         engine_pid = process.get("engine_pid")

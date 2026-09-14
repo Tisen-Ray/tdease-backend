@@ -45,7 +45,9 @@ class ProfileReport:
     valid: bool
     violations: list[ProfileViolation] = field(default_factory=list)
     rule_count: int = 0
-    job_count: int = 0  # populated by the frontend DAG parser; here = best-effort estimate
+    job_count: int = (
+        0  # populated by the frontend DAG parser; here = best-effort estimate
+    )
 
     def errors(self) -> list[str]:
         return [f"rule '{v.rule}': {v.message}" for v in self.violations]
@@ -54,10 +56,31 @@ class ProfileReport:
 # ── Section keywords (Snakemake directive set) ─────────────────────────────────
 
 _SECTION_KEYWORDS = {
-    "input", "output", "shell", "script", "run", "threads", "params",
-    "log", "message", "resources", "priority", "wildcard_constraints",
-    "conda", "container", "wrapper", "benchmark", "notebook", "cwl", "cache",
-    "version", "name", "group", "shadow", "handover", "default_target",
+    "input",
+    "output",
+    "shell",
+    "script",
+    "run",
+    "threads",
+    "params",
+    "log",
+    "message",
+    "resources",
+    "priority",
+    "wildcard_constraints",
+    "conda",
+    "container",
+    "wrapper",
+    "benchmark",
+    "notebook",
+    "cwl",
+    "cache",
+    "version",
+    "name",
+    "group",
+    "shadow",
+    "handover",
+    "default_target",
 }
 
 # Directives that disqualify a rule from the static Profile regardless of body.
@@ -68,6 +91,7 @@ _DISQUALIFYING_DIRECTIVES = {
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
 
 def validate_snakefile_profile(snakefile: str) -> ProfileReport:
     """Validate a Snakefile against the TDEase static-parseable Profile.
@@ -81,15 +105,21 @@ def validate_snakefile_profile(snakefile: str) -> ProfileReport:
     except Exception as e:  # pragma: no cover - defensive
         return ProfileReport(
             valid=False,
-            violations=[ProfileViolation(rule="<parse>", message=str(e), kind="parse-error")],
+            violations=[
+                ProfileViolation(rule="<parse>", message=str(e), kind="parse-error")
+            ],
         )
 
     if not rules:
         return ProfileReport(
             valid=False,
-            violations=[ProfileViolation(
-                rule="<parse>", message="No rules found in Snakefile", kind="parse-error",
-            )],
+            violations=[
+                ProfileViolation(
+                    rule="<parse>",
+                    message="No rules found in Snakefile",
+                    kind="parse-error",
+                )
+            ],
         )
 
     for rule in rules:
@@ -99,11 +129,14 @@ def validate_snakefile_profile(snakefile: str) -> ProfileReport:
         valid=len(violations) == 0,
         violations=violations,
         rule_count=len(rules),
-        job_count=len(rules),  # static estimate; per-wildcard expansion is the frontend's job
+        job_count=len(
+            rules
+        ),  # static estimate; per-wildcard expansion is the frontend's job
     )
 
 
 # ── Rule splitting ─────────────────────────────────────────────────────────────
+
 
 @dataclass
 class _RawRule:
@@ -133,7 +166,11 @@ def _split_rules(source: str) -> list[_RawRule]:
             continue
         if current is not None:
             # End the rule at the next top-level non-blank, non-comment line.
-            if line and not line.startswith((" ", "\t")) and not line.lstrip().startswith("#"):
+            if (
+                line
+                and not line.startswith((" ", "\t"))
+                and not line.lstrip().startswith("#")
+            ):
                 rules.append(current)
                 current = None
             else:
@@ -145,11 +182,16 @@ def _split_rules(source: str) -> list[_RawRule]:
 
 # ── Per-rule validation ───────────────────────────────────────────────────────
 
+
 def _validate_rule(rule: _RawRule) -> list[ProfileViolation]:
     out: list[ProfileViolation] = []
 
     if rule.is_checkpoint:
-        out.append(ProfileViolation(rule.name, "'checkpoint' not supported in static Profile", "checkpoint"))
+        out.append(
+            ProfileViolation(
+                rule.name, "'checkpoint' not supported in static Profile", "checkpoint"
+            )
+        )
 
     sections = _extract_sections(rule.lines)
 
@@ -158,28 +200,39 @@ def _validate_rule(rule: _RawRule) -> list[ProfileViolation]:
     #    the canonical Snakemake DAG root; it produces no file and runs no
     #    shell, so it is statically trivial and must be allowed.
     is_aggregator = (
-        "input" in sections and sections["input"].strip()
+        "input" in sections
+        and sections["input"].strip()
         and not sections.get("output", "").strip()
         and ("shell" not in sections or not sections["shell"].strip())
     )
     if is_aggregator:
         # Aggregators still must not use dynamic input patterns.
         if _looks_dynamic(sections["input"]):
-            out.append(ProfileViolation(
-                rule.name,
-                "input contains a dynamic expression (lambda/function call) — "
-                "only literal patterns with {wildcards} are supported",
-                "dynamic-input",
-            ))
+            out.append(
+                ProfileViolation(
+                    rule.name,
+                    "input contains a dynamic expression (lambda/function call) — "
+                    "only literal patterns with {wildcards} are supported",
+                    "dynamic-input",
+                )
+            )
         return out
 
     if "shell" not in sections or not sections["shell"].strip():
-        out.append(ProfileViolation(rule.name, "only shell rules are supported (no shell directive found)", "no-shell"))
+        out.append(
+            ProfileViolation(
+                rule.name,
+                "only shell rules are supported (no shell directive found)",
+                "no-shell",
+            )
+        )
 
     # 2. disqualifying directives.
     for kw, msg in _DISQUALIFYING_DIRECTIVES.items():
         if kw in sections and sections[kw].strip():
-            out.append(ProfileViolation(rule.name, f"'{kw}' {msg}", "unsupported-directive"))
+            out.append(
+                ProfileViolation(rule.name, f"'{kw}' {msg}", "unsupported-directive")
+            )
 
     # 3. input/output must be literal patterns (no lambda / function calls).
     for field_name in ("input", "output"):
@@ -187,12 +240,14 @@ def _validate_rule(rule: _RawRule) -> list[ProfileViolation]:
         if not body.strip():
             continue
         if _looks_dynamic(body):
-            out.append(ProfileViolation(
-                rule.name,
-                f"{field_name} contains a dynamic expression (lambda/function call) — "
-                "only literal patterns with {wildcards} are supported",
-                "dynamic-input",
-            ))
+            out.append(
+                ProfileViolation(
+                    rule.name,
+                    f"{field_name} contains a dynamic expression (lambda/function call) — "
+                    "only literal patterns with {wildcards} are supported",
+                    "dynamic-input",
+                )
+            )
 
     return out
 
@@ -237,6 +292,7 @@ def _looks_dynamic(section_body: str) -> bool:
 
 
 # ── Section extraction (text-based, indentation-aware) ────────────────────────
+
 
 def _extract_sections(body_lines: list[str]) -> dict[str, str]:
     """Slice a rule body into {keyword: raw_body_text}.

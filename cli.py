@@ -43,9 +43,14 @@ def _worker(args: argparse.Namespace) -> int:
 
 def _worker_command(args: argparse.Namespace) -> list[str]:
     command = [
-        sys.executable, "-m", "cli", "worker",
-        "--config", str(args.config.resolve()),
-        "--parent-pid", str(os.getpid()),
+        sys.executable,
+        "-m",
+        "cli",
+        "worker",
+        "--config",
+        str(args.config.resolve()),
+        "--parent-pid",
+        str(os.getpid()),
     ]
     if args.allow_env_overrides:
         command.append("--allow-env-overrides")
@@ -71,18 +76,23 @@ def _supervise_worker(
     crashes: list[float] = []
     while not stop.is_set():
         started = time.monotonic()
-        child = subprocess.Popen(_worker_command(args), cwd=Path(__file__).resolve().parent)
+        child = subprocess.Popen(
+            _worker_command(args), cwd=Path(__file__).resolve().parent
+        )
         workers.append(child)
         while child.poll() is None and not stop.wait(0.5):
             pass
         if stop.is_set():
             return
         print(
-            json.dumps({
-                "type": "worker_exited",
-                "code": child.returncode,
-                "uptime_s": round(time.monotonic() - started, 1),
-            }, separators=(",", ":")),
+            json.dumps(
+                {
+                    "type": "worker_exited",
+                    "code": child.returncode,
+                    "uptime_s": round(time.monotonic() - started, 1),
+                },
+                separators=(",", ":"),
+            ),
             file=sys.stderr,
             flush=True,
         )
@@ -90,7 +100,10 @@ def _supervise_worker(
         crashes = [stamp for stamp in crashes if now - stamp < 60] + [now]
         if len(crashes) >= 3:
             print(
-                json.dumps({"type": "worker_unstable", "crashes": len(crashes)}, separators=(",", ":")),
+                json.dumps(
+                    {"type": "worker_unstable", "crashes": len(crashes)},
+                    separators=(",", ":"),
+                ),
                 file=sys.stderr,
                 flush=True,
             )
@@ -123,22 +136,33 @@ def _serve(args: argparse.Namespace) -> int:
             except (AttributeError, IndexError, OSError):
                 bound = settings.bind_port
             print(
-                json.dumps({
-                    "type": "ready",
-                    "baseUrl": f"http://{settings.bind_host}:{bound}",
-                }, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "type": "ready",
+                        "baseUrl": f"http://{settings.bind_host}:{bound}",
+                    },
+                    separators=(",", ":"),
+                ),
                 flush=True,
             )
 
-    server = ReadyServer(uvicorn.Config(
-        app,
-        host=settings.bind_host,
-        port=settings.bind_port,
-        log_level=logging_name(settings.log_level),
-    ))
+    server = ReadyServer(
+        uvicorn.Config(
+            app,
+            host=settings.bind_host,
+            port=settings.bind_port,
+            log_level=logging_name(settings.log_level),
+        )
+    )
     supervisor = threading.Thread(
         target=_supervise_worker,
-        args=(args, stop, unstable, workers, lambda: setattr(server, "should_exit", True)),
+        args=(
+            args,
+            stop,
+            unstable,
+            workers,
+            lambda: setattr(server, "should_exit", True),
+        ),
         daemon=True,
     )
     supervisor.start()

@@ -17,8 +17,7 @@ STATUS_BY_EVENT: dict[str, str] = dict(_RULES["statuses"])
 TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(_RULES["terminal_events"])
 EXECUTION_MODES: frozenset[str] = frozenset(_RULES["execution_modes"])
 REQUIRED_DATA: dict[str, tuple[str, ...]] = {
-    event_type: tuple(fields)
-    for event_type, fields in _RULES["required_data"].items()
+    event_type: tuple(fields) for event_type, fields in _RULES["required_data"].items()
 }
 ALLOWED_FROM: dict[str, tuple[Optional[str], ...]] = {
     event_type: tuple(statuses)
@@ -110,7 +109,9 @@ def _lifecycle_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
         reconstructable = {"revision_id", "mode"}
         hard_missing = [name for name in missing if name not in reconstructable]
         if hard_missing:
-            raise ValueError(f"{event_type} missing required data: {', '.join(hard_missing)}")
+            raise ValueError(
+                f"{event_type} missing required data: {', '.join(hard_missing)}"
+            )
     mode = data.get("mode")
     if mode is not None and mode not in EXECUTION_MODES:
         raise ValueError(f"{event_type} has invalid execution mode: {mode}")
@@ -206,7 +207,9 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
             else current_revision_id
         )
         if active_revision is not None and revision_id != active_revision:
-            raise ValueError(f"{event_type} revision does not match the active revision")
+            raise ValueError(
+                f"{event_type} revision does not match the active revision"
+            )
         if had_open_range:
             active = ranges[open_range_index]
             ranges[open_range_index] = ExecutionRange(

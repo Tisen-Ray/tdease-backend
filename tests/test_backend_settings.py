@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 import pytest
 
@@ -50,7 +49,9 @@ def test_environment_is_ignored_without_explicit_development_opt_in(tmp_path) ->
     environ = {"TDEASE_BACKEND_PORT": "54321", "TDEASE_ENV": "development"}
 
     production = load_backend_settings(config, environ=environ)
-    development = load_backend_settings(config, allow_env_overrides=True, environ=environ)
+    development = load_backend_settings(
+        config, allow_env_overrides=True, environ=environ
+    )
 
     assert production.bind_port == 43123
     assert production.environment == "production"

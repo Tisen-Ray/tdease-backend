@@ -20,6 +20,7 @@ from src.contracts.errors import ErrorCode, TDEaseError
 @dataclass
 class Rule:
     """Parsed TDEase rule — transient object."""
+
     name: str
     lineno: int
     snakefile: str
@@ -37,6 +38,7 @@ class Rule:
 @dataclass
 class Workflow:
     """Parsed TDEase workflow — transient object."""
+
     snakefile: str
     rules: list[Rule] = field(default_factory=list)
     rule_index: dict[str, Rule] = field(default_factory=dict)
@@ -45,8 +47,10 @@ class Workflow:
 
 # ── Token helpers ──
 
+
 def _is(tok: tokenize.TokenInfo, *types: int) -> bool:
     return tok.type in types
+
 
 NAME = tokenize.NAME
 OP = tokenize.OP
@@ -63,14 +67,19 @@ NUMBER = tokenize.NUMBER
 def _unquote(s: str) -> str:
     s = s.strip()
     if len(s) >= 2:
-        if (s.startswith('"""') and s.endswith('"""')) or (s.startswith("'''") and s.endswith("'''")):
+        if (s.startswith('"""') and s.endswith('"""')) or (
+            s.startswith("'''") and s.endswith("'''")
+        ):
             return s[3:-3]
-        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        if (s.startswith('"') and s.endswith('"')) or (
+            s.startswith("'") and s.endswith("'")
+        ):
             return s[1:-1]
     return s
 
 
 # ── Parser ──
+
 
 def parse_snakefile(source: str, path: str = "<snakefile>") -> Workflow:
     """
@@ -122,7 +131,6 @@ def _split_rules(tokens: list, path: str) -> list[list]:
     current: list = []
     in_rule = False
     indent_depth = 0
-    rule_indent = 0
 
     for tok in tokens:
         if _is(tok, ENDMARKER):
@@ -134,7 +142,6 @@ def _split_rules(tokens: list, path: str) -> list[list]:
                     blocks.append(current)
                 current = [tok]
                 in_rule = True
-                rule_indent = 0
             continue
 
         current.append(tok)
@@ -240,7 +247,14 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
             elif keyword == "run":
                 rule.unsupported.append("run")
                 idx = _skip_section(tokens, idx)
-            elif keyword in ("benchmark", "conda", "container", "wrapper", "notebook", "cwl"):
+            elif keyword in (
+                "benchmark",
+                "conda",
+                "container",
+                "wrapper",
+                "notebook",
+                "cwl",
+            ):
                 rule.unsupported.append(keyword)
                 idx = _skip_section(tokens, idx)
             else:
@@ -252,6 +266,7 @@ def _parse_rule_block(tokens: list, path: str) -> Rule:
 
 
 # ── Section parsers ──
+
 
 def _parse_io(tokens: list, start: int, rule: Rule, kind: str) -> int:
     """Parse input:/output: — collect strings (indented sub-blocks supported)."""
@@ -293,9 +308,15 @@ def _parse_io(tokens: list, start: int, rule: Rule, kind: str) -> int:
         elif _is(tok, NAME):
             if tok.string == "expand" or tok.string == "lambda":
                 # skip function calls — just advance past this line
-                while idx < len(tokens) and not (_is(tokens[idx], NEWLINE) or _is(tokens[idx], NL)):
+                while idx < len(tokens) and not (
+                    _is(tokens[idx], NEWLINE) or _is(tokens[idx], NL)
+                ):
                     idx += 1
-                if in_block and idx < len(tokens) and (_is(tokens[idx], NEWLINE) or _is(tokens[idx], NL)):
+                if (
+                    in_block
+                    and idx < len(tokens)
+                    and (_is(tokens[idx], NEWLINE) or _is(tokens[idx], NL))
+                ):
                     idx += 1
                     continue
                 break
@@ -345,7 +366,11 @@ def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> in
                 peek = idx + 1
                 while peek < len(tokens) and _is(tokens[peek], (COMMENT, NL)):
                     peek += 1
-                continues = attr == "shellcmd" and peek < len(tokens) and _is(tokens[peek], STRING)
+                continues = (
+                    attr == "shellcmd"
+                    and peek < len(tokens)
+                    and _is(tokens[peek], STRING)
+                )
                 if not continues:
                     if cmd_parts and attr == "shellcmd":
                         setattr(rule, attr, " ".join(cmd_parts))
@@ -376,7 +401,14 @@ def _parse_string_section(tokens: list, start: int, rule: Rule, attr: str) -> in
         # For shellcmd: capture unquoted arguments (NAME, NUMBER, OP tokens)
         if attr == "shellcmd" and found:
             # Snakemake {input}/{output} macros — preserve as-is
-            if _is(tok, NAME) and tok.string in ("{input}", "{output}", "{params}", "{wildcards}", "{threads}", "{resources}"):
+            if _is(tok, NAME) and tok.string in (
+                "{input}",
+                "{output}",
+                "{params}",
+                "{wildcards}",
+                "{threads}",
+                "{resources}",
+            ):
                 cmd_parts.append(tok.string)
                 idx += 1
                 continue
@@ -430,8 +462,11 @@ def _parse_int_section(tokens: list, start: int, rule: Rule, attr: str) -> int:
             continue
         elif _is(tok, NAME):
             if not found:
-                try: setattr(rule, attr, int(tok.string)); found = True
-                except ValueError: break
+                try:
+                    setattr(rule, attr, int(tok.string))
+                    found = True
+                except ValueError:
+                    break
             else:
                 break
             idx += 1

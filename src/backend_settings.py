@@ -121,7 +121,11 @@ def load_backend_settings(
         # root: <TDnexus-Data>/backend/nodes vs <TDnexus-Data>/system.
         node_root = (data_root / "nodes").resolve()
     elif isinstance(configured_node_root, str) and configured_node_root.strip():
-        config_base = Path(config_path).expanduser().resolve().parent if config_path else Path.cwd()
+        config_base = (
+            Path(config_path).expanduser().resolve().parent
+            if config_path
+            else Path.cwd()
+        )
         node_root = (config_base / configured_node_root).resolve()
     else:
         raise RuntimeError("nodeRoot must be a non-empty path string")
@@ -164,9 +168,16 @@ def load_backend_settings(
 
     return BackendSettings(
         environment=environment,
-        deployment_mode=cast(DeploymentMode, _enum(deployment, "deploymentMode", "local", {"local", "remote"})),
-        auth_mode=cast(AuthMode, _enum(auth_mode, "auth.mode", "local", {"local", "bearer"})),
-        bootstrap_secret=str(bootstrap_secret).strip() or None if bootstrap_secret is not None else None,
+        deployment_mode=cast(
+            DeploymentMode,
+            _enum(deployment, "deploymentMode", "local", {"local", "remote"}),
+        ),
+        auth_mode=cast(
+            AuthMode, _enum(auth_mode, "auth.mode", "local", {"local", "bearer"})
+        ),
+        bootstrap_secret=str(bootstrap_secret).strip() or None
+        if bootstrap_secret is not None
+        else None,
         bind_host=host or "127.0.0.1",
         bind_port=_port(port),
         backend_generation=None,
@@ -203,8 +214,15 @@ def resolve_runtime_inventory(
         except importlib_metadata.PackageNotFoundError:
             engine_version = "unknown"
     return RuntimeInventory(
-        logical_cpus=max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1)),
-        total_memory_mb=max(1, total_memory_mb if total_memory_mb is not None else int(psutil.virtual_memory().total // MIB)),
+        logical_cpus=max(
+            1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1)
+        ),
+        total_memory_mb=max(
+            1,
+            total_memory_mb
+            if total_memory_mb is not None
+            else int(psutil.virtual_memory().total // MIB),
+        ),
         engine_name="snakemake",
         engine_version=engine_version,
         execution_profile="desktop-local",

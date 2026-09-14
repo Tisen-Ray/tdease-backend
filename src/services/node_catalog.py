@@ -16,6 +16,7 @@ The scanner derives everything else from rules.smk by reusing the same
 text-slicing logic the Profile validator uses (so node capabilities and the
 submittable Profile stay in lockstep).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -33,7 +34,9 @@ def _package_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
         if path.is_symlink():
-            raise ValueError(f"node package cannot contain symlinks: {path.relative_to(root)}")
+            raise ValueError(
+                f"node package cannot contain symlinks: {path.relative_to(root)}"
+            )
         files.append(path)
     return files
 
@@ -123,7 +126,7 @@ def _split_inline_comment(line: str) -> tuple[str, str | None]:
         elif ch == '"' and not in_single:
             in_double = not in_double
         elif ch == "#" and not in_single and not in_double:
-            return line[:i].rstrip(), line[i + 1:].strip()
+            return line[:i].rstrip(), line[i + 1 :].strip()
     return line.rstrip(), None
 
 
@@ -161,7 +164,9 @@ def _split_named_fields(section_text: str) -> list[dict[str, str]]:
         _code, comment = _split_inline_comment(line)
         if not comment:
             continue
-        named = [name for name in by_name if re.search(rf"\b{re.escape(name)}\s*=", line)]
+        named = [
+            name for name in by_name if re.search(rf"\b{re.escape(name)}\s*=", line)
+        ]
         target = by_name[named[-1]] if named else (entries[-1] if entries else None)
         if target is not None:
             target.setdefault("comment", comment)
@@ -177,17 +182,19 @@ def _extract_capabilities(rules_text: str) -> list[dict[str, Any]]:
         outputs = _split_named_fields(sections.get("output", ""))
         params = _split_named_fields(sections.get("params", ""))
         message = sections.get("message", "").strip().strip('"').strip("'")
-        capabilities.append({
-            "name": raw_rule.name,
-            "inputs": inputs,
-            "outputs": outputs,
-            "params": params,
-            "message": message,
-            # The invocation contract: HOW the executable is addressed (a
-            # `nodes/<id>/...` relative path or a quoted absolute path). Without
-            # it, a digest reader invents a bare command name and hunts PATH.
-            "shell": sections.get("shell", "").strip(),
-        })
+        capabilities.append(
+            {
+                "name": raw_rule.name,
+                "inputs": inputs,
+                "outputs": outputs,
+                "params": params,
+                "message": message,
+                # The invocation contract: HOW the executable is addressed (a
+                # `nodes/<id>/...` relative path or a quoted absolute path). Without
+                # it, a digest reader invents a bare command name and hunts PATH.
+                "shell": sections.get("shell", "").strip(),
+            }
+        )
     return capabilities
 
 
@@ -214,6 +221,7 @@ def _extract_description(rules_text: str, readme: str) -> str:
 
 
 # ── Public scanner API ───────────────────────────────────────────────────────
+
 
 def project_package(package_dir: Path) -> dict[str, Any]:
     """Project a node package directory into its public catalog record.
@@ -259,8 +267,11 @@ def scan_nodes(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if not root.is_dir():
         return [], []
     nodes, errors = [], []
-    for package_dir in sorted(path for path in root.iterdir()
-                              if path.is_dir() and not path.name.startswith(("_", "."))):
+    for package_dir in sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and not path.name.startswith(("_", "."))
+    ):
         try:
             nodes.append(project_package(package_dir))
         except (OSError, ValueError) as exc:
@@ -284,38 +295,53 @@ def scan_node_catalog(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     """
     resolved = Path(os.path.normpath(str(root)))
     if not root.exists():
-        return [], [{
-            "path": str(resolved),
-            "error": (
-                f"node catalog does not exist: {resolved} -- deploy node packages "
-                "under the configured Backend data root"
-            ),
-            "node_root": str(resolved),
-        }]
+        return [], [
+            {
+                "path": str(resolved),
+                "error": (
+                    f"node catalog does not exist: {resolved} -- deploy node packages "
+                    "under the configured Backend data root"
+                ),
+                "node_root": str(resolved),
+            }
+        ]
     if not root.is_dir():
-        return [], [{
-            "path": str(resolved),
-            "error": f"node catalog is not a directory: {resolved}",
-            "node_root": str(resolved),
-        }]
+        return [], [
+            {
+                "path": str(resolved),
+                "error": f"node catalog is not a directory: {resolved}",
+                "node_root": str(resolved),
+            }
+        ]
     try:
         next(iter(root.iterdir()), None)
     except OSError as exc:
-        return [], [{
-            "path": str(resolved),
-            "error": f"node catalog is not readable: {resolved} ({exc})",
-            "node_root": str(resolved),
-        }]
+        return [], [
+            {
+                "path": str(resolved),
+                "error": f"node catalog is not readable: {resolved} ({exc})",
+                "node_root": str(resolved),
+            }
+        ]
     return scan_nodes(root)
 
 
 def platform_id() -> str:
     import sys
-    os_name = "win" if sys.platform == "win32" else "linux" if sys.platform.startswith("linux") else "macos"
+
+    os_name = (
+        "win"
+        if sys.platform == "win32"
+        else "linux"
+        if sys.platform.startswith("linux")
+        else "macos"
+    )
     return f"{os_name}-x64"
 
 
-def resolve_bindings(root: Path, bindings: list[Any]) -> list[tuple[Any, dict[str, Any]]]:
+def resolve_bindings(
+    root: Path, bindings: list[Any]
+) -> list[tuple[Any, dict[str, Any]]]:
     """Validate that each binding names a deployed node, and return the pairs.
 
     The catalog IS deployment state: a Run binds a node by id, and executions

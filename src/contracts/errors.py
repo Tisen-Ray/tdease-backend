@@ -274,9 +274,7 @@ _SECRET_KEY_PATTERN = re.compile(
 
 # Windows drive-letter absolute path (`C:\...` / `C:/...`), UNC share
 # (`\\host\share\...`), or a POSIX-style leading `/`.
-_ABSOLUTE_PATH_PATTERN = re.compile(
-    r"^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\|/)"
-)
+_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\|/)")
 
 _REDACTED_VALUE = "[redacted]"
 _REDACTED_PATH_VALUE = "[redacted-path]"

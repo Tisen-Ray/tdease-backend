@@ -88,7 +88,9 @@ def _project_loop() -> None:
             except Exception:
                 index.mark_dirty()
                 _retry_later(database, run_id, events[-1])
-                logger.exception("Run event projection deferred; filesystem truth is intact")
+                logger.exception(
+                    "Run event projection deferred; filesystem truth is intact"
+                )
         for _ in batch:
             _QUEUE.task_done()
 

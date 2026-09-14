@@ -26,7 +26,9 @@ class NodeBinding(BaseModel):
         description="Full Node package sha256",
         pattern=r"^[a-f0-9]{64}$",
     )
-    rules: list[str] = Field(default_factory=list, description="Public rule names used by this run")
+    rules: list[str] = Field(
+        default_factory=list, description="Public rule names used by this run"
+    )
 
 
 class ResultSpec(BaseModel):
@@ -47,12 +49,16 @@ class ResultSpec(BaseModel):
         pattern=r"^[a-zA-Z0-9_.:-]+$",
     )
     name: str = Field(description="Display name")
-    kind: str = Field(description="Result kind (e.g. feature_table), used for grouping and selectors")
+    kind: str = Field(
+        description="Result kind (e.g. feature_table), used for grouping and selectors"
+    )
     dimensions: dict[str, str] = Field(
         default_factory=dict,
         description="Declared dimension values (e.g. {sample: sample-a}); keys are stable identifiers, values are strings",
     )
-    output: str = Field(description="Run-root-relative artifact path, used to join with the file manifest")
+    output: str = Field(
+        description="Run-root-relative artifact path, used to join with the file manifest"
+    )
     _validate_output = field_validator("output")(_validate_path_no_traversal)
 
 
@@ -128,7 +134,9 @@ class RunCommit(BaseModel):
     # compute budget; callers who send these fields are rejected by name
     # (`_reject_removed_commit_fields`). Kept on the model because the worker,
     # the engine request, and run.json all consume the injected values.
-    cores: int = Field(default=4, description="Backend-injected CPU core budget", ge=1, le=256)
+    cores: int = Field(
+        default=4, description="Backend-injected CPU core budget", ge=1, le=256
+    )
     memory_mb: Optional[int] = Field(
         default=None,
         ge=128,
@@ -182,6 +190,7 @@ class RunCommit(BaseModel):
         description="User-defined labels for search and grouping",
     )
 
+
 class RunCreateRequest(BaseModel):
     """
     Request body for submitting a Run.
@@ -207,7 +216,9 @@ class RunDryRunResponse(BaseModel):
 
 
 class WorkflowGraphNode(WorkflowJobNode):
-    status: Literal["waiting", "up_to_date", "running", "succeeded", "failed", "cancelled"]
+    status: Literal[
+        "waiting", "up_to_date", "running", "succeeded", "failed", "cancelled"
+    ]
     wildcards: dict[str, str] = Field(default_factory=dict)
 
 

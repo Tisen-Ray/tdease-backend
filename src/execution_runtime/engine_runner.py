@@ -14,6 +14,7 @@ Internalization of Snakemake's `.snakemake/` directory:
   POSIX falls back to os.symlink (target_is_directory=True); if that fails
   (permissions), we let upstream create a real `.snakemake/` as a degraded mode.
 """
+
 from __future__ import annotations
 
 import os
@@ -85,13 +86,19 @@ def _projection_from_dag(dag) -> dict:
     jobs = list(engine_dag.jobs)
     return {
         "nodes": [
-            {"id": engine_dag.jobid(job), "rule": job.rule.name, "label": job.rule.name,
-             "initial_status": "waiting" if engine_dag.needrun(job) else "up_to_date",
-             # The engine already clamped rule threads to the Run core budget
-             # (min(rule threads, cores)) when the DAG was built; projecting the
-             # resolved values keeps that degradation observable, not silent.
-             "threads": job.threads,
-             "resources": _declared_resources(job)}
+            {
+                "id": engine_dag.jobid(job),
+                "rule": job.rule.name,
+                "label": job.rule.name,
+                "initial_status": "waiting"
+                if engine_dag.needrun(job)
+                else "up_to_date",
+                # The engine already clamped rule threads to the Run core budget
+                # (min(rule threads, cores)) when the DAG was built; projecting the
+                # resolved values keeps that degradation observable, not silent.
+                "threads": job.threads,
+                "resources": _declared_resources(job),
+            }
             for job in jobs
         ],
         "edges": [
@@ -116,6 +123,7 @@ class _JobEventHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         from snakemake_interface_logger_plugins.common import LogEvent
+
         event = getattr(record, "event", None)
         mapping = {
             LogEvent.JOB_INFO: "job.started",
@@ -126,20 +134,32 @@ class _JobEventHandler(logging.Handler):
         job_id = getattr(record, "jobid", getattr(record, "job_id", None))
         rule = getattr(record, "rule_name", None)
         if event == LogEvent.JOB_INFO and job_id is not None and rule:
-            self.jobs[int(job_id)] = (str(rule), getattr(record, "wildcards", None) or {})
+            self.jobs[int(job_id)] = (
+                str(rule),
+                getattr(record, "wildcards", None) or {},
+            )
         if job_id is not None and not rule and int(job_id) in self.jobs:
             rule = self.jobs[int(job_id)][0]
         if event_type is not None and job_id is not None and rule:
             terminal_key = (event_type, int(job_id))
-            if event_type in {"job.succeeded", "job.failed"} and terminal_key in self.terminal:
+            if (
+                event_type in {"job.succeeded", "job.failed"}
+                and terminal_key in self.terminal
+            ):
                 return
             if event_type in {"job.succeeded", "job.failed"}:
                 self.terminal.add(terminal_key)
             saved_wildcards = self.jobs.get(int(job_id), ("", {}))[1]
-            payload = {"type": event_type, "job_id": int(job_id), "rule": str(rule),
-                       "wildcards": getattr(record, "wildcards", None) or saved_wildcards}
+            payload = {
+                "type": event_type,
+                "job_id": int(job_id),
+                "rule": str(rule),
+                "wildcards": getattr(record, "wildcards", None) or saved_wildcards,
+            }
             with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+                stream.write(
+                    json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+                )
                 stream.flush()
 
 
@@ -232,7 +252,9 @@ def main() -> int:
             # The DAG is always built: the resource feasibility assertion and
             # the projection both read resolved per-job values off it.
             dag.workflow_api._workflow._prepare_dag(
-                forceall=dag.dag_settings.forceall, ignore_incomplete=True, lock_warn_only=True
+                forceall=dag.dag_settings.forceall,
+                ignore_incomplete=True,
+                lock_warn_only=True,
             )
             dag.workflow_api._workflow._build_dag()
             projection = _projection_from_dag(dag)
@@ -241,7 +263,9 @@ def main() -> int:
             )
             if violations:
                 for violation in violations:
-                    print(f"TDEase resource budget exceeded: {violation}", file=sys.stderr)
+                    print(
+                        f"TDEase resource budget exceeded: {violation}", file=sys.stderr
+                    )
                 print(
                     "Remedy: lower the node's declared resource floor "
                     "(rules.smk resources) or raise this machine's budget.",
@@ -249,23 +273,30 @@ def main() -> int:
                 )
                 return 1
             if request.projection_path:
-                projection_target = (root / request.projection_path).resolve(strict=False)
+                projection_target = (root / request.projection_path).resolve(
+                    strict=False
+                )
                 projection_target.relative_to(root)
                 projection_target.parent.mkdir(parents=True, exist_ok=True)
                 # Atomic replace: a bare write_text killed mid-way (disk full,
                 # hard kill) leaves a partial file that the dry-run route would
                 # otherwise parse as a raw 500 instead of an invalid plan.
                 payload = json.dumps(projection, ensure_ascii=False)
-                tmp_target = projection_target.with_suffix(projection_target.suffix + ".tmp")
+                tmp_target = projection_target.with_suffix(
+                    projection_target.suffix + ".tmp"
+                )
                 tmp_target.write_text(payload, encoding="utf-8")
                 os.replace(tmp_target, projection_target)
             if request.mode == "execute" and request.job_event_path:
                 from snakemake.logging import logger as engine_logger
+
                 event_target = (root / request.job_event_path).resolve(strict=False)
                 event_target.relative_to(root)
                 event_target.parent.mkdir(parents=True, exist_ok=True)
                 with event_target.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"type": "workflow.graph", **projection}) + "\n")
+                    stream.write(
+                        json.dumps({"type": "workflow.graph", **projection}) + "\n"
+                    )
                 engine_logger.addHandler(_JobEventHandler(event_target))
             dag.execute_workflow(
                 executor="dryrun" if request.mode == "dry-run" else "local",

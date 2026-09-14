@@ -14,6 +14,7 @@ assignments) against the concrete `config`. Anything it cannot resolve cleanly i
 skipped, and the caller falls back to the `results/**` glob -- so an exotic
 Snakefile degrades to prior behaviour instead of raising.
 """
+
 from __future__ import annotations
 
 import ast
@@ -25,10 +26,29 @@ _MAX_DEPTH = 10
 
 # Snakemake rule-section keywords that terminate an `input:` body.
 _SECTION_KEYWORDS = {
-    "output", "params", "shell", "run", "script", "notebook", "wrapper",
-    "message", "log", "threads", "resources", "benchmark", "priority",
-    "group", "conda", "container", "shadow", "wildcard_constraints",
-    "default_target", "retries", "cache", "handover", "localrule",
+    "output",
+    "params",
+    "shell",
+    "run",
+    "script",
+    "notebook",
+    "wrapper",
+    "message",
+    "log",
+    "threads",
+    "resources",
+    "benchmark",
+    "priority",
+    "group",
+    "conda",
+    "container",
+    "shadow",
+    "wildcard_constraints",
+    "default_target",
+    "retries",
+    "cache",
+    "handover",
+    "localrule",
 }
 
 
@@ -68,6 +88,7 @@ def rule_all_outputs(snakefile_text: str, config: dict[str, Any] | None) -> list
 
 # ── Snakefile slicing ────────────────────────────────────────────────────────
 
+
 def _rule_block(text: str, name: str) -> str | None:
     lines = text.split("\n")
     header = re.compile(rf"^rule\s+{re.escape(name)}\s*:")
@@ -79,7 +100,7 @@ def _rule_block(text: str, name: str) -> str | None:
     if start is None:
         return None
     body = [lines[start]]
-    for line in lines[start + 1:]:
+    for line in lines[start + 1 :]:
         if line.strip() == "" or line[:1] in (" ", "\t"):
             body.append(line)
         else:
@@ -103,7 +124,7 @@ def _section_body(block: str, name: str) -> str | None:
     if idx is None:
         return None
     body = [rest]
-    for line in lines[idx + 1:]:
+    for line in lines[idx + 1 :]:
         if line.strip() == "":
             body.append(line)
             continue
@@ -129,6 +150,7 @@ def _top_level_assignments(text: str) -> dict[str, str]:
 
 
 # ── Expression evaluation (config-aware, Snakemake-free) ─────────────────────
+
 
 def _eval_output_element(node: ast.AST, config: dict, assignments: dict) -> list[str]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -195,10 +217,13 @@ def _safe_format(pattern: str, mapping: dict[str, str]) -> str:
         if key not in mapping:
             raise KeyError(key)
         return str(mapping[key])
+
     return _WILDCARD_RE.sub(repl, pattern)
 
 
-def _resolve_to_list(node: ast.AST, config: dict, assignments: dict, depth: int = 0) -> list[str]:
+def _resolve_to_list(
+    node: ast.AST, config: dict, assignments: dict, depth: int = 0
+) -> list[str]:
     if depth > _MAX_DEPTH:
         return []
     if isinstance(node, ast.Constant):
@@ -230,7 +255,11 @@ def _resolve_to_list(node: ast.AST, config: dict, assignments: dict, depth: int 
                 default = None
         value = config.get(key, default) if key is not None else default
         return _as_str_list(value)
-    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "config":
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "config"
+    ):
         key = _subscript_key(node)
         if key is not None:
             return _as_str_list(config.get(key))

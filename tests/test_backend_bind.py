@@ -23,16 +23,21 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 def _config(tmp_path: Path, port: int) -> Path:
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({
-        "schemaVersion": 1,
-        "environment": "test",
-        "deploymentMode": "local",
-        "dataRoot": ".",
-        "server": {"host": "127.0.0.1", "port": port},
-        "auth": {"mode": "local"},
-        "logging": {"level": "INFO"},
-        "resources": {},
-    }), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "environment": "test",
+                "deploymentMode": "local",
+                "dataRoot": ".",
+                "server": {"host": "127.0.0.1", "port": port},
+                "auth": {"mode": "local"},
+                "logging": {"level": "INFO"},
+                "resources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -50,9 +55,22 @@ def test_occupied_port_fails_closed(tmp_path: Path) -> None:
         holder.listen(1)
         occupied = int(holder.getsockname()[1])
         completed = subprocess.run(
-            [sys.executable, "-m", "cli", "serve", "--config", str(_config(tmp_path, occupied))],
-            cwd=BACKEND_ROOT, capture_output=True, text=True, timeout=120, check=False,
+            [
+                sys.executable,
+                "-m",
+                "cli",
+                "serve",
+                "--config",
+                str(_config(tmp_path, occupied)),
+            ],
+            cwd=BACKEND_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
         )
 
-    assert '"type":"ready"' not in completed.stdout, "a busy port must never report ready"
+    assert '"type":"ready"' not in completed.stdout, (
+        "a busy port must never report ready"
+    )
     assert completed.returncode != 0, completed.stdout + completed.stderr

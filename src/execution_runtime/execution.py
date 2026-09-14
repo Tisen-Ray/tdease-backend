@@ -13,10 +13,16 @@ from typing import Mapping, Sequence
 
 def backend_child_env() -> dict[str, str]:
     """Return the Backend execution environment without product config leakage."""
-    return {key: value for key, value in os.environ.items() if not key.startswith("TDEASE_")}
+    return {
+        key: value for key, value in os.environ.items() if not key.startswith("TDEASE_")
+    }
 
-from src.execution_runtime.storage import get_storage
-from src.execution_runtime.resource_budget import RESOURCE_BUDGET
+
+# Deliberately mid-file: these must import AFTER the helpers above define the
+# module's import-time environment (same snakemake import-order constraint as
+# engine_runner.main()).
+from src.execution_runtime.storage import get_storage  # noqa: E402
+from src.execution_runtime.resource_budget import RESOURCE_BUDGET  # noqa: E402
 
 
 def _isolate_engine_process(run_id: str, task_id: str, pid: int) -> None:
@@ -126,7 +132,8 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             # Windows: taskkill /T kills entire tree
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True, timeout=5,
+                capture_output=True,
+                timeout=5,
             )
         else:
             try:
@@ -145,5 +152,7 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
                 except subprocess.TimeoutExpired:
                     pass
     except Exception:
-        try: proc.kill()
-        except Exception: pass
+        try:
+            proc.kill()
+        except Exception:
+            pass

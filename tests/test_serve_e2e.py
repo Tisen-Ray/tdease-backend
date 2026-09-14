@@ -9,16 +9,21 @@ from urllib.request import urlopen
 
 def test_serve_starts_api_and_worker_from_json(tmp_path: Path) -> None:
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({
-        "schemaVersion": 1,
-        "environment": "development",
-        "deploymentMode": "local",
-        "dataRoot": "data",
-        "server": {"host": "127.0.0.1", "port": 0},
-        "auth": {"mode": "local"},
-        "logging": {"level": "WARNING"},
-        "resources": {},
-    }), encoding="utf-8")
+    config.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "environment": "development",
+                "deploymentMode": "local",
+                "dataRoot": "data",
+                "server": {"host": "127.0.0.1", "port": 0},
+                "auth": {"mode": "local"},
+                "logging": {"level": "WARNING"},
+                "resources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     process = subprocess.Popen(
         [sys.executable, "-m", "cli", "serve", "--config", str(config)],
@@ -31,7 +36,7 @@ def test_serve_starts_api_and_worker_from_json(tmp_path: Path) -> None:
         assert process.stdout is not None
         ready = json.loads(process.stdout.readline())
         assert ready["type"] == "ready"
-        with urlopen(f'{ready["baseUrl"]}/ready', timeout=10) as response:
+        with urlopen(f"{ready['baseUrl']}/ready", timeout=10) as response:
             assert response.status == 200
     finally:
         process.terminate()

@@ -68,7 +68,9 @@ def _materialize_run(commit: RunCommit, storage: StorageLayout) -> None:
                     "Workspace root capability is missing, revoked, or the Run path escapes it"
                 )
             storage.materialize_local_run_files(
-                storage.allocate_run(commit.run_id), workspace, commit.workspace_files,
+                storage.allocate_run(commit.run_id),
+                workspace,
+                commit.workspace_files,
                 user_id=commit.user_id,
             )
     else:
@@ -143,7 +145,9 @@ def _dequeue() -> dict | None:
         if not rj.exists():
             continue
         data = json.loads(rj.read_text(encoding="utf-8"))
-        projection, _snapshot = get_storage().project_run_snapshot(str(data.get("run_id", rd.name)))
+        projection, _snapshot = get_storage().project_run_snapshot(
+            str(data.get("run_id", rd.name))
+        )
         if projection.status != "QUEUED":
             continue
 
@@ -159,7 +163,9 @@ def _dequeue() -> dict | None:
                 queued_at = rj.stat().st_mtime
         candidates.append((queued_at, str(data.get("run_id", rd.name)), data))
 
-    for _queued_at, _run_id, data in sorted(candidates, key=lambda item: (item[0], item[1])):
+    for _queued_at, _run_id, data in sorted(
+        candidates, key=lambda item: (item[0], item[1])
+    ):
         try:
             if get_storage().claim_run(data["run_id"]):
                 return data
@@ -233,27 +239,39 @@ def execute_run(run_data: dict) -> None:
             # through to the failure handler below would append run.failed
             # from CANCELLED -- an illegal lifecycle transition that poisons
             # every future projection of this Run. There is nothing to execute.
-            wlog(f"[q?] {run_id} was cancelled inside the claim window; nothing to execute")
+            wlog(
+                f"[q?] {run_id} was cancelled inside the claim window; nothing to execute"
+            )
             return
-        if projection.status != RunStatus.QUEUED.value or not projection.current_revision_id:
+        if (
+            projection.status != RunStatus.QUEUED.value
+            or not projection.current_revision_id
+        ):
             raise RuntimeError(
                 f"Run {run_id} is not backed by a queued Journal revision "
                 f"(projection says {projection.status})"
             )
         revision_id = projection.current_revision_id
         queue_tag = f"q{projection.queued_at_seq}"
-        wlog(f"[{queue_tag}] claimed definition {revision_id} "
-             f"(mode={projection.queued_mode or 'execute'})")
+        wlog(
+            f"[{queue_tag}] claimed definition {revision_id} "
+            f"(mode={projection.queued_mode or 'execute'})"
+        )
         # A cancel flag left behind by an earlier execution must not self-cancel
         # this one: the flag names the queue_seq it targets, and a flag aimed at
         # any other (or unknown/legacy) execution is stale here and gets cleared.
-        if storage.check_cancelled(run_id) and storage.cancelled_queue_seq(run_id) != projection.queued_at_seq:
+        if (
+            storage.check_cancelled(run_id)
+            and storage.cancelled_queue_seq(run_id) != projection.queued_at_seq
+        ):
             storage.clear_cancelled(run_id)
             wlog(f"[{queue_tag}] cleared a stale cancel flag from another execution")
         # run.json is only the latest pointer. The queue event identifies the
         # definition that this execution must use, even when a newer edit arrived
         # after the old execution was queued.
-        queued_definition = storage.read_definition_snapshot(run_id, revision_id) or run_data
+        queued_definition = (
+            storage.read_definition_snapshot(run_id, revision_id) or run_data
+        )
 
         commit = RunCommit(
             run_id=run_id,
@@ -283,7 +301,8 @@ def execute_run(run_data: dict) -> None:
         stage = "queue-request"
         queue_event = next(
             (
-                event for event in storage.read_events(run_id)
+                event
+                for event in storage.read_events(run_id)
                 if event.get("type") == "run.queue_requested"
                 and projection.queued_at_seq is not None
                 and int(event.get("seq") or 0) == projection.queued_at_seq
@@ -301,39 +320,50 @@ def execute_run(run_data: dict) -> None:
         _index_run(run_data, storage)
         try:
             stage = "materialize"
-            wlog(f"[{queue_tag}] materializing {revision_id} "
-                 f"({commit.materialization_strategy}, {len(commit.workspace_files)} input(s), "
-                 f"{len(commit.nodes)} node binding(s))")
+            wlog(
+                f"[{queue_tag}] materializing {revision_id} "
+                f"({commit.materialization_strategy}, {len(commit.workspace_files)} input(s), "
+                f"{len(commit.nodes)} node binding(s))"
+            )
             _materialize_run(commit, storage)
             stage = "engine"
-            wlog(f"[{queue_tag}] engine starting (mode={execution_mode}, rerun={rerun_mode})")
+            wlog(
+                f"[{queue_tag}] engine starting (mode={execution_mode}, rerun={rerun_mode})"
+            )
             result = execute(
                 commit,
                 revision_id=revision_id,
                 execution_mode=execution_mode,
                 rerun_mode=rerun_mode,
             )
-            wlog(f"[{queue_tag}] engine finished success={result.success} "
-                 f"in {result.run_time_seconds:.1f}s")
+            wlog(
+                f"[{queue_tag}] engine finished success={result.success} "
+                f"in {result.run_time_seconds:.1f}s"
+            )
             if commit.materialization_strategy == "local_workspace_hardlink":
                 stage = "verify-inputs"
                 storage.verify_local_inputs(run_id)
                 wlog(f"[{queue_tag}] shared inputs verified unchanged")
         except TDEaseError as exc:
             from src.execution_runtime.runtime import ExecutionResult
+
             terminal_emitted = True
             wlog(f"[{queue_tag}] FAILED at {stage}: {exc}")
             EventEmitter(run_id).runtime_message("error", str(exc))
             result = ExecutionResult(success=False, exit_code=-1, error=exc)
             EventEmitter(run_id).run_failed(
                 revision_id=revision_id,
-                exit_code=-1, run_time_seconds=0.0, error_message=f"[{stage}] {exc}"
+                exit_code=-1,
+                run_time_seconds=0.0,
+                error_message=f"[{stage}] {exc}",
             )
         except Exception as exc:
             from src.execution_runtime.runtime import ExecutionResult
+
             terminal_emitted = True
             wlog(f"[{queue_tag}] FAILED at {stage}: {type(exc).__name__}: {exc}")
             import traceback
+
             try:
                 with storage.resolve(run_id, "logs", "tasks", "worker.log").open(
                     "a", encoding="utf-8"
@@ -345,7 +375,7 @@ def execute_run(run_data: dict) -> None:
                 code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
                 message=f"[{stage}] {exc}",
                 remedy="Read the run log (the worker section names the failing stage "
-                       "and ends with the traceback), then retry or repair the Run.",
+                "and ends with the traceback), then retry or repair the Run.",
                 retryable=False,
             )
             EventEmitter(run_id).runtime_message("error", str(error))
@@ -357,7 +387,9 @@ def execute_run(run_data: dict) -> None:
             # projection has a terminal fact instead of remaining RUNNING/QUEUED.
             EventEmitter(run_id).run_failed(
                 revision_id=revision_id,
-                exit_code=-1, run_time_seconds=0.0, error_message=f"[{stage}] {exc}"
+                exit_code=-1,
+                run_time_seconds=0.0,
+                error_message=f"[{stage}] {exc}",
             )
 
         manifest_path = None
@@ -389,6 +421,7 @@ def execute_run(run_data: dict) -> None:
         # claim invisibly.
         wlog(f"[{queue_tag}] FATAL at {stage}: {type(exc).__name__}: {exc}")
         import traceback
+
         try:
             with storage.resolve(run_id, "logs", "tasks", "worker.log").open(
                 "a", encoding="utf-8"
@@ -453,7 +486,9 @@ def run_loop(
         if stop_event and stop_event.is_set():
             return
         if parent_identity and not process_identity_alive(parent_identity):
-            logger.warning("Worker parent process is gone; exiting to avoid an orphan poller")
+            logger.warning(
+                "Worker parent process is gone; exiting to avoid an orphan poller"
+            )
             return
         try:
             # An idle worker must not monopolize the Backend-wide execution
@@ -487,6 +522,7 @@ def run_loop(
             break
         except Exception:
             import traceback
+
             traceback.print_exc()
             time.sleep(poll_interval)
 

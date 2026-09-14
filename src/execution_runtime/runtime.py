@@ -30,6 +30,7 @@ from src.execution_runtime.storage import get_storage, get_tools_root
 @dataclass
 class PreflightResult:
     """preflight() return value — transient view model, not persisted."""
+
     valid: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -42,6 +43,7 @@ class PreflightResult:
 @dataclass
 class ExecutionResult:
     """execute() return value."""
+
     success: bool
     exit_code: int | None = None
     error: TDEaseError | None = None
@@ -58,17 +60,53 @@ class ExecutionResult:
 # grep, sed, ...) are deliberately absent — on Windows they would only fail
 # at execution time, after minutes of compute. Leaving them out makes the
 # which() check in preflight fail fast with that answer.
-_SHELL_BUILTINS = frozenset({
-    "echo", "python", "python3", "mkdir", "cd", "true", "false",
-    "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
-    "case", "esac", "in", "export", "source", ".", "set", "unset",
-    "exec", "find", "printf", "date", "time", "test", "[",
-})
+_SHELL_BUILTINS = frozenset(
+    {
+        "echo",
+        "python",
+        "python3",
+        "mkdir",
+        "cd",
+        "true",
+        "false",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "while",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "in",
+        "export",
+        "source",
+        ".",
+        "set",
+        "unset",
+        "exec",
+        "find",
+        "printf",
+        "date",
+        "time",
+        "test",
+        "[",
+    }
+)
 # Proteomics tools — checked against PATH; .exe stripped on Windows
-_KNOWN_PROTEO_TOOLS = frozenset({
-    "topfd", "toppic", "topindex", "topmg", "topdiff", "topdia",
-    "msconvert",
-})
+_KNOWN_PROTEO_TOOLS = frozenset(
+    {
+        "topfd",
+        "toppic",
+        "topindex",
+        "topmg",
+        "topdiff",
+        "topdia",
+        "msconvert",
+    }
+)
 
 
 def preflight(commit: RunCommit) -> PreflightResult:
@@ -117,6 +155,7 @@ def preflight(commit: RunCommit) -> PreflightResult:
         tools.add(first)
 
     import shutil
+
     for tool in sorted(tools):
         if shutil.which(tool) is None and shutil.which(tool + ".exe") is None:
             errors.append(
@@ -185,9 +224,7 @@ def execute(
     # tool-related is ever written under the Run directory.
     from src.services.node_catalog import bound_node_paths, resolve_bindings
 
-    node_paths = bound_node_paths(
-        resolve_bindings(get_tools_root(), commit.nodes)
-    )
+    node_paths = bound_node_paths(resolve_bindings(get_tools_root(), commit.nodes))
     engine_request = WorkflowEngineRequest(
         mode="execute",
         snakefile="Snakefile",
@@ -222,8 +259,10 @@ def execute(
                 retryable=False,
                 details={"run_id": run_id},
             ),
-            run_time_seconds=time.perf_counter() - start, total_tasks=1,
-            final_seq=emitter.last_seq)
+            run_time_seconds=time.perf_counter() - start,
+            total_tasks=1,
+            final_seq=emitter.last_seq,
+        )
     if engine_result.success:
         succeeded = 1
     else:
@@ -234,13 +273,24 @@ def execute(
             message=f"Task failed: engine (exit {engine_result.exit_code})",
             remedy="Inspect the engine log for the failed task's stderr, then fix and rerun.",
             retryable=False,
-            details={"task_id": "engine", "exit_code": engine_result.exit_code,
-                     "reason": engine_result.stderr_tail},
+            details={
+                "task_id": "engine",
+                "exit_code": engine_result.exit_code,
+                "reason": engine_result.stderr_tail,
+            },
         )
-        emitter.run_failed(revision_id, engine_result.exit_code, total_elapsed, str(error))
-        return ExecutionResult(success=False, exit_code=engine_result.exit_code, error=error,
-            run_time_seconds=total_elapsed, total_tasks=1, failed_tasks=1,
-            final_seq=emitter.last_seq)
+        emitter.run_failed(
+            revision_id, engine_result.exit_code, total_elapsed, str(error)
+        )
+        return ExecutionResult(
+            success=False,
+            exit_code=engine_result.exit_code,
+            error=error,
+            run_time_seconds=total_elapsed,
+            total_tasks=1,
+            failed_tasks=1,
+            final_seq=emitter.last_seq,
+        )
 
     # Success is finalized by the Worker only after local-input verification
     # and atomic Result Manifest publication. Emitting run.succeeded here would

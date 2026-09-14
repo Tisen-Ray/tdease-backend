@@ -77,13 +77,23 @@ _TERMINAL_EVENT_BY_STATUS = {
 }
 
 
-def _project_lifecycle_metadata(events: list[dict[str, Any]], status: object) -> dict[str, Any]:
+def _project_lifecycle_metadata(
+    events: list[dict[str, Any]], status: object
+) -> dict[str, Any]:
     """Project public lifecycle metadata from the same event prefix as status."""
     status_text = str(status) if status is not None else ""
     if status_text == "QUEUED":
-        return {"started_at": None, "finished_at": None, "exit_code": None, "error": None}
+        return {
+            "started_at": None,
+            "finished_at": None,
+            "exit_code": None,
+            "error": None,
+        }
 
-    started = next((event for event in reversed(events) if event.get("type") == "run.started"), None)
+    started = next(
+        (event for event in reversed(events) if event.get("type") == "run.started"),
+        None,
+    )
     projected = {
         "started_at": started.get("timestamp") if started else None,
         "finished_at": None,
@@ -94,7 +104,10 @@ def _project_lifecycle_metadata(events: list[dict[str, Any]], status: object) ->
     if terminal_type is None:
         return projected
 
-    terminal = next((event for event in reversed(events) if event.get("type") == terminal_type), None)
+    terminal = next(
+        (event for event in reversed(events) if event.get("type") == terminal_type),
+        None,
+    )
     if terminal is None:
         return projected
     raw_data = terminal.get("data")
@@ -184,9 +197,14 @@ class StorageLayout:
         run_dir = self.data / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         for sub in [
-            "results", "logs", "logs/tasks", "config",
-            ".runtime", ".runtime/task-records",
-            ".runtime/incomplete", ".runtime/locks",
+            "results",
+            "logs",
+            "logs/tasks",
+            "config",
+            ".runtime",
+            ".runtime/task-records",
+            ".runtime/incomplete",
+            ".runtime/locks",
         ]:
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         return run_dir
@@ -208,7 +226,9 @@ class StorageLayout:
             p = p / seg
         resolved = os.path.normpath(str(p))
         base_str = os.path.normpath(str(base)) + os.sep
-        if not resolved.startswith(base_str) and resolved != os.path.normpath(str(base)):
+        if not resolved.startswith(base_str) and resolved != os.path.normpath(
+            str(base)
+        ):
             raise ValueError(f"Path escapes run dir: {segments}")
         return p
 
@@ -240,14 +260,18 @@ class StorageLayout:
                 os.close(fd)
             except OSError:
                 pass
-            try: os.unlink(tmp)
-            except OSError: pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             raise
         try:
             os.replace(tmp, target)
         except Exception:
-            try: os.unlink(tmp)
-            except OSError: pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             raise
         # Fsync parent directory for durability (Unix only -- Windows rejects dir fsync)
         if os.name != "nt":
@@ -258,14 +282,18 @@ class StorageLayout:
                 os.close(dfd)
 
     def atomic_write_json(self, target: Path, obj: dict | list) -> None:
-        self.atomic_write(target, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
+        self.atomic_write(
+            target, json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+        )
 
     def atomic_copy(self, source: Path, target: Path) -> None:
         """Atomically stream one file into Backend-owned storage."""
         source = Path(source)
         target = Path(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix="." + target.name + ".")
+        fd, tmp = tempfile.mkstemp(
+            dir=str(target.parent), prefix="." + target.name + "."
+        )
         try:
             with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
@@ -560,7 +588,9 @@ class StorageLayout:
             offset = next_offset
 
     @staticmethod
-    def tail_text_lines(path: Path, limit: int, chunk_size: int = 64 * 1024) -> list[str]:
+    def tail_text_lines(
+        path: Path, limit: int, chunk_size: int = 64 * 1024
+    ) -> list[str]:
         """Return a bounded line tail by seeking backward from file end."""
         if limit <= 0 or not path.is_file():
             return []
@@ -576,7 +606,11 @@ class StorageLayout:
                 chunk = stream.read(size)
                 chunks.append(chunk)
                 newline_count += chunk.count(b"\n")
-        return b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()[-limit:]
+        return (
+            b"".join(reversed(chunks))
+            .decode("utf-8", errors="replace")
+            .splitlines()[-limit:]
+        )
 
     def repair_events_file(self, run_id: str) -> int:
         """Truncate events.jsonl to its last complete, parseable line.
@@ -622,10 +656,12 @@ class StorageLayout:
         events = self.read_events(run_id)
         projection = project_run(events)
         lifecycle = _project_lifecycle_metadata(events, projection.status)
-        lifecycle.update({
-            "status": projection.status,
-            "projected_at_seq": projection.projected_at_seq,
-        })
+        lifecycle.update(
+            {
+                "status": projection.status,
+                "projected_at_seq": projection.projected_at_seq,
+            }
+        )
         return projection, lifecycle
 
     # -- Logs (deep operations) --
@@ -673,28 +709,42 @@ class StorageLayout:
                 destination.unlink(missing_ok=True)
                 path.replace(destination)
 
-        self.atomic_write_json(marker_path, {
-            "schema_version": 1,
-            "queue_seq": queue_seq,
-        })
+        self.atomic_write_json(
+            marker_path,
+            {
+                "schema_version": 1,
+                "queue_seq": queue_seq,
+            },
+        )
 
-    def append_runtime_record(self, run_id: str, level: str, message: str,
-                               task_id: str | None = None, max_mb: int = 50) -> None:
+    def append_runtime_record(
+        self,
+        run_id: str,
+        level: str,
+        message: str,
+        task_id: str | None = None,
+        max_mb: int = 50,
+    ) -> None:
         """Append a structured diagnostic record. Handles rotation automatically."""
         p = self._rotating_path(run_id, "logs", "runtime.jsonl", max_mb)
-        rec = json.dumps({
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "level": level,
-            "message": message,
-            "task_id": task_id,
-        }, ensure_ascii=False, default=str)
+        rec = json.dumps(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": level,
+                "message": message,
+                "task_id": task_id,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
         with open(p, "a", encoding="utf-8") as f:
             f.write(rec + "\n")
             f.flush()
             os.fsync(f.fileno())
 
-    def append_task_output(self, run_id: str, task_id: str, stream: str,
-                            text: str, max_kb: int = 1024) -> None:
+    def append_task_output(
+        self, run_id: str, task_id: str, stream: str, text: str, max_kb: int = 1024
+    ) -> None:
         """Append task stdout/stderr. Size-bounded; rotates past the cap."""
         task_dir = self.resolve(run_id, "logs", "tasks")
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -788,8 +838,9 @@ class StorageLayout:
         os.replace(tmp, dest)
         return h
 
-    def blob_put_stream(self, source, expected_digest: str,
-                        chunk_size: int = 8 * 1024 * 1024) -> tuple[str, int]:
+    def blob_put_stream(
+        self, source, expected_digest: str, chunk_size: int = 8 * 1024 * 1024
+    ) -> tuple[str, int]:
         """Stream an uploaded file into CAS with one pass and bounded memory."""
         incoming = self.data / "store" / ".incoming"
         incoming.mkdir(parents=True, exist_ok=True)
@@ -832,7 +883,9 @@ class StorageLayout:
         run_dir = self.allocate_run(run_id).resolve()
         for entry in entries:
             path = entry.path if hasattr(entry, "path") else entry["path"]
-            digest = entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
+            digest = (
+                entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
+            )
             target = (run_dir / path).resolve(strict=False)
             try:
                 target.relative_to(run_dir)
@@ -842,8 +895,9 @@ class StorageLayout:
                 raise FileNotFoundError(f"missing blob for {path}: {digest}")
             self._link_blob(digest, target)
 
-    def _local_sources(self, workspace_root: Path, entries: list[Any], *,
-                       user_id: str) -> list[tuple[str, Path, str, bool]]:
+    def _local_sources(
+        self, workspace_root: Path, entries: list[Any], *, user_id: str
+    ) -> list[tuple[str, Path, str, bool]]:
         """Resolve every frozen local entry to its approved, digest-matching source.
 
         Read-only: containment, existence and digest only. Submission's check and
@@ -858,13 +912,17 @@ class StorageLayout:
         is approved for anyone and every call here raises WORKSPACE_PATH_ESCAPE
         (fail-closed default).
         """
-        from src.execution_runtime.workspace_containment import validate_root_containment
+        from src.execution_runtime.workspace_containment import (
+            validate_root_containment,
+        )
 
         workspace_root = validate_root_containment(Path(workspace_root), user_id)
         resolved: list[tuple[str, Path, str, bool]] = []
         for entry in entries:
             rel = entry.path if hasattr(entry, "path") else entry["path"]
-            expected = entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
+            expected = (
+                entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
+            )
             source = (workspace_root / rel).resolve(strict=True)
             try:
                 source.relative_to(workspace_root)
@@ -872,11 +930,18 @@ class StorageLayout:
                 raise ValueError(f"local source escapes workspace: {rel}") from exc
             if self.file_digest(source) != expected:
                 raise ValueError(f"local source digest changed: {rel}")
-            is_control = rel == "Snakefile" or rel.endswith(".smk") or rel == "config.yaml" or rel.startswith("scripts/")
+            is_control = (
+                rel == "Snakefile"
+                or rel.endswith(".smk")
+                or rel == "config.yaml"
+                or rel.startswith("scripts/")
+            )
             resolved.append((rel, source, expected, is_control))
         return resolved
 
-    def verify_local_run_files(self, workspace_root: Path, entries: list[Any], *, user_id: str) -> None:
+    def verify_local_run_files(
+        self, workspace_root: Path, entries: list[Any], *, user_id: str
+    ) -> None:
         """Submission-time check that the frozen mapping still matches its sources.
 
         Writes nothing into the Run directory: a submission only verifies the
@@ -885,7 +950,9 @@ class StorageLayout:
         """
         self._local_sources(workspace_root, entries, user_id=user_id)
 
-    def seal_local_run_files(self, workspace_root: Path, entries: list[Any], *, user_id: str) -> None:
+    def seal_local_run_files(
+        self, workspace_root: Path, entries: list[Any], *, user_id: str
+    ) -> None:
         """Seal a verified local input mapping into CAS without touching the Run.
 
         The definition must remain executable if the Workspace changes or is
@@ -901,8 +968,14 @@ class StorageLayout:
             with source.open("rb") as stream:
                 self.blob_put_stream(stream, expected)
 
-    def materialize_local_run_files(self, target_dir: Path, workspace_root: Path,
-                                    entries: list[Any], *, user_id: str) -> None:
+    def materialize_local_run_files(
+        self,
+        target_dir: Path,
+        workspace_root: Path,
+        entries: list[Any],
+        *,
+        user_id: str,
+    ) -> None:
         """Expose frozen local inputs in `target_dir` WITHOUT copying them.
 
         One implementation for both the real run directory and a dry-run's
@@ -915,11 +988,14 @@ class StorageLayout:
         target_dir = Path(target_dir).resolve()
         previous = self.read_json(target_dir / ".tdease" / "local-inputs.json") or []
         previous_paths = {
-            item.get("path") for item in previous
+            item.get("path")
+            for item in previous
             if isinstance(item, dict) and isinstance(item.get("path"), str)
         }
         shared: list[dict[str, Any]] = []
-        for rel, source, expected, is_control in self._local_sources(workspace_root, entries, user_id=user_id):
+        for rel, source, expected, is_control in self._local_sources(
+            workspace_root, entries, user_id=user_id
+        ):
             target = (target_dir / rel).resolve(strict=False)
             target.relative_to(target_dir)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -935,7 +1011,14 @@ class StorageLayout:
                 if rel not in previous_paths:
                     try:
                         if os.path.samefile(source, target):
-                            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "hardlink"})
+                            shared.append(
+                                {
+                                    "path": rel,
+                                    "sha256": expected,
+                                    "source": str(source),
+                                    "strategy": "hardlink",
+                                }
+                            )
                             continue
                     except OSError:
                         pass
@@ -956,7 +1039,14 @@ class StorageLayout:
                     f"input {rel} cannot be sealed into the Backend CAS "
                     f"({getattr(exc, 'strerror', None) or exc})"
                 ) from exc
-            shared.append({"path": rel, "sha256": expected, "source": str(source), "strategy": "cas_hardlink"})
+            shared.append(
+                {
+                    "path": rel,
+                    "sha256": expected,
+                    "source": str(source),
+                    "strategy": "cas_hardlink",
+                }
+            )
         self.atomic_write_json(target_dir / ".tdease" / "local-inputs.json", shared)
 
     def _link_blob(self, digest: str, target: Path) -> None:
@@ -975,7 +1065,9 @@ class StorageLayout:
             raise
 
     def verify_local_inputs(self, run_id: str) -> None:
-        manifest = self.read_json(self.resolve(run_id, ".tdease", "local-inputs.json")) or []
+        manifest = (
+            self.read_json(self.resolve(run_id, ".tdease", "local-inputs.json")) or []
+        )
         for item in manifest:
             path = self.resolve(run_id, item["path"])
             if not path.is_file() or self.file_digest(path) != item["sha256"]:
@@ -1007,7 +1099,7 @@ class StorageLayout:
     @staticmethod
     def _declared_output_files_from_data(data: dict[str, Any]) -> list[str]:
         candidates: list[str] = []
-        for spec in (data.get("result_specs") or []):
+        for spec in data.get("result_specs") or []:
             if isinstance(spec, dict):
                 output = spec.get("output")
                 if isinstance(output, str) and output:
@@ -1015,6 +1107,7 @@ class StorageLayout:
         snakefile = data.get("snakefile")
         if isinstance(snakefile, str) and snakefile:
             from src.execution_runtime.declared_outputs import rule_all_outputs
+
             candidates.extend(rule_all_outputs(snakefile, data.get("config")))
 
         seen: set[str] = set()
@@ -1022,7 +1115,11 @@ class StorageLayout:
         for rel in candidates:
             normalized = rel.replace("\\", "/").lstrip("/")
             parts = normalized.split("/")
-            if not normalized or ".." in parts or (len(parts[0]) == 2 and parts[0][1] == ":"):
+            if (
+                not normalized
+                or ".." in parts
+                or (len(parts[0]) == 2 and parts[0][1] == ":")
+            ):
                 continue
             if normalized not in seen:
                 seen.add(normalized)
@@ -1038,7 +1135,8 @@ class StorageLayout:
         if run_data is None:
             run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
         submitted_inputs = {
-            entry.get("path") for entry in (run_data.get("workspace_files") or [])
+            entry.get("path")
+            for entry in (run_data.get("workspace_files") or [])
             if isinstance(entry, dict) and isinstance(entry.get("path"), str)
         }
         # The sweep attributes only files no earlier execution has already
@@ -1048,8 +1146,10 @@ class StorageLayout:
         target = self.resolve(run_id, "results.manifest.json")
         previous_manifest = self.read_json(target) or {}
         previously_published = {
-            entry.get("path") for entry in (
-                previous_manifest.get("files", []) + previous_manifest.get("workflow_files", [])
+            entry.get("path")
+            for entry in (
+                previous_manifest.get("files", [])
+                + previous_manifest.get("workflow_files", [])
             )
             if isinstance(entry, dict) and isinstance(entry.get("path"), str)
         }
@@ -1060,7 +1160,11 @@ class StorageLayout:
             if not path.is_file():
                 return
             try:
-                rel = path.resolve(strict=False).relative_to(run_root.resolve()).as_posix()
+                rel = (
+                    path.resolve(strict=False)
+                    .relative_to(run_root.resolve())
+                    .as_posix()
+                )
             except ValueError:
                 return
             if rel in seen:
@@ -1091,9 +1195,23 @@ class StorageLayout:
             if not path.is_file():
                 continue
             rel = path.relative_to(run_root).as_posix()
-            if rel in submitted_inputs or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
+            if rel in submitted_inputs or rel in {
+                "run.json",
+                "events.jsonl",
+                "results.manifest.json",
+            }:
                 continue
-            if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/", "definitions/")):
+            if rel.startswith(
+                (
+                    ".runtime/",
+                    ".tdease/",
+                    ".snakemake/",
+                    "nodes/",
+                    "logs/",
+                    "revisions/",
+                    "definitions/",
+                )
+            ):
                 continue
             if rel in previously_published:
                 continue
@@ -1114,7 +1232,9 @@ class StorageLayout:
             digest = self.file_digest(source)
             with source.open("rb") as stream:
                 self.blob_put_stream(stream, digest)
-            workflow_entries.append({"path": rel, "size": source.stat().st_size, "sha256": digest})
+            workflow_entries.append(
+                {"path": rel, "size": source.stat().st_size, "sha256": digest}
+            )
 
         entries.sort(key=lambda entry: entry["path"])
         journal_seq = self.recover_seq(run_id)
@@ -1130,7 +1250,9 @@ class StorageLayout:
             "files": entries,
             "workflow_files": sorted(workflow_entries, key=lambda entry: entry["path"]),
         }
-        self.atomic_write_json(self.resolve(run_id, "revisions", f"{revision_id}.json"), manifest)
+        self.atomic_write_json(
+            self.resolve(run_id, "revisions", f"{revision_id}.json"), manifest
+        )
         self.atomic_write_json(target, manifest)
         return target
 
@@ -1154,12 +1276,16 @@ class StorageLayout:
             reverse=True,
         )
 
-    def revision_manifest(self, run_id: str, revision_id: str) -> Optional[dict[str, Any]]:
+    def revision_manifest(
+        self, run_id: str, revision_id: str
+    ) -> Optional[dict[str, Any]]:
         if not __import__("re").fullmatch(r"rev-[0-9]{8,}", revision_id):
             return None
         return self.read_json(self.resolve(run_id, "revisions", f"{revision_id}.json"))
 
-    def write_definition_snapshot(self, run_id: str, definition: dict[str, Any]) -> Path:
+    def write_definition_snapshot(
+        self, run_id: str, definition: dict[str, Any]
+    ) -> Path:
         """Persist one small immutable definition without copying run outputs."""
         revision_id = str(definition.get("definition_revision_id", ""))
         if not __import__("re").fullmatch(r"def-[a-f0-9]{24}", revision_id):
@@ -1168,10 +1294,14 @@ class StorageLayout:
         self.atomic_write_json(target, definition)
         return target
 
-    def read_definition_snapshot(self, run_id: str, revision_id: str) -> Optional[dict[str, Any]]:
+    def read_definition_snapshot(
+        self, run_id: str, revision_id: str
+    ) -> Optional[dict[str, Any]]:
         if not __import__("re").fullmatch(r"def-[a-f0-9]{24}", revision_id):
             return None
-        return self.read_json(self.resolve(run_id, "definitions", f"{revision_id}.json"))
+        return self.read_json(
+            self.resolve(run_id, "definitions", f"{revision_id}.json")
+        )
 
     def definition_snapshots(self, run_id: str) -> list[dict[str, Any]]:
         directory = self.resolve(run_id, "definitions")
@@ -1223,7 +1353,9 @@ class StorageLayout:
                             continue
                         for field in ("blob_hash", "sha256"):
                             value = entry.get(field)
-                            if isinstance(value, str) and __import__("re").fullmatch(r"[a-f0-9]{64}", value):
+                            if isinstance(value, str) and __import__("re").fullmatch(
+                                r"[a-f0-9]{64}", value
+                            ):
                                 digests.add(value)
         return digests
 
@@ -1244,7 +1376,9 @@ class StorageLayout:
             if not shard.is_dir() or shard.name == ".incoming":
                 continue
             for blob in shard.iterdir():
-                if not blob.is_file() or not __import__("re").fullmatch(r"[a-f0-9]{64}", blob.name):
+                if not blob.is_file() or not __import__("re").fullmatch(
+                    r"[a-f0-9]{64}", blob.name
+                ):
                     continue
                 if blob.name in reachable:
                     continue
@@ -1286,7 +1420,8 @@ class StorageLayout:
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/PID", str(int(engine_pid)), "/T", "/F"],
-                    capture_output=True, timeout=5,
+                    capture_output=True,
+                    timeout=5,
                 )
             else:
                 try:
@@ -1294,7 +1429,9 @@ class StorageLayout:
                 except (ProcessLookupError, OSError):
                     pass
         except Exception:
-            logger.exception("Engine tree kill failed for run %s (pid %s)", run_id, engine_pid)
+            logger.exception(
+                "Engine tree kill failed for run %s (pid %s)", run_id, engine_pid
+            )
 
     def execution_slot_has_live_owner(self) -> bool:
         """Read-only liveness check of the global execution slot holder.
@@ -1385,15 +1522,26 @@ class StorageLayout:
                     # alone; or nobody owns it -- the engine is an orphan no
                     # one will ever wait on, which previously wedged the Run at
                     # RUNNING forever. Kill the whole tree and close the range.
-                    if self._engine_pid_alive(run_id) and self.execution_slot_has_live_owner():
+                    if (
+                        self._engine_pid_alive(run_id)
+                        and self.execution_slot_has_live_owner()
+                    ):
                         continue
                     self._kill_engine_pid(run_id)
                     from src.execution_runtime.events import EventEmitter
-                    active_range = next(r for r in reversed(projection.ranges) if r.is_open)
-                    manifest = self.read_json(self.resolve(run_id, "results.manifest.json")) or {}
+
+                    active_range = next(
+                        r for r in reversed(projection.ranges) if r.is_open
+                    )
+                    manifest = (
+                        self.read_json(self.resolve(run_id, "results.manifest.json"))
+                        or {}
+                    )
                     if (
-                        manifest.get("definition_revision_id") == active_range.revision_id
-                        and int(manifest.get("journal_seq", 0)) >= active_range.start_seq
+                        manifest.get("definition_revision_id")
+                        == active_range.revision_id
+                        and int(manifest.get("journal_seq", 0))
+                        >= active_range.start_seq
                     ):
                         EventEmitter(run_id).run_succeeded(
                             revision_id=active_range.revision_id,
@@ -1409,6 +1557,7 @@ class StorageLayout:
                     recovered.append(run_id)
             elif projection.status == "QUEUED" and was_claimed:
                 from src.execution_runtime.events import EventEmitter
+
                 EventEmitter(run_id).run_action("orphan_reclaimed", "system")
                 recovered.append(run_id)
 
@@ -1465,7 +1614,10 @@ class StorageLayout:
         root = self.trash / "runs"
         if not root.is_dir():
             return []
-        return sorted((path for path in root.iterdir() if path.is_dir()), key=lambda path: path.name)
+        return sorted(
+            (path for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+        )
 
     # -- Result access --
 
@@ -1502,7 +1654,6 @@ def get_tools_root() -> Path:
     data root's ``nodes/`` directory. There is one path calculation for execution
     and enumeration; no separate tools-root deployment variable is required.
     """
-    from pathlib import Path as _Path
     from src.backend_settings import BACKEND_SETTINGS
 
     return BACKEND_SETTINGS.node_root

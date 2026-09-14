@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,7 +37,9 @@ def resolve_resource_budget(
         try:
             reserved = int(raw_override)
         except ValueError as exc:
-            raise RuntimeError("TDEASE_RESERVED_LOGICAL_CPUS must be an integer") from exc
+            raise RuntimeError(
+                "TDEASE_RESERVED_LOGICAL_CPUS must be an integer"
+            ) from exc
         if reserved < 0:
             raise RuntimeError("TDEASE_RESERVED_LOGICAL_CPUS must be non-negative")
 
@@ -66,7 +67,9 @@ def resolve_resource_budget(
             raise RuntimeError("TDEASE_RESERVED_MEMORY_MB must be an integer") from exc
         if reserved_memory < 0:
             raise RuntimeError("TDEASE_RESERVED_MEMORY_MB must be non-negative")
-    reserved_memory = min(reserved_memory, max(0, memory_total - minimum_compute_memory))
+    reserved_memory = min(
+        reserved_memory, max(0, memory_total - minimum_compute_memory)
+    )
     compute_memory = memory_total - reserved_memory
 
     return ResourceBudget(

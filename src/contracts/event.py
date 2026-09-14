@@ -27,7 +27,9 @@ class RuntimeRef(BaseModel):
     """Execution context reference — for diagnostic correlation, not a persistent entity."""
 
     task_id: Optional[str] = Field(default=None, description="Task identifier")
-    step_label: Optional[str] = Field(default=None, description="Human-readable step name")
+    step_label: Optional[str] = Field(
+        default=None, description="Human-readable step name"
+    )
 
 
 class Event(BaseModel):
@@ -53,7 +55,10 @@ class Event(BaseModel):
         description="Event schema version",
     )
     run_id: str = Field(description="Owning Run")
-    seq: int = Field(description="Event sequence number, starting at 1, monotonically increasing", ge=1)
+    seq: int = Field(
+        description="Event sequence number, starting at 1, monotonically increasing",
+        ge=1,
+    )
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="UTC occurrence time",
@@ -61,8 +66,12 @@ class Event(BaseModel):
     type: EventType = Field(description="Event type")
     level: str = Field(default="info", description="info | warn | error")
     message: str = Field(default="", description="Human-readable summary")
-    runtime_ref: Optional[RuntimeRef] = Field(default=None, description="Execution context reference")
-    data: dict[str, Any] = Field(default_factory=dict, description="Payload varying by type")
+    runtime_ref: Optional[RuntimeRef] = Field(
+        default=None, description="Execution context reference"
+    )
+    data: dict[str, Any] = Field(
+        default_factory=dict, description="Payload varying by type"
+    )
 
 
 class EventBatch(BaseModel):
@@ -74,6 +83,7 @@ class EventBatch(BaseModel):
 
 
 # --- Per-product event data schemas ---
+
 
 class RunSubmittedData(BaseModel):
     """Records the creation of a Run identity and its initial revision."""
@@ -137,6 +147,7 @@ class RunTerminatedData(BaseModel):
 
 class RuntimeMessageData(BaseModel):
     """Diagnostic information that cannot be structured."""
+
     level: str = Field(default="debug", description="debug | info | warn | error")
     message: str
     runtime_ref: Optional[RuntimeRef] = Field(default=None)

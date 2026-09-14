@@ -137,7 +137,10 @@ class WorkspaceRootRegistry:
 
         resolved = canonicalize_root(raw_path)
         normalized = os.path.normcase(str(resolved))
-        root_id = "root_" + hashlib.sha256(f"{user_id}\0{normalized}".encode()).hexdigest()[:24]
+        root_id = (
+            "root_"
+            + hashlib.sha256(f"{user_id}\0{normalized}".encode()).hexdigest()[:24]
+        )
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO workspace_root_grants "
@@ -164,7 +167,9 @@ class WorkspaceRootRegistry:
             )
             return cursor.rowcount > 0
 
-    def resolve(self, user_id: str, root_id: str, relative_path: str = ".") -> Path | None:
+    def resolve(
+        self, user_id: str, root_id: str, relative_path: str = "."
+    ) -> Path | None:
         relative = Path(relative_path)
         if relative.is_absolute():
             return None

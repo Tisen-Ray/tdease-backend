@@ -17,6 +17,8 @@ RUN_INDEX_SCHEMA_VERSION = 4
 
 class ProjectionGapError(RuntimeError):
     """The queued batch starts after an event that has not been projected."""
+
+
 RUN_INDEX_DDL = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id          TEXT PRIMARY KEY,
@@ -162,11 +164,13 @@ class RunIndex:
         labels_value = data.get("labels")
         labels = labels_value if isinstance(labels_value, dict) else {}
         name = str(labels.get("name") or run_id)
-        search_text = " ".join([
-            run_id,
-            str(data.get("workspace_id", "")),
-            *(str(value) for value in labels.values()),
-        ]).lower()
+        search_text = " ".join(
+            [
+                run_id,
+                str(data.get("workspace_id", "")),
+                *(str(value) for value in labels.values()),
+            ]
+        ).lower()
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
             connection.execute(
@@ -243,7 +247,7 @@ class RunIndex:
                 raise ProjectionGapError(
                     f"projection gap for {run_id}: checkpoint={checkpoint}, "
                     f"next={pending[0].get('seq')}"
-            )
+                )
             for event in pending:
                 seq = int(event.get("seq", 0))
                 if seq != checkpoint + 1:
@@ -292,7 +296,9 @@ class RunIndex:
                         """,
                         (run_id, json.dumps(graph, ensure_ascii=False), seq),
                     )
-                    connection.execute("DELETE FROM run_jobs WHERE run_id = ?", (run_id,))
+                    connection.execute(
+                        "DELETE FROM run_jobs WHERE run_id = ?", (run_id,)
+                    )
                 job_status = job_status_by_type.get(event_type)
                 job_id = data.get("job_id")
                 if job_status and isinstance(job_id, int):
@@ -365,13 +371,15 @@ class RunIndex:
                     total = len(json.loads(str(graph_row[0])).get("nodes", []))
                 except (json.JSONDecodeError, TypeError):
                     total = 0
-            done = int(connection.execute(
-                """
+            done = int(
+                connection.execute(
+                    """
                 SELECT COUNT(*) FROM run_jobs
                 WHERE run_id = ? AND status IN ('succeeded', 'failed')
                 """,
-                (run_id,),
-            ).fetchone()[0])
+                    (run_id,),
+                ).fetchone()[0]
+            )
             percent = round(done / total * 100, 1) if total else 0.0
             connection.execute(
                 """
@@ -407,28 +415,35 @@ class RunIndex:
                 """,
                 (run_id,),
             ).fetchall()
-        if run is None or graph is None or int(run["projected_at_seq"]) < int(run["event_seq"]):
+        if (
+            run is None
+            or graph is None
+            or int(run["projected_at_seq"]) < int(run["event_seq"])
+        ):
             return None
         payload = json.loads(str(graph["graph_json"]))
-        payload.update({
-            "status": str(run["status"]),
-            "event_seq": int(run["event_seq"]),
-            "projected_at_seq": int(run["projected_at_seq"]),
-            "jobs": [
-                {
-                    "job_id": int(job["job_id"]),
-                    "status": str(job["status"]),
-                    "wildcards": json.loads(str(job["wildcards_json"])),
-                }
-                for job in jobs
-            ],
-        })
+        payload.update(
+            {
+                "status": str(run["status"]),
+                "event_seq": int(run["event_seq"]),
+                "projected_at_seq": int(run["projected_at_seq"]),
+                "jobs": [
+                    {
+                        "job_id": int(job["job_id"]),
+                        "status": str(job["status"]),
+                        "wildcards": json.loads(str(job["wildcards_json"])),
+                    }
+                    for job in jobs
+                ],
+            }
+        )
         return payload
 
     def catch_up_run(self, storage, run_id: str) -> int:
         checkpoint = self.projected_at_seq(run_id)
         events = [
-            event for event in storage.read_events(run_id)
+            event
+            for event in storage.read_events(run_id)
             if int(event.get("seq", 0)) > checkpoint
         ]
         return self.project_events(run_id, events)
@@ -459,9 +474,11 @@ class RunIndex:
             parameters.append(f"%{query.lower()}%")
         where = " AND ".join(clauses)
         with self._connect() as connection:
-            total = int(connection.execute(
-                f"SELECT COUNT(*) FROM runs WHERE {where}", parameters
-            ).fetchone()[0])
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM runs WHERE {where}", parameters
+                ).fetchone()[0]
+            )
             rows = connection.execute(
                 f"""
                 SELECT run_id FROM runs WHERE {where}
@@ -495,16 +512,18 @@ class RunIndex:
             for item in values:
                 if not isinstance(item, dict) or not isinstance(item.get("path"), str):
                     continue
-                entries.append((
-                    run_id,
-                    revision_id,
-                    item["path"],
-                    role,
-                    int(item.get("size", 0)),
-                    item.get("mtime_ns"),
-                    str(item.get("sha256", "")),
-                    now,
-                ))
+                entries.append(
+                    (
+                        run_id,
+                        revision_id,
+                        item["path"],
+                        role,
+                        int(item.get("size", 0)),
+                        item.get("mtime_ns"),
+                        str(item.get("sha256", "")),
+                        now,
+                    )
+                )
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM run_files WHERE run_id = ? AND revision_id = ?",
@@ -556,7 +575,8 @@ class RunIndex:
                         self.replace_manifest(run_id, current)
         with self._connect() as connection:
             indexed_ids = {
-                str(row[0]) for row in connection.execute("SELECT run_id FROM runs").fetchall()
+                str(row[0])
+                for row in connection.execute("SELECT run_id FROM runs").fetchall()
             }
             for stale in indexed_ids - filesystem_ids:
                 connection.execute("DELETE FROM runs WHERE run_id = ?", (stale,))

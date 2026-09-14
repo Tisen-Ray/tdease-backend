@@ -81,14 +81,18 @@ class EventType(str, Enum):
 
 
 # Terminal statuses
-TERMINAL_STATUSES: frozenset[RunStatus] = frozenset({
-    RunStatus.SUCCEEDED,
-    RunStatus.FAILED,
-    RunStatus.CANCELLED,
-})
+TERMINAL_STATUSES: frozenset[RunStatus] = frozenset(
+    {
+        RunStatus.SUCCEEDED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }
+)
 
 # Cancellable statuses
-CANCELLABLE_STATUSES: frozenset[RunStatus] = frozenset({
-    RunStatus.QUEUED,
-    RunStatus.RUNNING,
-})
+CANCELLABLE_STATUSES: frozenset[RunStatus] = frozenset(
+    {
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    }
+)
