@@ -27,20 +27,28 @@ class Principal:
     auth_source: str
 
 
+# One human desktop user, two launch-time principals. Both principals carry
+# the SAME user identity: the agent harness is the owner acting through a
+# scoped delegate, not a second user — Runs, workspace roots and stable Run
+# ids created by either token must land in one ownership namespace (an
+# agent-dispatched Run is visible in the owner's Runs list). What separates
+# the principals is SCOPE, not identity; `role` names the actor for audit.
+LOCAL_USER_ID = "local-owner"
+
 LOCAL_OWNER = Principal(
-    user_id="local-owner",
+    user_id=LOCAL_USER_ID,
     role="owner",
     scopes=("desktop", "workspace:read", "workspace:write", "run:execute", "run:purge"),
     auth_source="desktop-bootstrap",
 )
 
-# The AI agent harness runs as a second launch-time principal with the same
-# working scopes but WITHOUT the irreversible ones: a hallucinated call loop
-# must never be able to purge (or otherwise destroy) the user's Runs. The
-# Desktop launcher exchanges one bootstrap secret for both tokens and hands
-# each to its own client.
+# The AI agent harness runs as the same local user with the same working
+# scopes but WITHOUT the irreversible ones: a hallucinated call loop must
+# never be able to purge (or otherwise destroy) the user's Runs. The Desktop
+# launcher exchanges one bootstrap secret for both tokens and hands each to
+# its own client.
 DESKTOP_AGENT = Principal(
-    user_id="local-agent",
+    user_id=LOCAL_USER_ID,
     role="agent",
     scopes=("desktop", "workspace:read", "workspace:write", "run:execute"),
     auth_source="desktop-bootstrap",
