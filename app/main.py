@@ -105,12 +105,13 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     # The desktop Clients: the Electron renderer (file:// sends Origin
-    # "null"), the vite dev proxy (a loopback origin), and non-browser
-    # processes (no Origin at all). CORS is answered for exactly those --
-    # the previous wildcard+credentials combo reflected ANY origin back as
-    # allowed, which handed a tokenless local server to every website the
-    # user visits. Enforcement lives in browser_origin_gate below.
-    allow_origins=["null"],
+    # "null"), the Tauri shell (WebView2's fixed production origin
+    # http://tauri.localhost), the vite dev proxy (a loopback origin), and
+    # non-browser processes (no Origin at all). CORS is answered for exactly
+    # those -- the previous wildcard+credentials combo reflected ANY origin
+    # back as allowed, which handed a tokenless local server to every website
+    # the user visits. Enforcement lives in browser_origin_gate below.
+    allow_origins=["null", "http://tauri.localhost"],
     allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
@@ -134,7 +135,7 @@ async def browser_origin_gate(request: Request, call_next):
         from urllib.parse import urlparse
 
         host = (urlparse(origin).hostname or "").lower()
-        if host not in ("127.0.0.1", "localhost", "::1"):
+        if host not in ("127.0.0.1", "localhost", "::1", "tauri.localhost"):
             error = TDEaseError(
                 code=ErrorCode.AUTH_ORIGIN_FORBIDDEN,
                 message="cross-origin browser requests are not accepted by this Backend",
