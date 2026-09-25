@@ -3,7 +3,7 @@ name = "tdease-backend"
 version = "0.2.0"
 description = "TDEaseNexus — Zero-architecture mass spectrometry backend"
 readme = "README.md"
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 requires-python = ">=3.11,<3.15"
 dependencies = [
     # Web framework
