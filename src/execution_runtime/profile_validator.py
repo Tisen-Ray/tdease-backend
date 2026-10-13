@@ -16,14 +16,13 @@ Profile rules (the ONLY things that matter for static DAG topology):
     (params/threads may be lambdas; that's fine.)
 
 Why we re-scan the source text directly:
-  The shared `parser.py` consumes its own INDENT/DEDENT accounting and its
-  section slicers can desynchronise on multi-section bodies (resources +
-  params + shell), which previously made every real built-in template
-  (msconvert/topfd/toppic/promex) lose its `shell:` and fail validation.
   Profile compliance is a load-bearing gate, so this validator does its own
-  lightweight text scan for input/output/shell sections rather than trusting
-  parser.py's per-directive output. The frontend `static-dag.ts` parser
-  applies the same semantics — the two MUST stay in sync.
+  lightweight text scan for input/output/shell sections rather than relying
+  on any general-purpose Snakefile parser (multi-section bodies like
+  resources + params + shell are exactly where token accounting desynchronises;
+  the removed parser.py lost `shell:` on every real built-in template that
+  way). The frontend `static-dag.ts` parser applies the same semantics — the
+  two MUST stay in sync.
 """
 
 from __future__ import annotations
@@ -96,7 +95,7 @@ _DISQUALIFYING_DIRECTIVES = {
 def validate_snakefile_profile(snakefile: str) -> ProfileReport:
     """Validate a Snakefile against the TDEase static-parseable Profile.
 
-    Called during preflight before a run is accepted. Violations → run rejected.
+    A node-package QA check used by the node catalog tests.
     """
     violations: list[ProfileViolation] = []
 

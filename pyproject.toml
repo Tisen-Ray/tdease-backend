@@ -45,6 +45,7 @@ dependencies = [
     "polars>=1.18.0",
     "numpy>=2.4.2",
     "scipy>=1.14.0",
+    "scikit-misc>=0.1.5",
     "massql>=2025.12.10",
     "pyteomics>=4.7.5",
     "spectrum-utils>=0.5.0",

@@ -55,6 +55,19 @@ logger = logging.getLogger(__name__)
 
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
+# Run-tree subtrees that are internal state, never product artifacts. The
+# results-manifest collector and the Client file browser skip the same set
+# (`nodes/` stays listed for defense: junction-era Runs may still carry one).
+INTERNAL_RUN_PREFIXES = (
+    ".runtime/",
+    ".tdease/",
+    ".snakemake/",
+    "nodes/",
+    "logs/",
+    "revisions/",
+    "definitions/",
+)
+
 
 def _is_reparse_point(path: Path) -> bool:
     """True for a Windows junction / mount point (and for POSIX symlinks).
@@ -881,19 +894,39 @@ class StorageLayout:
     def materialize_run_files(self, run_id: str, entries: list[Any]) -> None:
         """Materialize a frozen client tree into the isolated run directory."""
         run_dir = self.allocate_run(run_id).resolve()
+        self.materialize_snapshot_files(run_dir, entries, fetch=self._require_blob)
+
+    def _require_blob(self, path: str, digest: str) -> bytes:
+        if not self.blob_exists(digest):
+            raise FileNotFoundError(f"missing blob for {path}: {digest}")
+        return self.blob_get(digest)
+
+    def materialize_snapshot_files(
+        self, target_dir: Path, entries: list[Any], *, fetch
+    ) -> None:
+        """Materialize a frozen client snapshot into an arbitrary root.
+
+        The one materialization path behind both the worker's run directory
+        and a dry-run's temporary root: one escape check, one write primitive.
+        Entries whose digest already sits in the CAS are hardlinked from the
+        immutable blob; ``fetch(path, digest)`` supplies bytes for the rest
+        and owns their client-side validation (dry-run inline blobs).
+        """
+        target_dir = Path(target_dir).resolve()
         for entry in entries:
             path = entry.path if hasattr(entry, "path") else entry["path"]
             digest = (
                 entry.blob_hash if hasattr(entry, "blob_hash") else entry["blob_hash"]
             )
-            target = (run_dir / path).resolve(strict=False)
+            target = (target_dir / path).resolve(strict=False)
             try:
-                target.relative_to(run_dir)
+                target.relative_to(target_dir)
             except ValueError as exc:
                 raise ValueError(f"run file escapes snapshot: {path}") from exc
-            if not self.blob_exists(digest):
-                raise FileNotFoundError(f"missing blob for {path}: {digest}")
-            self._link_blob(digest, target)
+            if self.blob_exists(digest):
+                self._link_blob(digest, target)
+            else:
+                self.atomic_write(target, fetch(path, digest))
 
     def _local_sources(
         self, workspace_root: Path, entries: list[Any], *, user_id: str
@@ -1201,17 +1234,7 @@ class StorageLayout:
                 "results.manifest.json",
             }:
                 continue
-            if rel.startswith(
-                (
-                    ".runtime/",
-                    ".tdease/",
-                    ".snakemake/",
-                    "nodes/",
-                    "logs/",
-                    "revisions/",
-                    "definitions/",
-                )
-            ):
+            if rel.startswith(INTERNAL_RUN_PREFIXES):
                 continue
             if rel in previously_published:
                 continue

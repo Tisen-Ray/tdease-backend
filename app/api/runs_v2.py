@@ -15,6 +15,7 @@ import json
 import hashlib
 import base64
 import os
+import re
 import sys
 import fnmatch
 import time
@@ -44,14 +45,15 @@ from src.contracts import (
     TERMINAL_STATUSES,
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
-from src.execution_runtime.storage import get_storage, get_tools_root
+from src.execution_runtime.storage import (
+    INTERNAL_RUN_PREFIXES,
+    get_storage,
+    get_tools_root,
+)
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET
 from src.execution_runtime.execution import run_captured_process
 from src.execution_runtime.execution import backend_child_env
-from src.services.node_catalog import (
-    bound_node_paths,
-    resolve_bindings,
-)
+from src.services.node_catalog import resolve_bindings
 from src.services.run_definition import freeze_definition
 
 # Reuses the Backend's own startup-resolved capability document (frozen at import
@@ -509,7 +511,13 @@ async def dry_run(payload: RunDryRunRequest, request: Request):
 
 
 def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
-    """Materialize and supervise one dry-run without blocking the API event loop."""
+    """Materialize and supervise one dry-run without blocking the API event loop.
+
+    Shares the definition-materialization and node-binding paths with the
+    worker's execution; only the client-freeze checks (verbatim Snakefile,
+    inline blob validation) and the removed-binding-include classification
+    are dry-run specific.
+    """
     if not commit.workspace_files:
         raise TDEaseError(
             code=ErrorCode.RUN_PLAN_INVALID,
@@ -518,15 +526,11 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
             retryable=False,
         )
     strategy = _select_materialization_strategy(commit)
-    try:
-        resolved_nodes = resolve_bindings(get_tools_root(), commit.nodes)
-    except ValueError as exc:
-        raise TDEaseError(
-            code=ErrorCode.RUN_PLAN_INVALID,
-            message=f"The Run node bindings could not be resolved: {exc}",
-            remedy="Correct the node bindings on the commit, or install the missing node package.",
-            retryable=False,
-        ) from exc
+    from src.execution_runtime.bindings import engine_config
+
+    # Binding resolution first: fail fast on an unbindable catalog id before
+    # any bytes move. The same seam injects config["nodes"] for execution.
+    config = engine_config(commit)
     with storage.temp_dir("dry-run", commit.run_id) as root:
         if strategy == LOCAL_WORKSPACE_HARDLINK:
             if not commit.local_root_id:
@@ -552,37 +556,39 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                     retryable=False,
                     details={"missing_blobs": sorted(set(missing))},
                 )
-            for entry in commit.workspace_files:
-                target = (root / entry.path).resolve(strict=False)
+
+            def _inline_blob(path: str, digest: str) -> bytes:
                 try:
-                    target.relative_to(root.resolve())
-                except ValueError as exc:
+                    content = base64.b64decode(inline_blobs[digest], validate=True)
+                except (KeyError, ValueError) as exc:
                     raise TDEaseError(
-                        code=ErrorCode.WORKSPACE_PATH_ESCAPE,
-                        message=f"Workspace file {entry.path} resolves outside the Run snapshot.",
-                        remedy="Use Workspace-relative paths with no parent-directory segments in workspace_files.",
+                        code=ErrorCode.RUN_PLAN_INVALID,
+                        message=f"Inline blob for {path} is missing or is not valid base64.",
+                        remedy="Send each inline blob as standard base64 keyed by its sha256 digest.",
                         retryable=False,
                     ) from exc
-                if storage.blob_exists(entry.blob_hash):
-                    content = storage.blob_get(entry.blob_hash)
-                else:
-                    try:
-                        content = base64.b64decode(inline_blobs[entry.blob_hash], validate=True)
-                    except (KeyError, ValueError) as exc:
-                        raise TDEaseError(
-                            code=ErrorCode.RUN_PLAN_INVALID,
-                            message=f"Inline blob {entry.blob_hash} is missing or is not valid base64.",
-                            remedy="Send each inline blob as standard base64 keyed by its sha256 digest.",
-                            retryable=False,
-                        ) from exc
-                    if hashlib.sha256(content).hexdigest() != entry.blob_hash:
-                        raise TDEaseError(
-                            code=ErrorCode.WORKSPACE_DIGEST_MISMATCH,
-                            message=f"Inline blob content does not hash to its declared digest {entry.blob_hash}.",
-                            remedy="Recompute the sha256 of the file content and resubmit.",
-                            retryable=False,
-                        )
-                storage.atomic_write(target, content)
+                if hashlib.sha256(content).hexdigest() != digest:
+                    raise TDEaseError(
+                        code=ErrorCode.WORKSPACE_DIGEST_MISMATCH,
+                        message=f"Inline blob content does not hash to its declared digest {digest}.",
+                        remedy="Recompute the sha256 of the file content and resubmit.",
+                        retryable=False,
+                    )
+                return content
+
+            try:
+                storage.materialize_snapshot_files(
+                    root, commit.workspace_files, fetch=_inline_blob
+                )
+            except ValueError as exc:
+                # materialize_snapshot_files raises ValueError only for a
+                # snapshot path that escapes the target root.
+                raise TDEaseError(
+                    code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+                    message=f"Workspace file resolves outside the Run snapshot: {exc}",
+                    remedy="Use Workspace-relative paths with no parent-directory segments in workspace_files.",
+                    retryable=False,
+                ) from exc
         snake_entry = next((entry for entry in commit.workspace_files if entry.path == "Snakefile"), None)
         if snake_entry is None:
             raise TDEaseError(
@@ -606,11 +612,30 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
                 ),
                 retryable=False,
             )
-        bound_paths = bound_node_paths(resolved_nodes)
+        # A literal `include: "nodes/<id>/rules.smk"` references a run-local
+        # nodes/ subtree this architecture never materializes (node packages
+        # resolve through config["nodes"] only), so the engine would die on an
+        # opaque WinError/FileNotFoundError. Classify it here, at the
+        # validity authority, as a product error with the fix in hand.
+        legacy_binding = _LEGACY_NODE_INCLUDE.search(snake_text)
+        if legacy_binding:
+            raise TDEaseError(
+                code=ErrorCode.RUN_PLAN_INVALID,
+                message=(
+                    "The Snakefile includes node rules through the removed "
+                    f"run-local path 'nodes/{legacy_binding.group(1)}/rules.smk'."
+                ),
+                remedy=(
+                    "Bind the node through config: "
+                    "_N = (config.get('nodes') or {}).get('<id>'); "
+                    "include: _N + '/rules.smk' — see references/node-binding.md."
+                ),
+                retryable=False,
+            )
         engine_request = WorkflowEngineRequest(
             mode="dry-run",
             snakefile="Snakefile",
-            config={**commit.config, "nodes": bound_paths} if bound_paths else commit.config,
+            config=config,
             cores=commit.cores,
             memory_mb=commit.memory_mb,
             targets=commit.targets,
@@ -639,6 +664,15 @@ def _dry_run_with_slot(commit, inline_blobs: dict[str, str], storage):
         return {"valid": completed.returncode == 0, "exit_code": completed.returncode,
                 "engine": "tdease-workflow", "output": output[-200_000:],
                 "projection": projection}
+
+
+# The removed run-local binding include (junction era): nodes/<id>/rules.smk
+# relative to the Run root. Kept in sync with the Client's
+# discoverManagedNodes regex in prepare-analysis.ts.
+_LEGACY_NODE_INCLUDE = re.compile(
+    r"""^\s*include\s*:\s*["']nodes/([^/"']+)/rules\.smk["']""",
+    re.MULTILINE,
+)
 
 
 @router.post("", status_code=201, response_model=RunCreateResponse)
@@ -698,7 +732,18 @@ def _create_run(body: RunCreateRequest, request: Request):
     # definition it starts, so revisions share bytes without private copies.
     local_run_root = None
     try:
-        resolve_bindings(get_tools_root(), commit.nodes)
+        try:
+            resolve_bindings(get_tools_root(), commit.nodes)
+        except ValueError as exc:
+            # The same failure class the dry-run and execution paths raise
+            # through engine_config: a missing node is RUN_NODE_NOT_FOUND at
+            # every stage, not a plan-invalid here and a 404 later.
+            raise TDEaseError(
+                code=ErrorCode.RUN_NODE_NOT_FOUND,
+                message=f"The Run node bindings could not be resolved: {exc}",
+                remedy="Correct the node bindings on the commit, or install the missing node package.",
+                retryable=False,
+            ) from exc
         if strategy == LOCAL_WORKSPACE_HARDLINK:
             if not commit.local_root_id:
                 raise ValueError("local_root_id is required for the local_workspace_hardlink strategy")
@@ -1281,7 +1326,7 @@ def list_run_files(
                 rel = candidate.relative_to(root).as_posix()
                 if rel in submitted or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
                     continue
-                if rel.startswith((".runtime/", ".tdease/", ".snakemake/", "nodes/", "logs/", "revisions/")):
+                if rel.startswith(INTERNAL_RUN_PREFIXES):
                     continue
                 if any(part.endswith("_idx") for part in Path(rel).parts):
                     continue
