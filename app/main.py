@@ -31,6 +31,7 @@ if str(_src_path) not in sys.path:
 
 from app.database.init_db import check_database_health
 from app.database.lifecycle import migrate_database
+from app.version import __version__
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -97,7 +98,7 @@ _service_started_at = datetime.now(timezone.utc).isoformat()
 app = FastAPI(
     title="TDEaseNexus",
     description="Zero-architecture mass spectrometry workflow backend",
-    version="0.2.0",
+    version=__version__,
     docs_url=None if _is_prod else "/docs",
     lifespan=lifespan,
 )
@@ -199,7 +200,7 @@ register_error_handlers(app)
 async def root():
     return {
         "name": "TDEaseNexus",
-        "version": "0.2.0",
+        "version": __version__,
         "environment": BACKEND_SETTINGS.environment,
     }
 
@@ -231,6 +232,7 @@ async def ready():
     return {
         "status": "ready",
         "engine": "tdease-workflow",
+        "version": __version__,
         "instance_id": _service_instance_id,
         "generation": _service_generation,
         "started_at": _service_started_at,
