@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
+import sys
 
 import pytest
 
@@ -95,3 +97,63 @@ def test_workflow_children_receive_no_tdease_environment(monkeypatch) -> None:
     child = backend_child_env()
     assert child["PATH"] == "managed-path"
     assert not any(name.startswith("TDEASE_") for name in child)
+
+
+# ── bootstrap-secret channel: stdin first line → env fallback → None ────────
+
+
+def test_bootstrap_secret_prefers_the_stdin_channel(tmp_path, monkeypatch) -> None:
+    # This generation's Desktop writes the secret to stdin right after spawn;
+    # the stdin channel outranks the env fallback so no double-channel launch
+    # can silently downgrade to the leakable one.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("stdin-secret\n"))
+
+    settings = load_backend_settings(
+        write_config(tmp_path),
+        allow_env_overrides=True,
+        environ={"TDEASE_BOOTSTRAP_SECRET": "env-secret"},
+    )
+
+    assert settings.bootstrap_secret == "stdin-secret"
+
+
+def test_bootstrap_secret_falls_back_to_the_gated_environment(
+    tmp_path, monkeypatch
+) -> None:
+    # EOF on stdin (previous-generation Desktop's stdio "ignore") falls through
+    # to the env var -- still behind the --allow-env-overrides gate.
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    environ = {"TDEASE_BOOTSTRAP_SECRET": "env-secret"}
+
+    fallback = load_backend_settings(
+        write_config(tmp_path), allow_env_overrides=True, environ=environ
+    )
+    ungated = load_backend_settings(write_config(tmp_path), environ=environ)
+
+    assert fallback.bootstrap_secret == "env-secret"
+    assert ungated.bootstrap_secret is None
+
+
+def test_bootstrap_secret_is_none_without_any_channel(tmp_path, monkeypatch) -> None:
+    # Neither channel carries a secret: the fail-closed AUTH_BOOTSTRAP_UNAVAILABLE
+    # posture downstream is fed by None, never by an empty string.
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    settings = load_backend_settings(write_config(tmp_path), environ={})
+
+    assert settings.bootstrap_secret is None
+
+
+def test_placeholder_configuration_never_consumes_the_stdin_channel(
+    monkeypatch,
+) -> None:
+    # The import-time placeholder load (config_path=None) runs before
+    # configure_backend in the same process; if it ever ate the Desktop's
+    # line, every real serve launch would fail closed.
+    stream = io.StringIO("stdin-secret\n")
+    monkeypatch.setattr(sys, "stdin", stream)
+
+    placeholder = load_backend_settings()
+
+    assert placeholder.bootstrap_secret is None
+    assert stream.read() == "stdin-secret\n"

@@ -27,6 +27,12 @@ def _parser() -> argparse.ArgumentParser:
 def _configure(args: argparse.Namespace):
     from src.backend_settings import configure_backend
 
+    # Consumes the bootstrap-secret channel (stdin first line, env fallback)
+    # BEFORE uvicorn starts: stdin is idle on the serve path from here on
+    # (ready JSON goes to stdout). Worker children re-exec through this same
+    # call, but inherit the serve process's already-consumed, EOF'd stdin --
+    # instant EOF -- and run_worker never touches bootstrap_secret, so the
+    # secret never needs to cross a process boundary.
     return configure_backend(
         args.config,
         allow_env_overrides=args.allow_env_overrides,

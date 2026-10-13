@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -108,6 +109,30 @@ def _read_config(config_path: str | Path | None) -> tuple[Mapping[str, Any], Pat
     return raw, data_root
 
 
+def _read_bootstrap_secret_line() -> str | None:
+    """Read stdin's first line when a peer pipes one; None when nobody will.
+
+    The Desktop writes the fresh bootstrap secret to stdin immediately after
+    spawn and closes the pipe, and the serve CLI consumes it before uvicorn
+    starts -- so no timeout is needed: a peer that will never write is a peer
+    whose stdin is closed or ignored (a previous-generation Desktop), which
+    surfaces here as an instant EOF. An interactive terminal is never
+    consumed: a human at a keyboard is not a secret channel, and a blocking
+    read on one would hang every development run.
+    """
+    stdin = sys.stdin
+    if stdin is None:
+        return None
+    try:
+        if stdin.isatty():
+            return None
+        return stdin.readline().strip() or None
+    except (OSError, ValueError, AttributeError):
+        # Closed/pseudofile stdin (pytest's DontReadFromInput raises
+        # io.UnsupportedOperation, an OSError+ValueError subclass): no channel.
+        return None
+
+
 def load_backend_settings(
     config_path: str | Path | None = None,
     *,
@@ -145,6 +170,10 @@ def load_backend_settings(
     deployment = raw.get("deploymentMode", "local")
     auth_mode = auth.get("mode", "local")
     bootstrap_secret = auth.get("bootstrapSecret")
+    # The stdin channel is consumed only by a real configure call: the
+    # import-time placeholder (config_path=None) runs before configure_backend
+    # in the same process and must leave the Desktop's line untouched.
+    stdin_secret = _read_bootstrap_secret_line() if config_path is not None else None
     host = str(server.get("host", "127.0.0.1")).strip()
     port: object = server.get("port", 0)
     log_name = str(logging_config.get("level", "INFO")).strip().upper()
@@ -156,15 +185,20 @@ def load_backend_settings(
         environment = source.get("TDEASE_ENV", environment)
         deployment = source.get("TDEASE_DEPLOYMENT_MODE", str(deployment))
         auth_mode = source.get("TDEASE_AUTH_MODE", auth_mode)
-        # The Desktop launcher generates a fresh secret per launch and hands it
-        # over through the child environment -- never a CLI arg (process lists
-        # are world-readable) and never persisted by the Backend itself.
+        # Fallback channel for one release: a previous-generation Desktop still
+        # hands the fresh per-launch secret over through the child environment.
+        # Never a CLI arg (process lists are world-readable) and never persisted
+        # by the Backend itself; the stdin channel above takes priority.
         bootstrap_secret = source.get("TDEASE_BOOTSTRAP_SECRET", bootstrap_secret)
         host = source.get("TDEASE_BACKEND_HOST", host)
         port = source.get("TDEASE_BACKEND_PORT", port)
         log_name = source.get("TDEASE_LOG_LEVEL", log_name).strip().upper()
         reserved_cpus = source.get("TDEASE_RESERVED_LOGICAL_CPUS", reserved_cpus)
         reserved_memory = source.get("TDEASE_RESERVED_MEMORY_MB", reserved_memory)
+    if stdin_secret:
+        # Channel order: stdin (this generation's Desktop) beats the env
+        # fallback (previous generation) beats the config document.
+        bootstrap_secret = stdin_secret
 
     return BackendSettings(
         environment=environment,
