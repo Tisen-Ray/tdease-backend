@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import subprocess
 import sys
 import threading
@@ -27,7 +26,7 @@ from src.execution_runtime.execution import (
     _isolate_engine_process,
     _kill_process_group,
 )
-from src.execution_runtime.storage import StorageLayout
+from src.execution_runtime.storage import StorageLayout, read_complete_lines_from
 
 
 @dataclass(frozen=True)
@@ -70,19 +69,26 @@ class SnakemakeAdapter:
         timeout_seconds: int,
     ) -> SnakemakeExecutionResult:
         inspection_start = time.perf_counter()
+        # The engine attempt's journal identity is the OPEN execution range:
+        # run_commands.begin_execution() appended run.started before this
+        # call, so a range that is missing or names another revision/mode
+        # means this attempt was never authorized (or was already superseded).
         projection, _snapshot = self.storage.project_run_snapshot(self.run_id)
-        queue_seq = projection.queued_at_seq
+        open_range = next(
+            (r for r in reversed(projection.ranges) if r.is_open), None
+        )
         if (
-            queue_seq is None
-            or projection.current_revision_id != revision_id
-            or projection.queued_mode != execution_mode
+            open_range is None
+            or open_range.revision_id != revision_id
+            or open_range.mode != execution_mode
         ):
             return SnakemakeExecutionResult(
                 success=False,
                 exit_code=-1,
                 duration_seconds=time.perf_counter() - inspection_start,
-                stderr_tail="workflow engine attempt does not match the queued Journal range",
+                stderr_tail="workflow engine attempt does not match the open Journal execution range",
             )
+        queue_seq = open_range.queue_seq
         try:
             self.storage.begin_task_log_attempt(self.run_id, self.TASK_ID, queue_seq)
         except OSError as exc:
@@ -143,12 +149,9 @@ class SnakemakeAdapter:
             daemon=True,
         ).start()
         self._record_engine_pid(proc.pid)
-        self.emitter.run_started(
-            revision_id=revision_id,
-            mode=execution_mode,
-            pid=proc.pid,
-            worker_id=platform.node(),
-        )
+        # run.started is NOT emitted here: begin_execution() appended it (and
+        # took the execution lease) before the engine spawned -- §2.5. The
+        # adapter keeps job/task/graph events only.
         self.emitter.task_started(
             self.TASK_ID,
             self.STEP_LABEL,
@@ -160,12 +163,12 @@ class SnakemakeAdapter:
                 return
             for line in iter(stream.readline, ""):
                 try:
-                    branded = _brand_engine_output(line)
+                    # Verbatim engine output is the debugging evidence; no renaming.
                     self.storage.append_task_output(
                         self.run_id,
                         self.TASK_ID,
                         stream_name,
-                        branded,
+                        line,
                     )
                 except OSError:
                     # Disk full while persisting output. Keep READING the pipe
@@ -175,7 +178,7 @@ class SnakemakeAdapter:
                     # held until the multi-day deadline.
                     continue
                 if stream_name == "stderr":
-                    stderr_lines.append(branded)
+                    stderr_lines.append(line)
                     if len(stderr_lines) > 200:
                         del stderr_lines[:-100]
 
@@ -260,34 +263,64 @@ class SnakemakeAdapter:
         return SnakemakeExecutionResult(False, exit_code, elapsed, message)
 
     def _relay_job_events(self, path: Path, stop: threading.Event) -> None:
+        """Forward engine job-event frames from the JSONL side channel.
+
+        The cursor only ever moves past complete lines (the
+        ``read_complete_lines_from`` discipline): the engine appends frames
+        byte-wise, so acknowledging a half-written line would skip that event
+        forever once the writer completed it.  ``stop`` is set after the
+        engine exited; the final pass then drains every complete line left in
+        the file.
+        """
         offset = 0
-        while not stop.is_set() or (path.exists() and path.stat().st_size > offset):
-            if not path.exists():
-                stop.wait(0.1)
-                continue
-            with path.open("r", encoding="utf-8") as stream:
-                stream.seek(offset)
-                for line in stream:
-                    try:
-                        payload = json.loads(line)
-                        if payload.get("type") == "workflow.graph":
-                            self.emitter.workflow_graph(
-                                {
-                                    "nodes": payload.get("nodes", []),
-                                    "edges": payload.get("edges", []),
-                                }
-                            )
-                        else:
-                            self.emitter.job_event(
-                                EventType(payload["type"]),
-                                int(payload["job_id"]),
-                                str(payload["rule"]),
-                                payload.get("wildcards"),
-                            )
-                    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-                        continue
-                offset = stream.tell()
+        while True:
+            if path.exists():
+                lines, offset = read_complete_lines_from(path, offset)
+                for raw_line in lines:
+                    self._relay_job_event_frame(raw_line)
+            if stop.is_set():
+                return
             stop.wait(0.1)
+
+    def _relay_job_event_frame(self, raw_line: bytes) -> None:
+        """Translate one complete frame to emitter calls.
+
+        Only parsing/validation is guarded; emission is not: a malformed
+        frame is reported loudly (never silently skipped) without blocking
+        the frames behind it, and a real emitter failure still surfaces as
+        such.
+        """
+        try:
+            payload = json.loads(raw_line)
+            if not isinstance(payload, dict):
+                raise ValueError("frame is not a JSON object")
+            event_type = payload["type"]
+            if event_type == "workflow.graph":
+                graph: dict | None = {
+                    "nodes": payload.get("nodes", []),
+                    "edges": payload.get("edges", []),
+                }
+                job = None
+            else:
+                graph = None
+                job = (
+                    EventType(event_type),
+                    int(payload["job_id"]),
+                    str(payload["rule"]),
+                    payload.get("wildcards"),
+                )
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            snippet = raw_line.decode("utf-8", errors="replace").strip()
+            message = f"malformed job-event frame: {exc}: {snippet[:200]}"
+            self.storage.append_runtime_record(
+                self.run_id, "error", message, self.TASK_ID
+            )
+            self.emitter.runtime_message("warning", message, self.TASK_ID)
+            return
+        if job is not None:
+            self.emitter.job_event(*job)
+        else:
+            self.emitter.workflow_graph(graph)
 
     def _record_engine_pid(self, pid: int) -> None:
         """Persist disposable process identity for cancellation/reconciliation.
@@ -345,15 +378,3 @@ class SnakemakeAdapter:
             if process_identity_alive(f"{engine_pid}:{created if created else ''}"):
                 return "stale workflow-engine lock recovery refused: engine process is still active"
         return None
-
-
-def _brand_engine_output(text: str) -> str:
-    import re
-
-    branded = (
-        text.replace("SNAKEMAKE", "TDEASE WORKFLOW ENGINE")
-        .replace("Snakemake version:", "Engine version:")
-        .replace("snakemake --", "workflow-engine --")
-        .replace(".snakemake", ".tdease/engine")
-    )
-    return re.sub(r"(?m)^  Command:.*$", "  Command: TDEase Workflow Engine", branded)

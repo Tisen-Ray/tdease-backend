@@ -14,7 +14,6 @@ import logging
 import json
 import hashlib
 import base64
-import os
 import re
 import sys
 import fnmatch
@@ -46,7 +45,6 @@ from src.contracts import (
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.storage import (
-    INTERNAL_RUN_PREFIXES,
     get_storage,
     get_tools_root,
 )
@@ -458,6 +456,7 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
     rerun_mode: Literal["resume", "overwrite"] = (
         raw_rerun_mode if raw_rerun_mode in ("resume", "overwrite") else "resume"
     )
+    raw_queue_ticket = queue_data.get("queue_ticket")
     return RunStatusResponse(
         run_id=run_id,
         name=str(labels.get("name") or run_id),
@@ -481,6 +480,9 @@ def _run_status_response(data: dict, storage) -> RunStatusResponse:
         exit_code=lifecycle.get("exit_code"),
         error=lifecycle.get("error"),
         rerun_mode=rerun_mode,
+        queue_ticket=(
+            raw_queue_ticket if isinstance(raw_queue_ticket, int) else None
+        ),
         labels={str(key): str(value) for key, value in labels.items()},
         result_file_count=len(result_files),
         created_at=_parse_datetime(data.get("created_at")),
@@ -686,22 +688,17 @@ def _create_run(body: RunCreateRequest, request: Request):
     """
     Submit a Run commit.
 
-    Atomically writes run.json + initial events via the Storage Layout.
+    Validation is read-only and stays here; durable submission lives in the
+    Run Command Module (src/services/run_commands.py), which writes the
+    Journal events first and the run.json pointer last.
     """
     commit = _schedule_commit(body.commit, request.state.principal.user_id)
     storage = get_storage()
-
-    # Idempotent allocation (creates dir if not exists)
-    storage.allocate_run(commit.run_id)
-
     run_json = storage.resolve(commit.run_id, "run.json")
 
     # Check idempotency first. A fresh idempotency key for the same Workspace
     # Run is a new definition revision, not a second anonymous Backend Run.
     existing = storage.read_json(run_json)
-    if existing and existing.get("idempotency_key") == commit.idempotency_key:
-        _index_run(existing, storage)
-        return RunCreateResponse(**_run_status_response(existing, storage).model_dump(), idempotent=True)
     if existing:
         if not _is_same_workspace_run(existing, commit):
             raise TDEaseError(
@@ -799,6 +796,12 @@ def _create_run(body: RunCreateRequest, request: Request):
     run_data = commit.model_dump()
     run_data["snakefile"] = snake_text
     run_data = freeze_definition(run_data)
+    revision_id = str(run_data["definition_revision_id"])
+    if existing is None:
+        # The pointer can be missing or stale after a crash mid-submit; the
+        # frozen snapshot for this exact revision is the durable fallback for
+        # the Workspace-Run-level fields a resubmission must preserve.
+        existing = storage.read_definition_snapshot(commit.run_id, revision_id)
     if existing:
         # The row's creation time and user-facing title belong to the durable
         # Workspace Run, while every frozen definition gets its own journal
@@ -807,41 +810,20 @@ def _create_run(body: RunCreateRequest, request: Request):
         run_data["created_at"] = existing.get("created_at", run_data["created_at"])
         if not run_data.get("labels"):
             run_data["labels"] = existing.get("labels", {})
-    # Definitions are immutable, small, and addressable by content digest.
-    # They are deliberately separate from the shared execution tree: a new
-    # revision never gets a second copy of intermediates or engine state.
-    storage.write_definition_snapshot(commit.run_id, run_data)
-    storage.atomic_write_json(run_json, run_data)
 
-    # Establish the disposable list projection before publishing lifecycle
-    # events. Event projection is asynchronous and may run immediately; without
-    # this baseline row it observes a Run that the list index cannot identify.
-    # The second call below catches the row up through the durable Journal
-    # before the 201 response makes the Run externally visible.
-    _index_run(run_data, storage)
+    # Durable submission lives in the command module: Journal events first
+    # (idempotent per definition revision against the Journal fold), the
+    # run.json pointer last, then the index. The previous run.json-first
+    # order left a crash window where a same-key retry folded an empty
+    # Journal and 404'd forever.
+    from src.services.run_commands import get_run_commands
 
-    # Write initial event through storage (seq allocated by storage)
-    from src.execution_runtime.events import EventEmitter
-    emitter = EventEmitter(commit.run_id)
-    revision_id = str(run_data["definition_revision_id"])
-    emitter.run_submitted(
-        revision_id,
-        idempotency_key=commit.idempotency_key,
-        workspace_tree_hash=commit.workspace_tree_hash,
-        user_id=commit.user_id,
-        cores=commit.cores,
-        workflow_steps=0,
-        actor=_actor(request),
+    outcome = get_run_commands().submit(run_data, actor=_actor(request))
+
+    return RunCreateResponse(
+        **_run_status_response(run_data, storage).model_dump(),
+        idempotent=outcome.idempotent,
     )
-    emitter.run_queue_requested(
-        revision_id,
-        "execute",
-        rerun_mode="resume",
-        actor=_actor(request),
-    )
-    _index_run(run_data, storage)
-
-    return RunCreateResponse(**_run_status_response(run_data, storage).model_dump(), idempotent=False)
 
 
 @router.get("/trash", response_model=RunTrashListResponse)
@@ -1014,13 +996,18 @@ def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: dict =
     storage.clear_cancelled(run_id)
     storage.release_claim(run_id)
     storage.resolve(run_id, "results.manifest.json").unlink(missing_ok=True)
-    from src.execution_runtime.events import EventEmitter
-    EventEmitter(run_id).run_queue_requested(
+    from src.services.run_commands import get_run_commands
+
+    get_run_commands().queue(
+        run_id,
         str(data["definition_revision_id"]),
         "continue",
         rerun_mode=body.mode,
         actor=_actor(request),
+        run_data=data,
     )
+    from src.execution_runtime.events import EventEmitter
+
     EventEmitter(run_id).run_action("rerun", _actor(request), mode=body.mode)
     _index_run(data, storage)
     return RunActionResponse(
@@ -1102,9 +1089,20 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
     ) or data
     specs = published_definition.get("result_specs") or []
     if not specs:
-        # The agent does not classify or select outputs. When a workflow has
-        # no optional product metadata, its Snakemake default targets are the
-        # authoritative publish set and receive a neutral file projection.
+        # The agent does not classify or select outputs. With no explicit
+        # product metadata, the publish set is the engine-attributed surface:
+        # what the current manifest already claims plus what the last
+        # execution recorded producing. Readiness stays a join against that
+        # same manifest below.
+        claimed = [
+            entry["path"]
+            for entry in current_manifest.get("files", [])
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        ]
+        outputs: list[str] = []
+        for output in [*claimed, *storage.execution_output_files(run_id)]:
+            if output not in outputs:
+                outputs.append(output)
         specs = [
             {
                 "result_id": f"output-{hashlib.sha256(output.encode('utf-8')).hexdigest()[:20]}",
@@ -1113,7 +1111,7 @@ def list_run_results(run_id: str, data: dict = Depends(_owned_run)):
                 "dimensions": {},
                 "output": output,
             }
-            for output in storage._declared_output_files_from_data(published_definition)
+            for output in outputs
         ]
     indexed = _indexed_files(run_id, revision_id) if isinstance(revision_id, str) else None
     indexed_by_path = {
@@ -1285,66 +1283,19 @@ def list_run_files(
             continue
         add(path.resolve(strict=False))
 
-    # A flat-layout template names its outputs in `rule all`, at the run root rather
-    # than under results/. The default discovery pattern would then report files:[]
-    # for a run whose declared outputs all sit at the root -- a SUCCEEDED run
-    # indistinguishable from one that produced nothing. Only under the default pattern (an explicit
-    # caller pattern is honoured verbatim), also surface the declared outputs that
-    # actually materialized so the default view is never silently empty over real
-    # products.
+    # A flat-layout template's outputs sit at the run root, outside the
+    # default results/** glob. Only under the default pattern (an explicit
+    # caller pattern is honoured verbatim), surface what the engine recorded
+    # as the last execution's products -- attribution, never a tree sweep, so
+    # nothing an execution merely touched can pose as an output.
     if pattern == "results/**":
-        manifest = storage.read_json(storage.resolve(run_id, "results.manifest.json")) or {}
-        for entry in manifest.get("files", []):
-            rel = entry.get("path") if isinstance(entry, dict) else None
-            if not isinstance(rel, str):
-                continue
+        for rel in storage.execution_output_files(run_id):
             try:
                 artifact = _run_file(run_id, rel)
             except TDEaseError:
-                continue
-            if artifact.is_file() and rel not in seen:
-                seen.add(rel)
-                files.append({
-                    "path": rel,
-                    "size": entry.get("size", artifact.stat().st_size),
-                    "sha256": entry.get("sha256") or storage.file_digest(artifact),
-                })
-
-        # A manifest is finalized only after terminal success. While a Run is
-        # active, expose its current execution outputs without hashing files
-        # that are still growing. Submitted inputs and Backend-private state
-        # stay hidden; terminal responses are replaced by the verified manifest.
-        if not manifest.get("files"):
-            run_data = storage.read_json(storage.resolve(run_id, "run.json")) or {}
-            submitted = {
-                item.get("path") for item in (run_data.get("workspace_files") or [])
-                if isinstance(item, dict) and isinstance(item.get("path"), str)
-            }
-            for candidate in root.rglob("*"):
-                if not candidate.is_file():
-                    continue
-                rel = candidate.relative_to(root).as_posix()
-                if rel in submitted or rel in {"run.json", "events.jsonl", "results.manifest.json"}:
-                    continue
-                if rel.startswith(INTERNAL_RUN_PREFIXES):
-                    continue
-                if any(part.endswith("_idx") for part in Path(rel).parts):
-                    continue
-                if rel in seen:
-                    continue
-                seen.add(rel)
-                files.append({
-                    "path": rel,
-                    "size": candidate.stat().st_size,
-                    "sha256": None,
-                })
-        for rel in storage.declared_output_files(run_id):
-            try:
-                declared = _run_file(run_id, rel)
-            except TDEaseError:
-                continue  # a declared path that will not resolve is simply not listed
-            if declared.is_file():
-                add(declared.resolve(strict=False))
+                continue  # a recorded path that will not resolve is simply not listed
+            if artifact.is_file():
+                add(artifact.resolve(strict=False))
 
     files.sort(key=lambda entry: entry["path"])
     return {"run_id": run_id, "files": files}
@@ -1754,12 +1705,22 @@ def cancel_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
     from src.execution_runtime.events import EventEmitter
     EventEmitter(run_id).run_action("cancel", _actor(request), previous_status=status.value)
 
-    # Dequeue: mark CANCELLED if still QUEUED (not yet claimed)
+    # A QUEUED run terminalizes through the command module: the
+    # fold-then-append must be atomic against the worker's begin_execution,
+    # or a cancel landing in that window leaves run.started appended after
+    # run.cancelled -- an unprojectable journal (run.started is legal only
+    # from QUEUED). A RUNNING run is closed by the marker plus the engine's
+    # own cancelled result, so a False return here means the worker started
+    # first and the cancellation is already in the engine path.
     response_status = status
     if status == RunStatus.QUEUED:
-        EventEmitter(run_id).run_cancelled(str(data["definition_revision_id"]))
-        response_status = RunStatus.CANCELLED
-        _index_run(data, storage)
+        from src.services.run_commands import get_run_commands
+
+        if get_run_commands().cancel(run_id):
+            response_status = RunStatus.CANCELLED
+            _index_run(data, storage)
+        else:
+            response_status = _run_status_value(run_id, storage)
 
     return RunActionResponse(
         run_id=run_id,

@@ -9,10 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from src.execution_runtime.run_projector import STATUS_BY_EVENT
 
-
-RUN_INDEX_SCHEMA_VERSION = 4
+RUN_INDEX_SCHEMA_VERSION = 5
 
 
 class ProjectionGapError(RuntimeError):
@@ -31,6 +29,7 @@ CREATE TABLE IF NOT EXISTS runs (
     event_seq       INTEGER NOT NULL DEFAULT 0,
     projected_at_seq INTEGER NOT NULL DEFAULT 0,
     queued_seq      INTEGER,
+    queued_ticket   INTEGER,
     definition_revision_id TEXT,
     execution_mode TEXT,
     rerun_mode TEXT,
@@ -43,7 +42,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_owner_created
     ON runs(user_id, created_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_queue
-    ON runs(status, queued_seq, run_id);
+    ON runs(status, queued_ticket, run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_workspace
     ON runs(user_id, workspace_id, created_at DESC);
 
@@ -257,27 +256,31 @@ class RunIndex:
                 event_type = str(event.get("type", ""))
                 raw_data = event.get("data")
                 data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
-                status = STATUS_BY_EVENT.get(event_type)
-                if status:
-                    connection.execute(
-                        "UPDATE runs SET status = ? WHERE run_id = ?", (status, run_id)
-                    )
+                # No status write here: interpreting lifecycle events one at a
+                # time (STATUS_BY_EVENT) disagrees with the journal fold when a
+                # revision is queued mid-run — the fold keeps the Run RUNNING
+                # until the open range terminates, then QUEUED for the pending
+                # revision. runs.status is a cache of that single fold
+                # (BACKEND-RUN-SERVICE §2.1), refreshed by catch_up_run below
+                # and later by the command module at append time.
                 if event_type == "run.submitted":
                     connection.execute(
                         "UPDATE runs SET definition_revision_id = ? WHERE run_id = ?",
                         (str(data.get("revision_id", "")), run_id),
                     )
                 if event_type == "run.queue_requested":
+                    raw_ticket = data.get("queue_ticket")
                     connection.execute(
                         """
                         UPDATE runs SET definition_revision_id = ?, execution_mode = ?,
-                            rerun_mode = ?, queued_seq = ? WHERE run_id = ?
+                            rerun_mode = ?, queued_seq = ?, queued_ticket = ? WHERE run_id = ?
                         """,
                         (
                             str(data.get("revision_id", "")),
                             str(data.get("mode", "")),
                             str(data.get("rerun_mode", "resume")),
                             seq,
+                            raw_ticket if isinstance(raw_ticket, int) else None,
                             run_id,
                         ),
                     )
@@ -440,13 +443,31 @@ class RunIndex:
         return payload
 
     def catch_up_run(self, storage, run_id: str) -> int:
+        journal = storage.read_events(run_id)
         checkpoint = self.projected_at_seq(run_id)
         events = [
-            event
-            for event in storage.read_events(run_id)
-            if int(event.get("seq", 0)) > checkpoint
+            event for event in journal if int(event.get("seq", 0)) > checkpoint
         ]
-        return self.project_events(run_id, events)
+        projected = self.project_events(run_id, events)
+        # runs.status caches the one journal fold (BACKEND-RUN-SERVICE §2.1).
+        # The fold is path-dependent (an open execution range plus a pending
+        # queue request), so it must run over the whole journal, not the batch
+        # after the checkpoint. The command module (§2.2) writes this cache at
+        # append time; this refresh keeps worker-appended events (run.started
+        # and terminals, until §2.5 folds them into the command module) and
+        # every reconcile pass converging through the same write.
+        from src.services.run_commands import write_status_cache
+
+        write_status_cache(self, storage, run_id)
+        return projected
+
+    def update_status(self, run_id: str, status: str | None) -> None:
+        """Write the cached status; the value is decided by write_status_cache."""
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET status = ? WHERE run_id = ?",
+                (status, run_id),
+            )
 
     def remove_run(self, run_id: str) -> None:
         with self._connect() as connection:
@@ -490,11 +511,16 @@ class RunIndex:
         return [str(row["run_id"]) for row in rows], total
 
     def queued_run_ids(self, limit: int = 100) -> list[str]:
+        """Queued Runs in global arrival order: the minted queue ticket
+        (BACKEND-RUN-SERVICE §2.4), with pre-ticket journals (NULL ticket)
+        after every ticketed arrival, by created_at. One ordering, shared by
+        the dequeue filesystem fallback."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT run_id FROM runs WHERE status = 'QUEUED'
-                ORDER BY (queued_seq IS NULL), queued_seq, created_at, run_id LIMIT ?
+                ORDER BY (queued_ticket IS NULL), queued_ticket, created_at, run_id
+                LIMIT ?
                 """,
                 (limit,),
             ).fetchall()

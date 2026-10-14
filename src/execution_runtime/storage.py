@@ -55,18 +55,31 @@ logger = logging.getLogger(__name__)
 
 RUN_ID_PATTERN = __import__("re").compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 
-# Run-tree subtrees that are internal state, never product artifacts. The
-# results-manifest collector and the Client file browser skip the same set
-# (`nodes/` stays listed for defense: junction-era Runs may still carry one).
-INTERNAL_RUN_PREFIXES = (
-    ".runtime/",
-    ".tdease/",
-    ".snakemake/",
-    "nodes/",
-    "logs/",
-    "revisions/",
-    "definitions/",
-)
+
+def _normalize_run_relative_path(rel: str) -> Optional[str]:
+    """Canonical slash form of a run-relative path, or None when unsafe.
+
+    Traversal segments, absolute prefixes, and Windows drive letters are
+    rejected: manifest paths are claims about files under one run root.
+    """
+    normalized = rel.replace("\\", "/").lstrip("/")
+    parts = normalized.split("/")
+    if not normalized or ".." in parts or (len(parts[0]) == 2 and parts[0][1] == ":"):
+        return None
+    return normalized
+
+
+def _claimed_entries(raw: Any) -> list[dict[str, Any]]:
+    """Well-formed claim entries from a manifest list; anything else is noise."""
+    if not isinstance(raw, list):
+        return []
+    return [
+        entry
+        for entry in raw
+        if isinstance(entry, dict)
+        and isinstance(entry.get("path"), str)
+        and isinstance(entry.get("sha256"), str)
+    ]
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -169,6 +182,77 @@ def process_identity_alive(identity: str) -> bool:
         return False
 
 
+def read_complete_lines_from(path: Path, offset: int = 0) -> tuple[list[bytes], int]:
+    """Read only the complete lines appended after a byte cursor.
+
+    Binary read delimited by the last newline: the returned cursor stops
+    before an incomplete trailing line, so a concurrent writer can finish
+    that line and the next read will see it.
+    """
+    if not path.exists():
+        return [], 0
+    size = path.stat().st_size
+    cursor = min(max(offset, 0), size)
+    with open(path, "rb") as stream:
+        stream.seek(cursor)
+        payload = stream.read()
+    if not payload:
+        return [], cursor
+    last_newline = payload.rfind(b"\n")
+    if last_newline < 0:
+        return [], cursor
+    complete = payload[: last_newline + 1]
+    return complete.splitlines(), cursor + len(complete)
+
+
+@contextmanager
+def _exclusive_lock(lock: Path, *, purpose: str, timeout: float = 5.0) -> Iterator[None]:
+    """Cross-process mutual exclusion on one O_CREAT|O_EXCL lock file.
+
+    The same pattern as the per-run event write lock, factored out for scopes
+    beyond one journal append (the global ticket mint, the run command
+    critical section): pid recorded for stale-owner detection, bounded wait,
+    Windows-tolerant release.
+    """
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            break
+        except (FileExistsError, PermissionError):
+            stale = False
+            try:
+                age = time.time() - lock.stat().st_mtime
+                if age > 1.0:
+                    owner = int(lock.read_text(encoding="ascii").strip())
+                    import psutil
+
+                    stale = not psutil.pid_exists(owner) or age > 30.0
+            except FileNotFoundError:
+                continue
+            except (OSError, TypeError, ValueError):
+                try:
+                    stale = time.time() - lock.stat().st_mtime > 30.0
+                except FileNotFoundError:
+                    continue
+            if stale:
+                StorageLayout._unlink_event_lock(lock)
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out acquiring the {purpose} lock")
+            time.sleep(0.005)
+    try:
+        yield
+    finally:
+        StorageLayout._unlink_event_lock(lock)
+
+
 class StorageLayout:
     """TDEase single file primitive."""
 
@@ -245,9 +329,6 @@ class StorageLayout:
             raise ValueError(f"Path escapes run dir: {segments}")
         return p
 
-    def run_exists(self, run_id: str) -> bool:
-        return (self.data / "runs" / run_id).is_dir()
-
     # -- Atomic write --
 
     def atomic_write(self, target: Path, content: str | bytes) -> None:
@@ -279,6 +360,13 @@ class StorageLayout:
                 pass
             raise
         try:
+            # Windows refuses os.replace onto a read-only inode (a stale CAS
+            # hardlink sitting at the target path); clear the flag first.
+            if not os.lstat(target).st_mode & 0o222:
+                os.chmod(target, self._WRITABLE_MODE)
+        except FileNotFoundError:
+            pass
+        try:
             os.replace(tmp, target)
         except Exception:
             try:
@@ -299,38 +387,6 @@ class StorageLayout:
             target, json.dumps(obj, indent=2, ensure_ascii=False, default=str)
         )
 
-    def atomic_copy(self, source: Path, target: Path) -> None:
-        """Atomically stream one file into Backend-owned storage."""
-        source = Path(source)
-        target = Path(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(target.parent), prefix="." + target.name + "."
-        )
-        try:
-            with source.open("rb") as src, os.fdopen(fd, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-                dst.flush()
-                os.fsync(dst.fileno())
-            os.replace(tmp, target)
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        # Fsync parent directory for durability (Unix only -- Windows rejects dir fsync)
-        if os.name != "nt":
-            dfd = os.open(str(target.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-
     def remove_tree(self, target: Path, *, ignore_errors: bool = False) -> None:
         """Remove a Backend-owned tree without following directory links.
 
@@ -349,7 +405,7 @@ class StorageLayout:
             return
         if not target.exists():
             return
-        for root, dirs, _files in os.walk(target, topdown=True):
+        for root, dirs, files in os.walk(target, topdown=True):
             for name in list(dirs):
                 candidate = Path(root) / name
                 if _is_reparse_point(candidate):
@@ -358,6 +414,15 @@ class StorageLayout:
                     except OSError:
                         candidate.unlink(missing_ok=True)
                     dirs.remove(name)
+            for name in files:
+                # Read-only inodes (CAS hardlinks linked into the tree) block
+                # Windows unlink; make them removable before rmtree.
+                candidate = Path(root) / name
+                try:
+                    if not candidate.lstat().st_mode & 0o222:
+                        os.chmod(candidate, self._WRITABLE_MODE)
+                except OSError:
+                    pass
         shutil.rmtree(target, ignore_errors=ignore_errors)
 
     def read_json(self, path: Path) -> Optional[dict]:
@@ -374,7 +439,12 @@ class StorageLayout:
         return digest.hexdigest()
 
     def claim_run(self, run_id: str) -> bool:
-        """Atomically claim one queued run; claim storage is runtime-owned."""
+        """Atomically claim one queued run; claim storage is runtime-owned.
+
+        Superseded as the worker's dequeue guard by the execution lease below;
+        kept for surfaces that clear a leftover claim of a terminal Run
+        (``rerun``) and for the legacy-claim migration in reconcile.
+        """
         claim = self.resolve(run_id, ".runtime", "claimed")
         try:
             fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -388,6 +458,122 @@ class StorageLayout:
 
     def is_claimed(self, run_id: str) -> bool:
         return self.resolve(run_id, ".runtime", "claimed").exists()
+
+    # -- Execution lease (BACKEND-RUN-SERVICE §2.5) --
+
+    LEASE_SCHEMA_VERSION = 1
+
+    def lease_path(self, run_id: str) -> Path:
+        return self.resolve(run_id, ".runtime", "lease.json")
+
+    def read_lease(self, run_id: str) -> Optional[dict[str, Any]]:
+        """The parsed lease record, or None when absent or unreadable."""
+        try:
+            return self.read_json(self.lease_path(run_id))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _lease_payload(
+        self,
+        *,
+        worker_identity: str,
+        queue_seq: Optional[int],
+        revision_id: Optional[str],
+        stage: str,
+        acquired_at: Optional[str] = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "schema_version": self.LEASE_SCHEMA_VERSION,
+            "worker_identity": worker_identity,
+            "queue_seq": queue_seq,
+            "revision_id": revision_id,
+            "stage": stage,
+            "acquired_at": acquired_at or now,
+            "updated_at": now,
+        }
+
+    def acquire_lease(self, run_id: str, *, stage: str = "startup") -> bool:
+        """Take one Run's execution lease at dequeue (O_CREAT|O_EXCL).
+
+        The lease names the owning worker process (pid + creation time), so a
+        lease whose owner died -- including a Windows pid recycle -- is stolen
+        on sight instead of wedging the Run behind a lock nobody holds. A live
+        owner is authoritative: the acquirer backs off and the Run is skipped.
+        """
+        target = self.lease_path(run_id)
+        identity = process_identity(os.getpid())
+        payload = json.dumps(
+            self._lease_payload(
+                worker_identity=identity,
+                queue_seq=None,
+                revision_id=None,
+                stage=stage,
+            ),
+            ensure_ascii=False,
+        )
+        for _attempt in range(3):
+            try:
+                fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                lease = self.read_lease(run_id)
+                if (
+                    isinstance(lease, dict)
+                    and lease.get("worker_identity")
+                    and process_identity_alive(str(lease["worker_identity"]))
+                ):
+                    return False
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return True
+        return False
+
+    def write_lease(
+        self,
+        run_id: str,
+        *,
+        worker_identity: str,
+        queue_seq: Optional[int],
+        revision_id: Optional[str],
+        stage: str,
+    ) -> dict[str, Any]:
+        """Rewrite the lease under the run command lock (begin_execution).
+
+        ``acquired_at`` survives the rewrite so the record keeps naming when
+        this execution was taken, not when its stage last advanced.
+        """
+        previous = self.read_lease(run_id)
+        acquired_at = (
+            previous.get("acquired_at") if isinstance(previous, dict) else None
+        )
+        record = self._lease_payload(
+            worker_identity=worker_identity,
+            queue_seq=queue_seq,
+            revision_id=revision_id,
+            stage=stage,
+            acquired_at=acquired_at if isinstance(acquired_at, str) else None,
+        )
+        self.atomic_write_json(self.lease_path(run_id), record)
+        return record
+
+    def refresh_lease(self, run_id: str, worker_identity: str, stage: str) -> None:
+        """Advance the owning worker's lease stage (observability only)."""
+        lease = self.read_lease(run_id)
+        if not isinstance(lease, dict) or lease.get("worker_identity") != worker_identity:
+            return
+        lease["stage"] = stage
+        lease["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.atomic_write_json(self.lease_path(run_id), lease)
+
+    def release_lease(self, run_id: str) -> None:
+        self.lease_path(run_id).unlink(missing_ok=True)
 
     def claim_execution_slot(self) -> bool:
         """Acquire the Backend-wide execution slot.
@@ -427,6 +613,85 @@ class StorageLayout:
             return
         if owner.split(":", 1)[0] == str(os.getpid()):
             claim.unlink(missing_ok=True)
+
+    # -- Global queue tickets (BACKEND-RUN-SERVICE §2.4) --
+
+    def queue_tickets_path(self) -> Path:
+        return self.data / ".runtime" / "queue.tickets.jsonl"
+
+    def mint_queue_ticket(self, run_id: str, revision_id: str) -> int:
+        """Append one line to the global mint log and return its ticket number.
+
+        Queue arrival order is a deployment-global monotonic integer: minted
+        once per queue request under a global lock, carried by the
+        run.queue_requested journal event, and cached in the Run index. The
+        mint log exists only to mint -- arrival truth rebuilds from the
+        journals alone -- so a crash between a mint and the journal append
+        that carries it merely wastes the number.
+        """
+        path = self.queue_tickets_path()
+        with _exclusive_lock(path.with_suffix(".lock"), purpose="queue ticket mint"):
+            ticket = 0
+            for line in reversed(self.tail_text_lines(path, 8)):
+                try:
+                    ticket = int(json.loads(line).get("ticket", 0))
+                    break
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            ticket += 1
+            record = (
+                json.dumps(
+                    {
+                        "ticket": ticket,
+                        "run_id": run_id,
+                        "revision_id": revision_id,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            # A crash mid-append can leave a partial trailing line; start the
+            # new record on a fresh line so the two never glue together.
+            if path.exists():
+                with open(path, "rb+") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    if stream.tell():
+                        stream.seek(-1, os.SEEK_CUR)
+                        if stream.read(1) != b"\n":
+                            stream.write(b"\n")
+                    stream.write(record.encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                with open(path, "wb") as stream:
+                    stream.write(record.encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+        return ticket
+
+    def latest_queue_tickets(self) -> dict[str, int]:
+        """Each Run's most recently minted ticket.
+
+        The dequeue filesystem fallback sorts by this map so it agrees with
+        the index path (§2.4: one ordering everywhere). Runs absent from the
+        log -- journals written before tickets existed -- carry no ticket and
+        order after ticketed arrivals.
+        """
+        path = self.queue_tickets_path()
+        tickets: dict[str, int] = {}
+        if not path.exists():
+            return tickets
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and isinstance(record.get("ticket"), int):
+                run_id = record.get("run_id")
+                if isinstance(run_id, str):
+                    tickets[run_id] = record["ticket"]
+        return tickets
 
     # -- Events (JSONL append, single-writer) --
 
@@ -558,23 +823,9 @@ class StorageLayout:
         The returned cursor stops before an incomplete trailing line, so a
         concurrent writer can finish that line and the next read will see it.
         """
-        path = self.events_path(run_id)
-        if not path.exists():
-            return [], 0
-        size = path.stat().st_size
-        cursor = min(max(offset, 0), size)
-        with open(path, "rb") as stream:
-            stream.seek(cursor)
-            payload = stream.read()
-        if not payload:
-            return [], cursor
-        last_newline = payload.rfind(b"\n")
-        if last_newline < 0:
-            return [], cursor
-        complete = payload[: last_newline + 1]
-        next_cursor = cursor + len(complete)
+        lines, cursor = read_complete_lines_from(self.events_path(run_id), offset)
         events: list[tuple[dict[str, Any], str]] = []
-        for raw_line in complete.splitlines():
+        for raw_line in lines:
             if not raw_line.strip():
                 continue
             try:
@@ -582,7 +833,7 @@ class StorageLayout:
                 events.append((json.loads(line), line))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-        return events, next_cursor
+        return events, cursor
 
     def event_offset_after_seq(self, run_id: str, seq: int) -> int:
         """Locate the byte cursor immediately after ``seq`` for SSE resume."""
@@ -834,6 +1085,13 @@ class StorageLayout:
 
     # -- Blob store --
 
+    # A CAS blob is immutable by contract; the read-only flag makes the inode
+    # itself refuse an in-place write, so every hardlink (each Run's inputs)
+    # fails loudly at write time instead of corrupting the shared bytes.
+    _READONLY_MODE = stat.S_IREAD if os.name == "nt" else 0o444
+    _WRITABLE_MODE = stat.S_IWRITE if os.name == "nt" else 0o666
+    _STAGING_DIRNAME = ".staging"
+
     def blob_put(self, data: bytes) -> str:
         h = hashlib.sha256(data).hexdigest()
         dest = self.data / "store" / h[:2] / h
@@ -848,6 +1106,7 @@ class StorageLayout:
             os.fsync(fd)
         finally:
             os.close(fd)
+        os.chmod(tmp, self._READONLY_MODE)
         os.replace(tmp, dest)
         return h
 
@@ -876,6 +1135,7 @@ class StorageLayout:
             if dest.exists():
                 os.unlink(tmp)
             else:
+                os.chmod(tmp, self._READONLY_MODE)
                 os.replace(tmp, dest)
             return actual, size
         except Exception:
@@ -924,9 +1184,34 @@ class StorageLayout:
             except ValueError as exc:
                 raise ValueError(f"run file escapes snapshot: {path}") from exc
             if self.blob_exists(digest):
+                # Re-materialization: the target may already BE the right
+                # read-only blob link (rerun) or a stale one (revision change).
+                # Windows replace needs write access to the replaced inode.
+                blob = self.blob_path(digest)
+                if target.exists():
+                    try:
+                        if os.path.samefile(target, blob):
+                            continue
+                    except OSError:
+                        pass
+                    self._make_writable_for_replace(target)
                 self._link_blob(digest, target)
             else:
                 self.atomic_write(target, fetch(path, digest))
+
+    @staticmethod
+    def _make_writable_for_replace(path: Path) -> None:
+        """Clear a read-only flag that would block os.replace/os.unlink.
+
+        Hardlinks share the inode, so this also flips the CAS blob the link
+        points at; callers that know the superseded digest reseal it, and the
+        GC store walk reseals whatever is left.
+        """
+        try:
+            if not path.lstat().st_mode & 0o222:
+                os.chmod(path, StorageLayout._WRITABLE_MODE)
+        except OSError:
+            pass
 
     def _local_sources(
         self, workspace_root: Path, entries: list[Any], *, user_id: str
@@ -996,10 +1281,13 @@ class StorageLayout:
         for _rel, source, expected, _is_control in self._local_sources(
             workspace_root, entries, user_id=user_id
         ):
-            if self.blob_exists(expected):
-                continue
-            with source.open("rb") as stream:
-                self.blob_put_stream(stream, expected)
+            if not self.blob_exists(expected):
+                with source.open("rb") as stream:
+                    self.blob_put_stream(stream, expected)
+            # Sealed here, referenced only when the submission commits: the
+            # digest is in flight, and its marker holds off a GC that would
+            # otherwise judge it by age alone.
+            self.touch_staging_marker(expected)
 
     def materialize_local_run_files(
         self,
@@ -1066,7 +1354,43 @@ class StorageLayout:
                 if not self.blob_exists(expected):
                     with source.open("rb") as stream:
                         self.blob_put_stream(stream, expected)
+                blob = self.blob_path(expected)
+                superseded = None
+                if target.exists():
+                    # Rerun over the shared tree: the previous hardlink is a
+                    # read-only CAS inode. Same bytes -> the link already IS
+                    # the right blob; new bytes -> clear the flag (Windows
+                    # replace needs write access) and reseal the superseded
+                    # blob once the link no longer names it.
+                    try:
+                        if os.path.samefile(target, blob):
+                            shared.append(
+                                {
+                                    "path": rel,
+                                    "sha256": expected,
+                                    "source": str(source),
+                                    "strategy": "cas_hardlink",
+                                }
+                            )
+                            continue
+                    except OSError:
+                        pass
+                    superseded = next(
+                        (
+                            item.get("sha256")
+                            for item in previous
+                            if isinstance(item, dict) and item.get("path") == rel
+                        ),
+                        None,
+                    )
+                    self._make_writable_for_replace(target)
                 self._link_blob(expected, target)
+                if (
+                    superseded
+                    and superseded != expected
+                    and self.blob_exists(superseded)
+                ):
+                    self._seal_file_if_writable(self.blob_path(superseded))
             except (OSError, ValueError) as exc:
                 raise ValueError(
                     f"input {rel} cannot be sealed into the Backend CAS "
@@ -1111,55 +1435,45 @@ class StorageLayout:
                     "current file content."
                 )
 
-    def declared_output_files(self, run_id: str) -> list[str]:
-        """Run-root-relative paths the committed workflow *declared* it would produce.
+    def execution_output_files(self, run_id: str) -> list[str]:
+        """Run-relative paths the engine recorded as its last execution's products.
 
-        Two sources, unioned in order: the commit's `result_specs[].output`
-        (explicit Published Results), then the concrete targets of the Snakefile's
-        `rule all` input (resolved against the Run's `config`). This is what makes a
-        flat-layout template -- whose outputs sit at the run root, not under
-        `results/` -- have a non-empty canonical result list, so a SUCCEEDED Run whose
-        declared table came back empty still lists that table and is distinguishable
-        from a Run that produced nothing.
-
-        Best-effort and never raising: an unparseable Snakefile yields the
-        result_specs alone (or []), and the caller falls back to the `results/**`
-        glob. Traversal segments and absolute paths are dropped.
+        The engine writes ``.tdease/execution-outputs.json`` from its own DAG
+        at the end of a successful execute-mode run; it is the only authority
+        on what an execution actually produced. Returns [] when the record is
+        absent (dry-run, never executed, or a run from before the record
+        existed) -- callers must NOT fall back to scanning the run directory:
+        a narrowed publish surface is correct, guessed products are not.
         """
-        data = self.read_json(self.resolve(run_id, "run.json")) or {}
-        return self._declared_output_files_from_data(data)
-
-    @staticmethod
-    def _declared_output_files_from_data(data: dict[str, Any]) -> list[str]:
-        candidates: list[str] = []
-        for spec in data.get("result_specs") or []:
-            if isinstance(spec, dict):
-                output = spec.get("output")
-                if isinstance(output, str) and output:
-                    candidates.append(output)
-        snakefile = data.get("snakefile")
-        if isinstance(snakefile, str) and snakefile:
-            from src.execution_runtime.declared_outputs import rule_all_outputs
-
-            candidates.extend(rule_all_outputs(snakefile, data.get("config")))
-
+        record = self.read_json(
+            self.resolve(run_id, ".tdease", "execution-outputs.json")
+        )
+        raw = record.get("outputs") if isinstance(record, dict) else None
+        if not isinstance(raw, list):
+            return []
         seen: set[str] = set()
-        result: list[str] = []
-        for rel in candidates:
-            normalized = rel.replace("\\", "/").lstrip("/")
-            parts = normalized.split("/")
-            if (
-                not normalized
-                or ".." in parts
-                or (len(parts[0]) == 2 and parts[0][1] == ":")
-            ):
+        outputs: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
                 continue
-            if normalized not in seen:
+            normalized = _normalize_run_relative_path(item)
+            if normalized and normalized not in seen:
                 seen.add(normalized)
-                result.append(normalized)
-        return result
+                outputs.append(normalized)
+        return outputs
 
     def write_results_manifest(self, run_id: str, definition_revision_id: str) -> Path:
+        """Publish the result manifest: content-addressed claims of this Run's products.
+
+        The publish set is attribution, never discovery: (1) `result_specs`
+        outputs that materialized, (2) the engine-recorded products of the
+        execution that just ran, (3) previously claimed manifest entries whose
+        path this execution did not overwrite -- kept verbatim (same digest)
+        so a dead rule's output stays published across revisions. Nothing is
+        parsed out of the Snakefile text and nothing is swept off the shared
+        run tree; when the execution record is missing the surface narrows and
+        `provenance_source` records the gap.
+        """
         run_root = self.resolve(run_id)
         # A newer definition may have been submitted while this execution was
         # running. Result provenance must use the definition that actually ran,
@@ -1167,25 +1481,24 @@ class StorageLayout:
         run_data = self.read_definition_snapshot(run_id, definition_revision_id)
         if run_data is None:
             run_data = self.read_json(self.resolve(run_id, "run.json")) or {}
-        submitted_inputs = {
-            entry.get("path")
-            for entry in (run_data.get("workspace_files") or [])
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
-        }
-        # The sweep attributes only files no earlier execution has already
-        # published: a previous revision's manifest keeps provenance for what
-        # it claimed, so a dead rule's output from an older definition is
-        # never republished under this one.
         target = self.resolve(run_id, "results.manifest.json")
-        previous_manifest = self.read_json(target) or {}
-        previously_published = {
-            entry.get("path")
-            for entry in (
-                previous_manifest.get("files", [])
-                + previous_manifest.get("workflow_files", [])
-            )
-            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
-        }
+        previous_manifest = self.read_json(target)
+        if not isinstance(previous_manifest, dict):
+            # rerun clears the live manifest before re-executing; the newest
+            # retained revision is the continuity anchor that keeps already-
+            # claimed entries (and their digests) alive across the rerun.
+            retained = self.revision_manifests(run_id)
+            previous_manifest = retained[0] if retained else {}
+        previously_claimed_files = _claimed_entries(
+            previous_manifest.get("files")
+        )
+        previously_claimed_workflow = _claimed_entries(
+            previous_manifest.get("workflow_files")
+        )
+        record_present = (
+            self.resolve(run_id, ".tdease", "execution-outputs.json").is_file()
+        )
+
         entries: list[dict[str, Any]] = []
         seen: set[str] = set()
 
@@ -1208,39 +1521,23 @@ class StorageLayout:
                 self.blob_put_stream(source, digest)
             entries.append({"path": rel, "size": path.stat().st_size, "sha256": digest})
 
-        # Declared outputs first (rule all / result_specs), then nested results/**
-        # for templates that use that layout -- so both a flat and a results/-rooted
-        # template surface their actual products.
-        for rel in self._declared_output_files_from_data(run_data):
+        explicit_specs = [
+            _normalize_run_relative_path(spec.get("output"))
+            for spec in (run_data.get("result_specs") or [])
+            if isinstance(spec, dict) and isinstance(spec.get("output"), str)
+        ]
+        for rel in explicit_specs:
+            if rel is None:
+                continue
             try:
                 add(self.resolve(run_id, rel))
             except ValueError:
                 continue  # a declared path that will not resolve is simply not listed
-        for path in self.result_files(run_id):
-            add(path)
-
-        # Flat scientific workflows write outputs beside their inputs. The
-        # committed workspace_files mapping is the frozen input set, so every
-        # other ordinary file created in the Run snapshot is an execution
-        # artifact even when result_specs are absent or rule-all parsing cannot
-        # understand a valid Snakemake expression (for example an f-string).
-        for path in run_root.rglob("*"):
-            if not path.is_file():
+        for rel in self.execution_output_files(run_id):
+            try:
+                add(self.resolve(run_id, rel))
+            except ValueError:
                 continue
-            rel = path.relative_to(run_root).as_posix()
-            if rel in submitted_inputs or rel in {
-                "run.json",
-                "events.jsonl",
-                "results.manifest.json",
-            }:
-                continue
-            if rel.startswith(INTERNAL_RUN_PREFIXES):
-                continue
-            if rel in previously_published:
-                continue
-            if any(part.endswith("_idx") for part in Path(rel).parts):
-                continue
-            add(path)
 
         workflow_entries: list[dict[str, Any]] = []
         workflow_seen: set[str] = set()
@@ -1259,6 +1556,25 @@ class StorageLayout:
                 {"path": rel, "size": source.stat().st_size, "sha256": digest}
             )
 
+        # Fixed retention: entries an earlier manifest already claimed keep
+        # their exact digest unless this execution overwrote the same path --
+        # a dead rule's output (or a dropped control file) stays published.
+        # Lists stay separate and a path is claimed once, in whichever list
+        # this execution's fresh evidence put it.
+        claimed_paths = seen | {entry["path"] for entry in workflow_entries}
+        for entry in previously_claimed_files:
+            rel = _normalize_run_relative_path(entry["path"])
+            if rel is None or rel in claimed_paths:
+                continue
+            claimed_paths.add(rel)
+            entries.append(entry)
+        for entry in previously_claimed_workflow:
+            rel = _normalize_run_relative_path(entry["path"])
+            if rel is None or rel in claimed_paths:
+                continue
+            claimed_paths.add(rel)
+            workflow_entries.append(entry)
+
         entries.sort(key=lambda entry: entry["path"])
         journal_seq = self.recover_seq(run_id)
         revision_id = f"rev-{journal_seq:08d}"
@@ -1270,6 +1586,9 @@ class StorageLayout:
             "journal_seq": journal_seq,
             "parent_revision_id": previous_manifest.get("revision_id"),
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "provenance_source": (
+                "engine_execution" if record_present else "execution_record_missing"
+            ),
             "files": entries,
             "workflow_files": sorted(workflow_entries, key=lambda entry: entry["path"]),
         }
@@ -1342,6 +1661,20 @@ class StorageLayout:
             raise ValueError("invalid blob digest")
         return self.data / "store" / digest[:2] / digest
 
+    def staging_marker_path(self, digest: str) -> Path:
+        if not __import__("re").fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("invalid blob digest")
+        return self.data / "store" / self._STAGING_DIRNAME / digest
+
+    def touch_staging_marker(self, digest: str) -> None:
+        """Mark a digest as in flight: an upload (or a local-input seal) that
+        finished but is not yet referenced by any definition. GC must not race
+        it -- the blob's age says nothing about whether its submission already
+        committed."""
+        marker = self.staging_marker_path(digest)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+
     def referenced_blob_digests(self) -> set[str]:
         """Return blobs reachable from active or recoverable Run records.
 
@@ -1382,48 +1715,97 @@ class StorageLayout:
                                 digests.add(value)
         return digests
 
-    def gc_unreferenced_blobs(self, *, min_age_seconds: float = 300.0) -> list[str]:
+    def gc_unreferenced_blobs(
+        self, *, min_age_seconds: float = 300.0, staging_ttl_seconds: float | None = None
+    ) -> list[str]:
         """Delete old CAS blobs unreachable from active/trash Run records.
 
-        The grace period protects an upload that has finished but has not yet
-        been attached to its definition. Callers may use zero only while
-        holding their own higher-level upload/submission lock.
+        A digest whose staging marker is younger than the staging TTL is exempt:
+        an upload that finished but has not yet been attached to its definition
+        is in flight, not garbage -- the age grace alone cannot protect a
+        multi-file upload. Orphan markers (no blob, or older than the TTL) are
+        dropped in the same pass. The walk also seals legacy writable blobs:
+        read-only CAS is the invariant, and pre-sealing blobs get the flag here,
+        idempotently, amortized over the walk.
         """
+        ttl = (
+            staging_ttl_seconds
+            if staging_ttl_seconds is not None
+            else _default_staging_ttl_seconds()
+        )
         reachable = self.referenced_blob_digests()
+        protected = self._sweep_staging_markers(ttl)
         now = time.time()
         removed: list[str] = []
         store = self.data / "store"
         if not store.is_dir():
             return removed
         for shard in store.iterdir():
-            if not shard.is_dir() or shard.name == ".incoming":
+            if not shard.is_dir() or shard.name in {
+                ".incoming",
+                self._STAGING_DIRNAME,
+            }:
                 continue
             for blob in shard.iterdir():
                 if not blob.is_file() or not __import__("re").fullmatch(
                     r"[a-f0-9]{64}", blob.name
                 ):
                     continue
-                if blob.name in reachable:
+                if self._seal_file_if_writable(blob):
+                    logger.info("Legacy CAS blob sealed read-only: %s", blob.name)
+                if blob.name in reachable or blob.name in protected:
                     continue
                 try:
                     if now - blob.stat().st_mtime < min_age_seconds:
                         continue
-                    blob.unlink()
+                    self._unlink_readonly(blob)
                     removed.append(blob.name)
                 except OSError:
                     logger.warning("CAS blob could not be collected: %s", blob)
         return removed
 
-    def _engine_pid_alive(self, run_id: str) -> bool:
-        """Whether the recorded Snakemake process is still the same process."""
-        process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
-        engine_pid = process.get("engine_pid")
-        if not engine_pid:
-            return False
-        created = process.get("engine_create_time")
-        return process_identity_alive(f"{engine_pid}:{created if created else ''}")
+    def _sweep_staging_markers(self, ttl: float) -> set[str]:
+        """Drop orphan staging markers; return the still-fresh digest set."""
+        staging = self.data / "store" / self._STAGING_DIRNAME
+        fresh: set[str] = set()
+        if not staging.is_dir():
+            return fresh
+        now = time.time()
+        for marker in staging.iterdir():
+            if not marker.is_file():
+                continue
+            if not __import__("re").fullmatch(r"[a-f0-9]{64}", marker.name):
+                marker.unlink(missing_ok=True)  # garbage, not a digest marker
+                continue
+            try:
+                age = now - marker.stat().st_mtime
+            except OSError:
+                continue
+            if not self.blob_exists(marker.name) or age >= ttl:
+                marker.unlink(missing_ok=True)
+                continue
+            fresh.add(marker.name)
+        return fresh
 
-    def _kill_engine_pid(self, run_id: str) -> None:
+    def _seal_file_if_writable(self, path: Path) -> bool:
+        """Set the read-only flag unless it is already set. Returns what happened."""
+        try:
+            if not path.lstat().st_mode & 0o222:
+                return False
+            os.chmod(path, self._READONLY_MODE)
+            return True
+        except OSError:
+            logger.warning("CAS blob could not be sealed: %s", path)
+            return False
+
+    def _unlink_readonly(self, path: Path) -> None:
+        # Windows refuses to unlink a read-only inode; the flag protects the
+        # CAS against writes, not against its own garbage collection.
+        if not path.lstat().st_mode & 0o222:
+            os.chmod(path, self._WRITABLE_MODE)
+        path.unlink()
+
+    def kill_engine_tree(self, run_id: str) -> None:
         """Kill the recorded engine AND its tool children.
 
         A bare terminate() on the engine pid leaves Snakemake's job children
@@ -1431,6 +1813,9 @@ class StorageLayout:
         inside the run dir and burn CPU after the projection says terminal.
         The engine is started in its own session/process group precisely so
         the whole tree can be taken down in one shot.
+
+        Called by reconcile only after the execution lease is dead: a live
+        lease owner owns this engine's outcome through finalization.
         """
         process = self.read_json(self.resolve(run_id, ".runtime", "process.json")) or {}
         engine_pid = process.get("engine_pid")
@@ -1456,143 +1841,7 @@ class StorageLayout:
                 "Engine tree kill failed for run %s (pid %s)", run_id, engine_pid
             )
 
-    def execution_slot_has_live_owner(self) -> bool:
-        """Read-only liveness check of the global execution slot holder.
-
-        Reconciliation runs in the API process too (lifespan) -- while the
-        worker may legitimately be executing with a live engine. A live slot
-        owner means that engine has an owner; nobody else may kill it.
-        """
-        claim = self.data / ".runtime" / "execution.claim"
-        try:
-            owner = claim.read_text(encoding="ascii").strip()
-        except (FileNotFoundError, OSError):
-            return False
-        return bool(owner) and process_identity_alive(owner)
-
-    def reconcile_orphaned_runs(self) -> list[str]:
-        """Recover Runs whose worker died from Journal and runtime facts.
-
-        Four things happen for every Run directory, in order:
-
-        1. repair_events_file -- drop any partial trailing line left by a
-           crash mid-append, so the projection below reads a clean log and
-           future appends do not get glued onto garbage bytes (crash point
-           c: mid-append with a partial line).
-        2. Unconditional claim release. This loop runs once at startup,
-           before any live worker exists, so any ".runtime/claimed" file on
-           record belongs to a process that is no longer running -- there is
-           no in-progress dequeue for this reconciliation to respect.
-           Released regardless of projected status, and *before* branch 3
-           below decides whether a status change needs an event. Without
-           this, a crash between a Run's projection reaching a terminal
-           status and that worker's own release_claim call (crash point b:
-           "projection update and process exit") leaves a claim file that
-           silently blocks every future Continue/resume dequeue for that
-           run_id forever -- no error anywhere, just a Run stuck QUEUED
-           after a later rerun because claim_run's O_CREAT|O_EXCL keeps
-           failing against a lock nobody still holds.
-        3. Orphan handling, driven by the projected status:
-           - projection RUNNING with an open execution range whose
-             engine_pid is not alive: this range crashed mid-execution.
-             Kill any lingering process, then close the range with an
-             explicit run.failed event ("orphaned"). The Run converges to
-             FAILED and can be retried through Continue.
-           - projection QUEUED and a claim was held (released in step 2):
-             the worker died before ever appending run.started. Append a
-             run.action audit event. The projection was already QUEUED --
-             the event log never said otherwise -- so no status flip is
-             needed, only the claim release from step 2.
-           Both shapes append an event, matching "orphan kill and recovery
-           always emit an event" -- a silent run.json rewrite never does.
-        The immutable definition is never rewritten. SQLite and API snapshots
-        catch up by replaying the repaired Journal.
-        """
-        recovered: list[str] = []
-        runs = self.data / "runs"
-        if not runs.is_dir():
-            return recovered
-        for directory in sorted(runs.iterdir()):
-            if not directory.is_dir():
-                continue
-            run_id = directory.name
-            try:
-                self._validate_run_id(run_id)
-            except ValueError:
-                continue
-
-            was_claimed = self.is_claimed(run_id)
-            if was_claimed:
-                self.release_claim(run_id)
-            try:
-                self.repair_events_file(run_id)
-                projection = project_run(self.read_events(run_id))
-            except Exception:
-                logger.exception(
-                    "Run journal could not be projected during startup reconciliation: run_id=%s path=%s",
-                    run_id,
-                    self.events_path(run_id),
-                )
-                continue
-
-            if projection.status == "RUNNING":
-                has_open_range = any(r.is_open for r in projection.ranges)
-                if has_open_range:
-                    # An engine still alive here belongs to a worker that died
-                    # (this is a startup pass). Two cases: a live process holds
-                    # the global execution slot -- that engine has a living
-                    # owner who will terminalize the Run itself, so leave it
-                    # alone; or nobody owns it -- the engine is an orphan no
-                    # one will ever wait on, which previously wedged the Run at
-                    # RUNNING forever. Kill the whole tree and close the range.
-                    if (
-                        self._engine_pid_alive(run_id)
-                        and self.execution_slot_has_live_owner()
-                    ):
-                        continue
-                    self._kill_engine_pid(run_id)
-                    from src.execution_runtime.events import EventEmitter
-
-                    active_range = next(
-                        r for r in reversed(projection.ranges) if r.is_open
-                    )
-                    manifest = (
-                        self.read_json(self.resolve(run_id, "results.manifest.json"))
-                        or {}
-                    )
-                    if (
-                        manifest.get("definition_revision_id")
-                        == active_range.revision_id
-                        and int(manifest.get("journal_seq", 0))
-                        >= active_range.start_seq
-                    ):
-                        EventEmitter(run_id).run_succeeded(
-                            revision_id=active_range.revision_id,
-                            run_time_seconds=0.0,
-                        )
-                    else:
-                        EventEmitter(run_id).run_failed(
-                            revision_id=active_range.revision_id,
-                            exit_code=None,
-                            run_time_seconds=0.0,
-                            error_message="orphaned: worker process not found (backend restarted)",
-                        )
-                    recovered.append(run_id)
-            elif projection.status == "QUEUED" and was_claimed:
-                from src.execution_runtime.events import EventEmitter
-
-                EventEmitter(run_id).run_action("orphan_reclaimed", "system")
-                recovered.append(run_id)
-
-        return recovered
-
     # -- Trash --
-
-    def move_to_trash(self, path: Path) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        dest = self.trash / f"{ts}_{path.name}"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(path), str(dest))
 
     def trash_run(self, run_id: str, metadata: dict[str, Any]) -> Path:
         """Move one terminal Run to recoverable trash without adding a status."""
@@ -1642,14 +1891,6 @@ class StorageLayout:
             key=lambda path: path.name,
         )
 
-    # -- Result access --
-
-    def result_files(self, run_id: str) -> list[Path]:
-        rd = self.resolve(run_id, "results")
-        if not rd.exists():
-            return []
-        return sorted(rd.rglob("*"))
-
 
 # -- Module singleton --
 
@@ -1668,6 +1909,12 @@ def _resolve_backend_root() -> Path:
     from src.backend_settings import BACKEND_SETTINGS
 
     return BACKEND_SETTINGS.data_root
+
+
+def _default_staging_ttl_seconds() -> float:
+    from src.backend_settings import BACKEND_SETTINGS
+
+    return float(BACKEND_SETTINGS.staging_ttl_seconds)
 
 
 def get_tools_root() -> Path:

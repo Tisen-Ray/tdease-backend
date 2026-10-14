@@ -118,37 +118,47 @@ def _lifecycle_data(event: Mapping[str, Any]) -> Mapping[str, Any]:
     return data
 
 
-def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
-    """Fold a journal prefix without consulting mutable Run metadata."""
+@dataclass
+class LifecycleState:
+    """The fold state of ``project_run``, made first-class (BACKEND-RUN-SERVICE
+    §2.1).
+
+    This is the ONE lifecycle interpreter. Anything needing a Run status folds
+    events through ``apply`` and reads ``snapshot``; interpreting individual
+    events independently (as the SQLite projector once did) re-creates the
+    journal/index disagreement where a revision queued mid-run vanished behind
+    a terminal event.
+    """
 
     status: Optional[str] = None
-    projected_at_seq = 0
+    projected_at_seq: int = 0
     current_revision_id: Optional[str] = None
     queued_mode: Optional[str] = None
     queued_at_seq: Optional[int] = None
     pending_queue: Optional[tuple[int, str, str]] = None
-    ranges: list[ExecutionRange] = []
+    ranges: list[ExecutionRange] = field(default_factory=list)
     open_range_index: Optional[int] = None
 
-    for persisted_event in events:
-        event = _normalize_lifecycle_event(persisted_event)
+    def apply(self, event: Mapping[str, Any]) -> None:
+        """Fold one persisted event; illegal transitions raise ValueError."""
+        event = _normalize_lifecycle_event(event)
         seq = int(event.get("seq") or 0)
-        if seq <= projected_at_seq:
-            continue
-        projected_at_seq = seq
+        if seq <= self.projected_at_seq:
+            return
+        self.projected_at_seq = seq
         event_type = str(event.get("type") or "")
         data = _lifecycle_data(event)
         allowed_from = ALLOWED_FROM.get(event_type)
-        if allowed_from is not None and status not in allowed_from:
-            raise ValueError(f"{event_type} is invalid from status {status}")
+        if allowed_from is not None and self.status not in allowed_from:
+            raise ValueError(f"{event_type} is invalid from status {self.status}")
 
         if event_type == RUN_SUBMITTED:
-            current_revision_id = str(data["revision_id"])
-            continue
+            self.current_revision_id = str(data["revision_id"])
+            return
 
         next_status = STATUS_BY_EVENT.get(event_type)
         if next_status is None:
-            continue
+            return
 
         # revision_id / mode are reconstructable for legacy journals written
         # before they became required (see _lifecycle_data). For run.queue_requested
@@ -157,62 +167,62 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
         # and must stay a hard error. run.started backfills from its pending queue.
         if data.get("revision_id"):
             revision_id = str(data["revision_id"])
-        elif event_type == RUN_STARTED and pending_queue is not None:
-            revision_id = pending_queue[1]
-        elif current_revision_id is not None:
-            revision_id = current_revision_id
+        elif event_type == RUN_STARTED and self.pending_queue is not None:
+            revision_id = self.pending_queue[1]
+        elif self.current_revision_id is not None:
+            revision_id = self.current_revision_id
         else:
             raise ValueError(f"{event_type} missing required data: revision_id")
         if event_type == RUN_QUEUE_REQUESTED:
-            mode = str(data["mode"]) if data.get("mode") else (queued_mode or "execute")
-            current_revision_id = revision_id
-            queued_mode = mode
-            queued_at_seq = seq
-            pending_queue = (seq, revision_id, mode)
-            if open_range_index is None:
+            mode = str(data["mode"]) if data.get("mode") else (self.queued_mode or "execute")
+            self.current_revision_id = revision_id
+            self.queued_mode = mode
+            self.queued_at_seq = seq
+            self.pending_queue = (seq, revision_id, mode)
+            if self.open_range_index is None:
                 # No execution in flight: the Run is queued now. Otherwise the
                 # request is pending and the projected status stays RUNNING
                 # until the open range terminates.
-                status = next_status
-            continue
+                self.status = next_status
+            return
 
         if event_type == RUN_STARTED:
-            if pending_queue is None:
+            if self.pending_queue is None:
                 raise ValueError("run.started requires a preceding run.queue_requested")
-            queue_seq, queued_revision_id, queued_execution_mode = pending_queue
+            queue_seq, queued_revision_id, queued_execution_mode = self.pending_queue
             # revision_id was resolved above (from data, else the pending queue);
             # backfill legacy run.started that omitted mode from the matching
             # queue request, then validate consistency as usual.
             mode = str(data["mode"]) if data.get("mode") else queued_execution_mode
             if (revision_id, mode) != (queued_revision_id, queued_execution_mode):
                 raise ValueError("run.started does not match its queue request")
-            if open_range_index is not None:
+            if self.open_range_index is not None:
                 raise ValueError("run.started cannot overlap an open execution range")
-            ranges.append(ExecutionRange(seq, queue_seq, revision_id, mode))
-            open_range_index = len(ranges) - 1
-            pending_queue = None
-            status = next_status
-            current_revision_id = revision_id
-            queued_mode = None
-            queued_at_seq = None
-            continue
+            self.ranges.append(ExecutionRange(seq, queue_seq, revision_id, mode))
+            self.open_range_index = len(self.ranges) - 1
+            self.pending_queue = None
+            self.status = next_status
+            self.current_revision_id = revision_id
+            self.queued_mode = None
+            self.queued_at_seq = None
+            return
 
         # A terminal event belongs to the execution range that is open (or, for a
         # journal without ranges, to the active revision). A newer definition
         # submitted while that range ran must not invalidate its terminal event.
-        had_open_range = open_range_index is not None
+        had_open_range = self.open_range_index is not None
         active_revision = (
-            ranges[open_range_index].revision_id
+            self.ranges[self.open_range_index].revision_id
             if had_open_range
-            else current_revision_id
+            else self.current_revision_id
         )
         if active_revision is not None and revision_id != active_revision:
             raise ValueError(
                 f"{event_type} revision does not match the active revision"
             )
         if had_open_range:
-            active = ranges[open_range_index]
-            ranges[open_range_index] = ExecutionRange(
+            active = self.ranges[self.open_range_index]
+            self.ranges[self.open_range_index] = ExecutionRange(
                 start_seq=active.start_seq,
                 queue_seq=active.queue_seq,
                 revision_id=active.revision_id,
@@ -220,25 +230,34 @@ def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
                 terminal_seq=seq,
                 terminal_type=event_type,
             )
-            open_range_index = None
-        if had_open_range and pending_queue is not None:
+            self.open_range_index = None
+        if had_open_range and self.pending_queue is not None:
             # A definition was queued while this execution ran: the Run is queued
             # for it, not terminal. The finished execution's own result stays in
             # the journal and its results manifest. A queue request with no
             # execution in flight (pre-launch validation) keeps the ordinary
             # terminal projection below.
-            status = STATUS_BY_EVENT[RUN_QUEUE_REQUESTED]
-            continue
-        status = next_status
-        queued_mode = None
-        queued_at_seq = None
-        pending_queue = None
+            self.status = STATUS_BY_EVENT[RUN_QUEUE_REQUESTED]
+            return
+        self.status = next_status
+        self.queued_mode = None
+        self.queued_at_seq = None
+        self.pending_queue = None
 
-    return RunProjection(
-        status=status,
-        projected_at_seq=projected_at_seq,
-        current_revision_id=current_revision_id,
-        queued_mode=queued_mode,
-        queued_at_seq=queued_at_seq,
-        ranges=tuple(ranges),
-    )
+    def snapshot(self) -> RunProjection:
+        return RunProjection(
+            status=self.status,
+            projected_at_seq=self.projected_at_seq,
+            current_revision_id=self.current_revision_id,
+            queued_mode=self.queued_mode,
+            queued_at_seq=self.queued_at_seq,
+            ranges=tuple(self.ranges),
+        )
+
+
+def project_run(events: Iterable[Mapping[str, Any]]) -> RunProjection:
+    """Fold a journal prefix without consulting mutable Run metadata."""
+    state = LifecycleState()
+    for event in events:
+        state.apply(event)
+    return state.snapshot()

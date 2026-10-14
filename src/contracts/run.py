@@ -342,6 +342,12 @@ class RunStatusResponse(BaseModel):
     exit_code: Optional[int] = None
     error: Optional[str] = None
     rerun_mode: Literal["resume", "overwrite"] = "resume"
+    queue_ticket: Optional[int] = Field(
+        default=None,
+        description="Global queue arrival ticket of the latest queue request "
+        "(minted per request, carried by the run.queue_requested Journal "
+        "event). Feature-detect on presence: absent on pre-ticket Journals.",
+    )
     labels: dict[str, str] = Field(default_factory=dict)
     result_file_count: int = 0
     created_at: datetime

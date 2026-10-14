@@ -21,6 +21,7 @@ import os
 import sys
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -34,6 +35,7 @@ from src.execution_runtime.engine_layout import (
 
 
 ENGINE_REQUEST = Path(".tdease") / "engine-request.json"
+EXECUTION_OUTPUTS = Path(".tdease") / "execution-outputs.json"
 
 # Internal or derived entries that never belong in a product-facing resource
 # projection: tmpdir/_cores/_nodes are engine-injected, mem/disk and *_mib are
@@ -81,8 +83,7 @@ def _resource_violations(jobs, limits: dict[str, int]) -> list[str]:
     return violations
 
 
-def _projection_from_dag(dag) -> dict:
-    engine_dag = dag.workflow_api._workflow.dag
+def _projection_from_dag(engine_dag) -> dict:
     jobs = list(engine_dag.jobs)
     return {
         "nodes": [
@@ -108,9 +109,49 @@ def _projection_from_dag(dag) -> dict:
             # keeps them, so dropping their edges left them isolated.
             {"source": engine_dag.jobid(dependency), "target": engine_dag.jobid(job)}
             for job in jobs
-            for dependency in engine_dag._dependencies[job]
+            for dependency in engine_dag.dependencies[job]
         ],
     }
+
+
+def _execution_outputs_from_dag(engine_dag, root: Path) -> list[str]:
+    """Run-relative outputs of the jobs this execution actually executed.
+
+    The engine DAG is the only attribution authority: a job counts when the
+    engine put it in the needrun set for THIS attempt and it reached the
+    finished set. Up-to-date jobs (resume) are excluded -- their outputs stay
+    attributed to the execution that produced them, and the results manifest
+    keeps them via its retained-entries merge.
+    """
+    outputs: list[str] = []
+    seen: set[str] = set()
+    for job in engine_dag.jobs:
+        if not (engine_dag.needrun(job) and engine_dag.finished(job)):
+            continue
+        for item in getattr(job, "output", ()) or ():
+            path = Path(str(item))
+            if path.is_absolute():
+                try:
+                    path = path.relative_to(root)
+                except ValueError:
+                    continue  # an output outside the run root is not a run product
+            rel = path.as_posix()
+            parts = rel.split("/")
+            if not rel or ".." in parts or (len(parts[0]) == 2 and parts[0][1] == ":"):
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                outputs.append(rel)
+    return sorted(outputs)
+
+
+def _write_json_atomically(target: Path, payload: dict) -> None:
+    # Atomic replace: a bare write_text killed mid-way (disk full, hard kill)
+    # leaves a partial file that downstream readers would parse as raw garbage.
+    payload_text = json.dumps(payload, ensure_ascii=False)
+    tmp_target = target.with_suffix(target.suffix + ".tmp")
+    tmp_target.write_text(payload_text, encoding="utf-8")
+    os.replace(tmp_target, target)
 
 
 class _JobEventHandler(logging.Handler):
@@ -165,8 +206,7 @@ class _JobEventHandler(logging.Handler):
 
 def main() -> int:
     from snakemake.api import SnakemakeApi
-    import snakemake.shell as engine_shell
-    import snakemake.workflow as engine_workflow
+    import snakemake.workflow as engine_workflow_module
     from snakemake.persistence.file import FilePersistence as UpstreamFilePersistence
     from snakemake.settings.types import (
         ConfigSettings,
@@ -205,7 +245,7 @@ def main() -> int:
         def __init__(self, *args, path=None, **kwargs):
             super().__init__(*args, path=path or engine_root, **kwargs)
 
-    engine_workflow.FilePersistence = TDEaseEnginePersistence
+    engine_workflow_module.FilePersistence = TDEaseEnginePersistence
 
     # Everything else (logging, shell tmpdir, workflow tmpdir, storage) reads
     # the literal ".snakemake" relative to cwd. Make that name a junction into
@@ -218,10 +258,6 @@ def main() -> int:
             # Upstream may create a temporary real directory; it is removed below.
             pass
 
-    # TDEase writes long shell commands itself through the managed process
-    # boundary; prevent the upstream helper from creating a branded breadcrumb.
-    engine_shell.MAX_ARG_LEN = 2**31 - 1
-
     output_settings = OutputSettings(
         dryrun=request.mode == "dry-run",
         printshellcmds=True,
@@ -229,6 +265,9 @@ def main() -> int:
         skip_plugin_handlers=True,
         enable_file_logging=False,
     )
+    # The one execution-settings instance for the whole process: the single DAG
+    # build below must mirror exactly what the executor will run with.
+    execution_settings = ExecutionSettings(retries=request.retries)
     try:
         with SnakemakeApi(output_settings) as api:
             workflow = api.workflow(
@@ -249,17 +288,22 @@ def main() -> int:
             )
             if request.unlock_before_execute:
                 dag.unlock()
-            # The DAG is always built: the resource feasibility assertion and
-            # the projection both read resolved per-job values off it.
-            dag.workflow_api._workflow._prepare_dag(
+            # The single DAG build for the whole process, with the arguments
+            # Workflow.execute() itself would pass: the projection, the resource
+            # assertion, and the executor below all consume THIS graph.
+            engine_workflow = dag.workflow_api._workflow
+            engine_workflow._prepare_dag(
                 forceall=dag.dag_settings.forceall,
-                ignore_incomplete=True,
-                lock_warn_only=True,
+                ignore_incomplete=execution_settings.ignore_incomplete,
+                lock_warn_only=request.mode == "dry-run",
+                nolock=not execution_settings.lock,
+                shadow_prefix=execution_settings.shadow_prefix,
             )
-            dag.workflow_api._workflow._build_dag()
-            projection = _projection_from_dag(dag)
+            engine_workflow._build_dag()
+            engine_dag = engine_workflow.dag
+            projection = _projection_from_dag(engine_dag)
             violations = _resource_violations(
-                dag.workflow_api._workflow.dag.jobs, _run_resource_limits(request)
+                engine_dag.jobs, _run_resource_limits(request)
             )
             if violations:
                 for violation in violations:
@@ -278,15 +322,7 @@ def main() -> int:
                 )
                 projection_target.relative_to(root)
                 projection_target.parent.mkdir(parents=True, exist_ok=True)
-                # Atomic replace: a bare write_text killed mid-way (disk full,
-                # hard kill) leaves a partial file that the dry-run route would
-                # otherwise parse as a raw 500 instead of an invalid plan.
-                payload = json.dumps(projection, ensure_ascii=False)
-                tmp_target = projection_target.with_suffix(
-                    projection_target.suffix + ".tmp"
-                )
-                tmp_target.write_text(payload, encoding="utf-8")
-                os.replace(tmp_target, projection_target)
+                _write_json_atomically(projection_target, projection)
             if request.mode == "execute" and request.job_event_path:
                 from snakemake.logging import logger as engine_logger
 
@@ -298,10 +334,30 @@ def main() -> int:
                         json.dumps({"type": "workflow.graph", **projection}) + "\n"
                     )
                 engine_logger.addHandler(_JobEventHandler(event_target))
+            # Workflow.execute() unconditionally rebuilds the DAG through the
+            # private _prepare_dag/_build_dag, discarding the graph projected
+            # above. Pinning both to no-ops on this instance keeps the public
+            # execute_workflow() entry while the build stays the only one.
+            engine_workflow._prepare_dag = lambda *args, **kwargs: None
+            engine_workflow._build_dag = lambda *args, **kwargs: None
             dag.execute_workflow(
                 executor="dryrun" if request.mode == "dry-run" else "local",
-                execution_settings=ExecutionSettings(retries=request.retries),
+                execution_settings=execution_settings,
             )
+            # execute_workflow returns only on success. The record is the
+            # attribution source for this execution's real products: dry-run
+            # plans nothing and up-to-date resumes ran nothing, so neither
+            # writes one.
+            if request.mode == "execute":
+                _write_json_atomically(
+                    root / EXECUTION_OUTPUTS,
+                    {
+                        "schema_version": 1,
+                        "mode": request.mode,
+                        "written_at": datetime.now(timezone.utc).isoformat(),
+                        "outputs": _execution_outputs_from_dag(engine_dag, root),
+                    },
+                )
     except Exception as exc:
         print(f"TDEase workflow engine failed: {exc}", file=sys.stderr)
         return 1

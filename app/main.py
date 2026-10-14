@@ -65,9 +65,14 @@ from src.services.workspace_roots import configure_workspace_root_runtime
 async def lifespan(app: FastAPI):
     logger.info("TDEaseNexus starting (env=%s)", BACKEND_SETTINGS.environment)
     from src.execution_runtime.storage import get_storage
+    from src.services.run_commands import get_run_commands
+
     storage = get_storage()
     storage.bootstrap()
-    recovered = storage.reconcile_orphaned_runs()
+    # The single recovery pass (BACKEND-RUN-SERVICE §2.5): ownership is the
+    # execution lease, so an API restart never touches a run a live worker is
+    # still finalizing.
+    recovered = get_run_commands().reconcile()
     if recovered:
         logger.warning("Recovered orphaned runs: %s", recovered)
     db_path = str(storage.data / "database" / "db.sqlite3")

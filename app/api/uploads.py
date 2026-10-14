@@ -29,8 +29,9 @@ async def upload_blob(digest: str, file: UploadFile = File(...)):
             remedy="Address the blob by the lowercase hex sha256 of its content.",
             retryable=False,
         )
+    storage = get_storage()
     try:
-        stored, size = get_storage().blob_put_stream(file.file, digest)
+        stored, size = storage.blob_put_stream(file.file, digest)
     except ValueError as exc:
         raise TDEaseError(
             code=ErrorCode.BACKEND_UPLOAD_INCOMPLETE,
@@ -40,4 +41,8 @@ async def upload_blob(digest: str, file: UploadFile = File(...)):
         ) from exc
     finally:
         await file.close()
+    # The upload is complete but not yet referenced by any definition; the
+    # marker keeps a worker-restart GC from collecting a multi-file upload
+    # whose submission has not committed yet.
+    storage.touch_staging_marker(stored)
     return {"sha256": stored, "size": size}

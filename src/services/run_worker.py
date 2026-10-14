@@ -29,6 +29,7 @@ from src.execution_runtime.storage import (
     process_identity,
     process_identity_alive,
 )
+from src.services.run_commands import Lease, get_run_commands
 
 logger = logging.getLogger(__name__)
 
@@ -131,13 +132,21 @@ def _dequeue() -> dict | None:
             data = get_storage().read_json(runs_dir / run_id / "run.json")
             if not data:
                 continue
-            if get_storage().claim_run(run_id):
+            if get_storage().acquire_lease(run_id):
                 return data
         return None
     except Exception:
         logger.exception("Run queue index unavailable; scanning filesystem truth")
 
-    candidates: list[tuple[float, str, dict]] = []
+    # One ordering with the index path (BACKEND-RUN-SERVICE §2.4): the global
+    # queue ticket minted at arrival. Each Run's local journal seq is an
+    # execution-attempt identity, not an arrival order -- ordering by it let a
+    # newly submitted Run (local seq 2) jump a resubmitted older Run (local
+    # seq 200). A Run absent from the mint log (pre-ticket journal) orders
+    # after ticketed arrivals by created_at, mirroring the index's NULL-
+    # queued_ticket sort.
+    tickets = get_storage().latest_queue_tickets()
+    candidates: list[tuple[int, int, float, str, dict]] = []
     for rd in runs_dir.iterdir():
         if not rd.is_dir():
             continue
@@ -145,32 +154,31 @@ def _dequeue() -> dict | None:
         if not rj.exists():
             continue
         data = json.loads(rj.read_text(encoding="utf-8"))
-        projection, _snapshot = get_storage().project_run_snapshot(
-            str(data.get("run_id", rd.name))
-        )
+        run_id = str(data.get("run_id", rd.name))
+        projection, _snapshot = get_storage().project_run_snapshot(run_id)
         if projection.status != "QUEUED":
             continue
 
-        # Order by the journal seq of the queue request itself (the same key
-        # the Run index uses): resubmission preserves created_at, so ordering
-        # by it would let an old resubmitted run jump every newer run.
-        queued_at = projection.queued_at_seq
-        if queued_at is None:
-            created_at = data.get("created_at")
+        ticket = tickets.get(run_id)
+        if ticket is not None:
+            candidates.append((0, ticket, 0.0, run_id, data))
+        else:
             try:
-                queued_at = datetime.fromisoformat(str(created_at)).timestamp()
+                created_ts = datetime.fromisoformat(
+                    str(data.get("created_at"))
+                ).timestamp()
             except (TypeError, ValueError, OSError):
-                queued_at = rj.stat().st_mtime
-        candidates.append((queued_at, str(data.get("run_id", rd.name)), data))
+                created_ts = rj.stat().st_mtime
+            candidates.append((1, 0, created_ts, run_id, data))
 
-    for _queued_at, _run_id, data in sorted(
-        candidates, key=lambda item: (item[0], item[1])
+    for _flag, _ticket, _created, _run_id, data in sorted(
+        candidates, key=lambda item: (item[0], item[1], item[2], item[3])
     ):
         try:
-            if get_storage().claim_run(data["run_id"]):
+            if get_storage().acquire_lease(data["run_id"]):
                 return data
             continue
-        except (FileExistsError, KeyError, ValueError):
+        except (KeyError, ValueError):
             continue
 
     return None
@@ -206,10 +214,12 @@ def execute_run(run_data: dict) -> None:
 
     Nothing may end silently. Every wrapper stage around the engine names
     itself in the worker log (`logs/tasks/worker.log`, part of the run-log
-    surface), and a death BEFORE the engine still leaves a terminal event
-    plus the traceback there. Letting an exception escape would bounce the
-    claim back to QUEUED with no event and no log -- an invisible crash loop
-    that, three times in a minute, takes the whole Backend down.
+    surface), and a death BEFORE the engine still leaves a diagnostic event,
+    a terminal via ``finish()`` when the journal still holds a live execution
+    for this dispatch, and the traceback there. Letting an exception escape
+    would bounce the lease back to QUEUED with no event and no log -- an
+    invisible crash loop that, three times in a minute, takes the whole
+    Backend down.
     """
     run_id = run_data["run_id"]
     storage = get_storage()
@@ -227,18 +237,20 @@ def execute_run(run_data: dict) -> None:
         except OSError:
             logger.exception("Worker log append failed for %s", run_id)
 
-    terminal_emitted = False
     revision_id = str(run_data.get("definition_revision_id") or "")
     queue_tag = "q?"
     stage = "startup"
+    lease: Lease | None = None
+    commands = get_run_commands()
     try:
         projection, _snapshot = storage.project_run_snapshot(run_id)
         if projection.status == RunStatus.CANCELLED.value:
-            # Cancel landed inside the claim window (after claim_run, before
-            # this read): the journal already holds the terminal fact. Falling
-            # through to the failure handler below would append run.failed
-            # from CANCELLED -- an illegal lifecycle transition that poisons
-            # every future projection of this Run. There is nothing to execute.
+            # Cancel landed inside the claim window (after the lease acquire,
+            # before this read): the journal already holds the terminal fact.
+            # Falling through to the failure handler below would append
+            # run.failed from CANCELLED -- an illegal lifecycle transition
+            # that poisons every future projection of this Run. There is
+            # nothing to execute.
             wlog(
                 f"[q?] {run_id} was cancelled inside the claim window; nothing to execute"
             )
@@ -299,6 +311,14 @@ def execute_run(run_data: dict) -> None:
         # race a definition submitted between the projection read and this read:
         # revision A's files with revision B's rerun_mode.
         stage = "queue-request"
+        lease = commands.begin_execution(run_id)
+        if lease is None:
+            # The dispatch window closed under the command lock (cancel or a
+            # terminal landed first): the journal already says so.
+            wlog(
+                f"[{queue_tag}] dispatch window closed for {revision_id}; nothing to execute"
+            )
+            return
         queue_event = next(
             (
                 event
@@ -318,15 +338,21 @@ def execute_run(run_data: dict) -> None:
         execution_mode = projection.queued_mode or "execute"
         rerun_mode = str(queue_data.get("rerun_mode", "resume"))
         _index_run(run_data, storage)
+
+        def beat(new_stage: str) -> str:
+            # Lease observability at the stage boundary; no liveness role.
+            commands.heartbeat_stage(lease, new_stage)
+            return new_stage
+
         try:
-            stage = "materialize"
+            stage = beat("materialize")
             wlog(
                 f"[{queue_tag}] materializing {revision_id} "
                 f"({commit.materialization_strategy}, {len(commit.workspace_files)} input(s), "
                 f"{len(commit.nodes)} node binding(s))"
             )
             _materialize_run(commit, storage)
-            stage = "engine"
+            stage = beat("engine")
             wlog(
                 f"[{queue_tag}] engine starting (mode={execution_mode}, rerun={rerun_mode})"
             )
@@ -341,26 +367,32 @@ def execute_run(run_data: dict) -> None:
                 f"in {result.run_time_seconds:.1f}s"
             )
             if commit.materialization_strategy == "local_workspace_hardlink":
-                stage = "verify-inputs"
+                stage = beat("verify-inputs")
                 storage.verify_local_inputs(run_id)
                 wlog(f"[{queue_tag}] shared inputs verified unchanged")
         except TDEaseError as exc:
             from src.execution_runtime.runtime import ExecutionResult
 
-            terminal_emitted = True
-            wlog(f"[{queue_tag}] FAILED at {stage}: {exc}")
-            EventEmitter(run_id).runtime_message("error", str(exc))
-            result = ExecutionResult(success=False, exit_code=-1, error=exc)
-            EventEmitter(run_id).run_failed(
-                revision_id=revision_id,
+            commands.finish(
+                run_id,
+                "failed",
                 exit_code=-1,
                 run_time_seconds=0.0,
                 error_message=f"[{stage}] {exc}",
             )
+            wlog(f"[{queue_tag}] FAILED at {stage}: {exc}")
+            EventEmitter(run_id).runtime_message("error", str(exc))
+            result = ExecutionResult(success=False, exit_code=-1, error=exc)
         except Exception as exc:
             from src.execution_runtime.runtime import ExecutionResult
 
-            terminal_emitted = True
+            commands.finish(
+                run_id,
+                "failed",
+                exit_code=-1,
+                run_time_seconds=0.0,
+                error_message=f"[{stage}] {exc}",
+            )
             wlog(f"[{queue_tag}] FAILED at {stage}: {type(exc).__name__}: {exc}")
             import traceback
 
@@ -383,41 +415,36 @@ def execute_run(run_data: dict) -> None:
             # execute() raises only from inside its own try/except, which
             # always appends a terminal event first -- but the local-input
             # verification calls above are outside execute() and can raise
-            # with no terminal event on record at all. Append one now so the
-            # projection has a terminal fact instead of remaining RUNNING/QUEUED.
-            EventEmitter(run_id).run_failed(
-                revision_id=revision_id,
-                exit_code=-1,
-                run_time_seconds=0.0,
-                error_message=f"[{stage}] {exc}",
-            )
+            # with no terminal event on record at all. finish() re-folded the
+            # journal and appended one only if this execution was still live.
 
         manifest_path = None
         if result.success:
-            stage = "manifest"
+            stage = beat("manifest")
             try:
                 manifest_path = storage.write_results_manifest(run_id, revision_id)
-                terminal_emitted = True
-                EventEmitter(run_id).run_succeeded(
-                    revision_id=revision_id,
+                commands.finish(
+                    run_id,
+                    "succeeded",
                     run_time_seconds=result.run_time_seconds,
                     total_tasks=result.total_tasks,
                 )
                 wlog(f"[{queue_tag}] manifest published for {revision_id}")
             except Exception as exc:
-                terminal_emitted = True
-                wlog(f"[{queue_tag}] FAILED at manifest finalization: {exc}")
-                EventEmitter(run_id).run_failed(
-                    revision_id=revision_id,
+                commands.finish(
+                    run_id,
+                    "failed",
                     exit_code=-1,
                     run_time_seconds=0.0,
                     error_message=f"result manifest finalization failed: {exc}",
                 )
+                wlog(f"[{queue_tag}] FAILED at manifest finalization: {exc}")
     except Exception as exc:
         # Death outside the staged block (journal/projection/queue-request
         # reading, or anything after a terminal event). It must still be
-        # visible: traceback to the worker log, and a terminal event when the
-        # journal has none yet. Never re-raise -- that would crash-loop the
+        # visible: traceback to the worker log, a runtime error event, and a
+        # terminal via finish() when the journal still has a live execution
+        # for this dispatch. Never re-raise -- that would crash-loop the
         # claim invisibly.
         wlog(f"[{queue_tag}] FATAL at {stage}: {type(exc).__name__}: {exc}")
         import traceback
@@ -429,16 +456,23 @@ def execute_run(run_data: dict) -> None:
                 traceback.print_exc(file=stream)
         except OSError:
             logger.exception("Worker traceback write failed for %s", run_id)
-        if not terminal_emitted:
-            try:
-                EventEmitter(run_id).run_failed(
-                    revision_id=revision_id,
-                    exit_code=-1,
-                    run_time_seconds=0.0,
-                    error_message=f"worker aborted at {stage}: {type(exc).__name__}: {exc}",
-                )
-            except Exception:
-                logger.exception("Worker terminal event failed for %s", run_id)
+        try:
+            EventEmitter(run_id).runtime_message(
+                "error",
+                f"worker aborted at {stage}: {type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            logger.exception("Worker diagnostic event failed for %s", run_id)
+        try:
+            commands.finish(
+                run_id,
+                "failed",
+                exit_code=-1,
+                run_time_seconds=0.0,
+                error_message=f"worker aborted at {stage}: {type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            logger.exception("Worker terminal event failed for %s", run_id)
         logger.exception("Worker execute_run failed for %s", run_id)
         return
 
@@ -459,8 +493,9 @@ def execute_run(run_data: dict) -> None:
                 index.mark_dirty()
             logger.exception("Worker Run file index update failed for %s", run_id)
 
-    # Cleanup claim
-    storage.release_claim(run_id)
+    # Cleanup: the lease is released only after finish() -- while it names a
+    # live process, reconcile treats this execution as owned (§2.5).
+    storage.release_lease(run_id)
 
 
 def run_loop(
@@ -479,7 +514,7 @@ def run_loop(
     storage = get_storage()
     storage.bootstrap()
     _prepare_worker(storage)
-    storage.reconcile_orphaned_runs()
+    get_run_commands().reconcile()
     parent_identity = process_identity(parent_pid) if parent_pid else None
 
     while True:
@@ -515,7 +550,7 @@ def run_loop(
                     try:
                         execute_run(run_data)
                     finally:
-                        storage.release_claim(run_data["run_id"])
+                        storage.release_lease(run_data["run_id"])
             finally:
                 storage.release_execution_slot()
         except KeyboardInterrupt:

@@ -36,6 +36,10 @@ class BackendSettings:
     dry_run_timeout_seconds: int = 300
     log_tail_default_lines: int = 200
     log_tail_max_lines: int = 10_000
+    # How long an uploaded-but-not-yet-referenced blob's staging marker keeps
+    # it out of CAS garbage collection (BACKEND-RUN-SERVICE §2.7). The outer
+    # bound for abandoned uploads, not a liveness signal.
+    staging_ttl_seconds: int = 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,7 @@ def load_backend_settings(
     auth = _object(raw.get("auth"), "auth")
     resources = _object(raw.get("resources"), "resources")
     logging_config = _object(raw.get("logging"), "logging")
+    storage_config = _object(raw.get("storage"), "storage")
 
     environment = str(raw.get("environment", "development")).strip() or "development"
     deployment = raw.get("deploymentMode", "local")
@@ -179,6 +184,15 @@ def load_backend_settings(
     log_name = str(logging_config.get("level", "INFO")).strip().upper()
     reserved_cpus = resources.get("reservedLogicalCpus")
     reserved_memory = resources.get("reservedMemoryMb")
+    raw_staging_ttl = storage_config.get("stagingTtlSeconds")
+    try:
+        staging_ttl_seconds = (
+            24 * 60 * 60 if raw_staging_ttl is None else int(raw_staging_ttl)
+        )
+    except (TypeError, ValueError):
+        raise RuntimeError("storage.stagingTtlSeconds must be an integer") from None
+    if staging_ttl_seconds <= 0:
+        raise RuntimeError("storage.stagingTtlSeconds must be positive")
 
     source = os.environ if environ is None else environ
     if allow_env_overrides:
@@ -220,6 +234,7 @@ def load_backend_settings(
         node_root=node_root,
         reserved_logical_cpus=None if reserved_cpus is None else str(reserved_cpus),
         reserved_memory_mb=None if reserved_memory is None else str(reserved_memory),
+        staging_ttl_seconds=staging_ttl_seconds,
     )
 
 

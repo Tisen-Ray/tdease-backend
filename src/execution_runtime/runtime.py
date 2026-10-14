@@ -36,7 +36,6 @@ class ExecutionResult:
     total_tasks: int = 0
     succeeded_tasks: int = 0
     failed_tasks: int = 0
-    final_seq: int = 0
 
 
 def execute(
@@ -53,6 +52,11 @@ def execute(
     2. Resolve node bindings into engine config (the shared binding seam)
     3. Supervise one engine process; TDEaseError kept as-is, unknown
        exceptions map to ENGINE_RUNTIME_INTERNAL
+
+    Terminals on the engine paths append through run_commands.finish() --
+    the command module is the only constructor of lifecycle run.* events
+    (BACKEND-RUN-SERVICE.md §2.2), and its fold decides whether this
+    execution is still the one that may be terminalized.
     """
     storage = get_storage()
     run_id = commit.run_id
@@ -60,6 +64,8 @@ def execute(
     # Idempotent — worker re-enters after API
     storage.allocate_run(run_id)
 
+    # Job/task/graph events only: lifecycle run.* events (terminals included)
+    # belong to the command module (§2.2).
     emitter = EventEmitter(run_id)
 
     start = time.perf_counter()
@@ -86,6 +92,7 @@ def execute(
     # reaches them through absolute paths injected into config["nodes"]. Nothing
     # tool-related is ever written under the Run directory.
     from src.execution_runtime.bindings import engine_config
+    from src.services.run_commands import get_run_commands
 
     engine_request = WorkflowEngineRequest(
         mode="execute",
@@ -110,7 +117,9 @@ def execute(
     finally:
         cleanup_engine_alias(execution_root)
     if engine_result.cancelled or storage.check_cancelled(run_id):
-        emitter.run_cancelled(revision_id, time.perf_counter() - start)
+        get_run_commands().finish(
+            run_id, "cancelled", run_time_seconds=time.perf_counter() - start
+        )
         return ExecutionResult(
             success=False,
             exit_code=engine_result.exit_code,
@@ -123,7 +132,6 @@ def execute(
             ),
             run_time_seconds=time.perf_counter() - start,
             total_tasks=1,
-            final_seq=emitter.last_seq,
         )
     if engine_result.success:
         succeeded = 1
@@ -141,8 +149,12 @@ def execute(
                 "reason": engine_result.stderr_tail,
             },
         )
-        emitter.run_failed(
-            revision_id, engine_result.exit_code, total_elapsed, str(error)
+        get_run_commands().finish(
+            run_id,
+            "failed",
+            exit_code=engine_result.exit_code,
+            run_time_seconds=total_elapsed,
+            error_message=str(error),
         )
         return ExecutionResult(
             success=False,
@@ -151,7 +163,6 @@ def execute(
             run_time_seconds=total_elapsed,
             total_tasks=1,
             failed_tasks=1,
-            final_seq=emitter.last_seq,
         )
 
     # Success is finalized by the Worker only after local-input verification
@@ -165,7 +176,6 @@ def execute(
         total_tasks=total,
         succeeded_tasks=succeeded,
         failed_tasks=failed,
-        final_seq=emitter.last_seq,
     )
 
 
