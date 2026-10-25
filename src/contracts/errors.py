@@ -109,6 +109,9 @@ class ErrorCode(str, Enum):
     BACKEND_PACKAGE_DIGEST_UNRESOLVABLE = "BACKEND_PACKAGE_DIGEST_UNRESOLVABLE"
     BACKEND_UPLOAD_INCOMPLETE = "BACKEND_UPLOAD_INCOMPLETE"
     BACKEND_PRESIGNED_EXPIRED = "BACKEND_PRESIGNED_EXPIRED"
+    # Hub-side node pairing: a malformed enrollment string is a caller error
+    # against the Hub's own registry, not a Run fault and not a package fault.
+    NODE_ENROLLMENT_INVALID = "NODE_ENROLLMENT_INVALID"
 
     # -- environment (§3.6) --
     # The four AUTH_* codes are environment-domain because a Desktop launch that
@@ -178,6 +181,7 @@ CODE_DOMAIN: dict[ErrorCode, ErrorDomain] = {
     ErrorCode.BACKEND_PACKAGE_DIGEST_UNRESOLVABLE: ErrorDomain.BACKEND,
     ErrorCode.BACKEND_UPLOAD_INCOMPLETE: ErrorDomain.BACKEND,
     ErrorCode.BACKEND_PRESIGNED_EXPIRED: ErrorDomain.BACKEND,
+    ErrorCode.NODE_ENROLLMENT_INVALID: ErrorDomain.BACKEND,
     # environment
     ErrorCode.AUTH_BOOTSTRAP_SECRET_MISSING: ErrorDomain.ENVIRONMENT,
     ErrorCode.AUTH_BOOTSTRAP_SECRET_INVALID: ErrorDomain.ENVIRONMENT,
@@ -255,6 +259,8 @@ CODE_HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.WORKSPACE_BLOB_NOT_FOUND: 404,
     # forbidden, not correctable by editing the request
     ErrorCode.WORKSPACE_PATH_ESCAPE: 403,
+    # bad pairing payload — correctable by re-running enroll on the node
+    ErrorCode.NODE_ENROLLMENT_INVALID: 400,
 }
 
 
