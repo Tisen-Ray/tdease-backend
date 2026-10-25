@@ -304,6 +304,7 @@ def execute_run(run_data: dict) -> None:
             memory_mb=queued_definition.get("memory_mb"),
             labels=queued_definition.get("labels", {}),
             result_specs=queued_definition.get("result_specs", []),
+            placement=queued_definition.get("placement"),
         )
 
         # The queue request that made THIS execution queued is the one at
