@@ -21,6 +21,3 @@ class WorkflowEngineRequest(BaseModel):
     unlock_before_execute: bool = False
     projection_path: str | None = None
     job_event_path: str | None = None
-    # Fleet dispatch section; present only when a pinned remote node was
-    # resolved at schedule time: {endpoint, token, tool_map, executor_dir}.
-    fleet: dict | None = None

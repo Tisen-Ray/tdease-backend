@@ -205,23 +205,6 @@ class _JobEventHandler(logging.Handler):
 
 
 def main() -> int:
-    # Fleet dispatch, take one: the executor plugin must sit on sys.path
-    # BEFORE snakemake is imported — plugin discovery runs at import time.
-    # Parse the request with plain json here; the validated model comes later.
-    import json as _json
-
-    _early_fleet_dir = None
-    try:
-        _early = _json.loads(
-            (Path.cwd() / ENGINE_REQUEST).read_text(encoding="utf-8")
-        )
-        _early_fleet = _early.get("fleet") or {}
-        _early_fleet_dir = _early_fleet.get("executor_dir")
-    except Exception:
-        _early_fleet_dir = None
-    if _early_fleet_dir and _early_fleet_dir not in sys.path:
-        sys.path.insert(0, _early_fleet_dir)
-
     from snakemake.api import SnakemakeApi
     import snakemake.workflow as engine_workflow_module
     from snakemake.persistence.file import FilePersistence as UpstreamFilePersistence
@@ -242,16 +225,6 @@ def main() -> int:
     except (OSError, ValidationError) as exc:
         print(f"Invalid TDEase engine request: {exc}", file=sys.stderr)
         return 2
-
-    # Fleet dispatch: the executor plugin must be importable BEFORE snakemake
-    # scans sys.path for snakemake_executor_plugin_* modules (registration
-    # happens at import time), and the import must precede the plugin-backed
-    # execute_workflow below.
-    fleet = request.fleet
-    if fleet and fleet.get("executor_dir"):
-        _dir = str(fleet["executor_dir"])
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
 
     snakefile = (root / request.snakefile).resolve(strict=False)
     try:
@@ -300,9 +273,6 @@ def main() -> int:
             workflow = api.workflow(
                 resource_settings=ResourceSettings(
                     cores=request.cores,
-                    # Remote executors demand an explicit node/job count;
-                    # mirror the local contract (one job per allocated core).
-                    nodes=request.cores if request.fleet else None,
                     resources=_run_resource_limits(request),
                 ),
                 config_settings=ConfigSettings(config=request.config),
@@ -370,25 +340,8 @@ def main() -> int:
             # execute_workflow() entry while the build stays the only one.
             engine_workflow._prepare_dag = lambda *args, **kwargs: None
             engine_workflow._build_dag = lambda *args, **kwargs: None
-            if fleet and request.mode == "execute":
-                # Pinned remote node: dispatch through the tdease-node
-                # executor plugin (argv plans over HTTP; no shell leaves the hub).
-                from snakemake_executor_plugin_tdease_node import (
-                    ExecutorSettings as TdeaseNodeSettings,
-                )
-
-                executor_name = "tdease-node"
-                tool_map_list = [
-                    f"{rule}={tool}" for rule, tool in (fleet.get("tool_map") or {}).items()
-                ]
-                executor_settings = TdeaseNodeSettings(
-                    endpoint=fleet.get("endpoint", "http://127.0.0.1:8731"),
-                    token=fleet.get("token"),
-                    tool_map=tool_map_list,
-                )
-            else:
-                executor_name = "dryrun" if request.mode == "dry-run" else "local"
-                executor_settings = None
+            executor_name = "dryrun" if request.mode == "dry-run" else "local"
+            executor_settings = None
             dag.execute_workflow(
                 executor=executor_name,
                 execution_settings=execution_settings,

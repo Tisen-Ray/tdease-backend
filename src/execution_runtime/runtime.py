@@ -39,57 +39,6 @@ class ExecutionResult:
     failed_tasks: int = 0
 
 
-def _resolve_fleet(commit: RunCommit, storage) -> dict | None:
-    """Turn a pinned placement into the engine's fleet dispatch section.
-
-    Placement is resolved HERE, once, at execution time — the single seam
-    the dry-run and the worker share. "local" and absent both mean the
-    ordinary local executor. A pinned node that is not in the registry
-    fails the Run (never a silent re-dispatch).
-    """
-    if commit.placement is None or commit.placement.node == "local":
-        return None
-    from src.services.node_registry import load_registry
-
-    # The registry lives beside the catalog under the SAME data root the
-    # storage owns (works for serve layouts and test layouts alike):
-    # <data>/config/nodes.json
-    registry_path = storage.data / "config" / "nodes.json"
-    registry = load_registry(registry_path)
-    entry = next(
-        (n for n in registry["nodes"] if n["nodeId"] == commit.placement.node),
-        None,
-    )
-    if entry is None:
-        raise TDEaseError(
-            code=ErrorCode.RUN_NODE_NOT_FOUND,
-            message=(
-                f"Pinned fleet node '{commit.placement.node}' is not in the "
-                f"registry ({registry_path})"
-            ),
-            remedy="Enroll the node (POST /api/nodes/enroll) or fix the placement.",
-            retryable=False,
-        )
-    executor_dir = Path(__file__).resolve().parents[3] / "tdease-node" / "executor"
-    if not executor_dir.is_dir():
-        raise TDEaseError(
-            code=ErrorCode.ENGINE_RUNTIME_INTERNAL,
-            message=f"tdease-node executor plugin directory missing: {executor_dir}",
-            remedy="Check the tdease-node checkout next to the backend.",
-            retryable=False,
-        )
-    tool_map = {
-        str(rule): str(tool)
-        for rule, tool in (commit.config.get("node_tool_map") or {}).items()
-    }
-    return {
-        "endpoint": entry["url"].rstrip("/"),
-        "token": entry.get("token"),
-        "tool_map": tool_map,
-        "executor_dir": str(executor_dir),
-    }
-
-
 def execute(
     commit: RunCommit,
     *,
@@ -146,18 +95,6 @@ def execute(
     from src.execution_runtime.bindings import engine_config
     from src.services.run_commands import get_run_commands
 
-    fleet = _resolve_fleet(commit, storage)
-    if fleet is not None:
-        storage.append_runtime_record(
-            run_id,
-            "info",
-            (
-                f"placement: node={commit.placement.node} (pinned) "
-                f"endpoint={fleet['endpoint']} tools={sorted(fleet['tool_map'].values())}"
-            ),
-            "engine",
-        )
-
     engine_request = WorkflowEngineRequest(
         mode="execute",
         snakefile="Snakefile",
@@ -169,7 +106,6 @@ def execute(
         rerun_incomplete=True,
         retries=0,
         job_event_path=".tdease/job-events.jsonl",
-        fleet=fleet,
     )
     adapter = SnakemakeAdapter(run_id, execution_root, storage, emitter)
     try:

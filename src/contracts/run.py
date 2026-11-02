@@ -79,24 +79,6 @@ class WorkflowProjection(BaseModel):
     edges: list[WorkflowJobEdge] = Field(default_factory=list)
 
 
-class PlacementSpec(BaseModel):
-    """
-    Where this Run's jobs execute when a fleet node is requested.
-
-    v1 semantics: a PINNED, whole-run, single-node choice. `node` is a fleet
-    node id (node_registry), or the literal "local". Pinning never silently
-    re-dispatches — an unreachable pinned node fails the Run with the
-    placement reason recorded. The rule->tool mapping for the remote node
-    travels in commit.config["node_tool_map"] (workflow knowledge, not
-    placement knowledge).
-    """
-
-    node: str = Field(
-        description="Fleet node id from the node registry, or 'local'",
-        pattern=r"^[a-z0-9_-]+$",
-    )
-
-
 class RunCommit(BaseModel):
     """
     Immutable Run commit — submitted by frontend/CLI/Agent; the backend only
@@ -169,12 +151,6 @@ class RunCommit(BaseModel):
     nodes: list[NodeBinding] = Field(
         default_factory=list,
         description="Locked node binary mapping",
-    )
-
-    # Fleet placement (v1: pinned, whole-run, single node)
-    placement: Optional[PlacementSpec] = Field(
-        default=None,
-        description="Pinned fleet node for remote execution; absent = local",
     )
 
     # Published Results — declared "answers"; see docs/design/CORE-ARCHITECTURE.md 3
