@@ -12,6 +12,11 @@ from src.contracts.errors import ErrorCode, TDEaseError
 router = APIRouter(prefix="/api/v2/uploads", tags=["uploads"])
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 
+# Hard ceiling for one streamed blob: run inputs are scientific data files,
+# none of which approach this size; the cap keeps an authenticated caller
+# from streaming the disk full.
+_MAX_BLOB_BYTES = 32 * 1024 * 1024 * 1024
+
 
 @router.post("/manifest")
 async def negotiate_manifest(entries: list[TreeEntry] = Body(..., embed=True)):
@@ -31,7 +36,7 @@ async def upload_blob(digest: str, file: UploadFile = File(...)):
         )
     storage = get_storage()
     try:
-        stored, size = storage.blob_put_stream(file.file, digest)
+        stored, size = storage.blob_put_stream(file.file, digest, max_bytes=_MAX_BLOB_BYTES)
     except ValueError as exc:
         raise TDEaseError(
             code=ErrorCode.BACKEND_UPLOAD_INCOMPLETE,

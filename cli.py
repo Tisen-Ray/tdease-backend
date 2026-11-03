@@ -122,6 +122,23 @@ def _serve(args: argparse.Namespace) -> int:
     settings = _configure(args)
     settings.data_root.mkdir(parents=True, exist_ok=True)
 
+    # Fail closed: tokenless local auth on a non-loopback bind would expose the
+    # full owner API (including Snakefile execution, i.e. arbitrary Python) to
+    # the network with zero secrets on the wire. Bearer auth is required for
+    # any remote bind.
+    if settings.auth_mode == "local" and settings.bind_host not in (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    ):
+        print(
+            "refusing to start: auth.mode=local only allows loopback binds "
+            f"(got server.host={settings.bind_host}); set auth.mode=bearer "
+            "with a bootstrapSecret to bind remotely",
+            file=sys.stderr,
+        )
+        return 2
+
     import uvicorn
 
     from app.main import app

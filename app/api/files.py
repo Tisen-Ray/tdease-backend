@@ -64,6 +64,13 @@ _PROTECTED_READ_PREFIXES = (
 # Backend process the next time any Run touches that node.
 _PROTECTED_WRITE_PREFIXES = _PROTECTED_READ_PREFIXES + ("nodes/",)
 
+# Hard ceiling on one /list response: `**` globs walk the whole data root.
+_LIST_MATCH_CAP = 5000
+
+# Hard ceiling on one text write through the generic Files API. Run-scale
+# data travels via uploads/blob streaming, not this endpoint.
+_MAX_TEXT_WRITE_BYTES = 64 * 1024 * 1024
+
 # ── Helpers ──
 
 # Root directory for file operations — single resolution point get_storage()
@@ -189,15 +196,41 @@ async def list_files(
     if not base.exists() or not base.is_dir():
         return {"files": []}
 
-    pattern = str(base / glob)
+    # The glob is attacker-controlled input joined unchecked onto the base:
+    # reject absolute patterns and parent-directory segments outright, and
+    # re-apply the protected-read containment to every match — otherwise the
+    # endpoint enumerates run ids / blob digests by name even though their
+    # content stays blocked.
+    cleaned_glob = glob.replace("\\", "/")
+    if (
+        cleaned_glob.startswith("/")
+        or (len(cleaned_glob) >= 2 and cleaned_glob[1] == ":")
+        or ".." in cleaned_glob.split("/")
+    ):
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_PATH_ESCAPE,
+            message="The glob pattern must be relative, without parent-directory segments.",
+            remedy="Use a relative glob pattern under the requested directory.",
+            retryable=False,
+            details={"glob": glob},
+        )
+
+    pattern = str(base / cleaned_glob)
     matches = glob_mod.glob(pattern, recursive=True)
     files = []
     for m in matches:
         try:
             rel = str(Path(m).resolve().relative_to(root)).replace("\\", "/")
-            files.append(rel)
         except ValueError:
             continue
+        if any(
+            rel == prefix.rstrip("/") or rel.startswith(prefix)
+            for prefix in _PROTECTED_READ_PREFIXES
+        ):
+            continue
+        files.append(rel)
+        if len(files) >= _LIST_MATCH_CAP:
+            break
 
     return {"files": sorted(files), "cwd": str(base.relative_to(root))}
 
@@ -241,6 +274,15 @@ async def write_file(
 ):
     """Write text content to a file. Protected paths are rejected."""
     from src.execution_runtime.storage import get_storage
+
+    if len(content.encode("utf-8")) > _MAX_TEXT_WRITE_BYTES:
+        raise TDEaseError(
+            code=ErrorCode.WORKSPACE_QUOTA_EXCEEDED,
+            message="The write exceeds the per-file size ceiling for this endpoint.",
+            remedy="Upload large files through the content-addressed uploads API.",
+            retryable=False,
+            details={"path": path, "limit_bytes": _MAX_TEXT_WRITE_BYTES},
+        )
 
     abs_path = _writable_path(path)
 

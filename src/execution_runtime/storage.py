@@ -1110,7 +1110,11 @@ class StorageLayout:
         return h
 
     def blob_put_stream(
-        self, source, expected_digest: str, chunk_size: int = 8 * 1024 * 1024
+        self,
+        source,
+        expected_digest: str,
+        chunk_size: int = 8 * 1024 * 1024,
+        max_bytes: int | None = None,
     ) -> tuple[str, int]:
         """Stream an uploaded file into CAS with one pass and bounded memory."""
         incoming = self.data / "store" / ".incoming"
@@ -1123,6 +1127,10 @@ class StorageLayout:
                 while chunk := source.read(chunk_size):
                     digest.update(chunk)
                     size += len(chunk)
+                    if max_bytes is not None and size > max_bytes:
+                        raise ValueError(
+                            f"upload exceeds the {max_bytes}-byte ceiling"
+                        )
                     target.write(chunk)
                 target.flush()
                 os.fsync(target.fileno())
