@@ -38,9 +38,7 @@ import json
 import logging
 import os
 import shutil
-import signal
 import stat
-import subprocess
 import tempfile
 import time
 import uuid
@@ -50,6 +48,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from src.execution_runtime.run_projector import RunProjection, project_run
+from src.execution_runtime.process_control import kill_tree
 
 logger = logging.getLogger(__name__)
 
@@ -1825,17 +1824,7 @@ class StorageLayout:
         if created and not process_identity_alive(f"{engine_pid}:{created}"):
             return  # the pid was recycled: this is not our engine
         try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/PID", str(int(engine_pid)), "/T", "/F"],
-                    capture_output=True,
-                    timeout=5,
-                )
-            else:
-                try:
-                    os.killpg(os.getpgid(int(engine_pid)), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+            kill_tree(int(engine_pid), graceful=True)
         except Exception:
             logger.exception(
                 "Engine tree kill failed for run %s (pid %s)", run_id, engine_pid

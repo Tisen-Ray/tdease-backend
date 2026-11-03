@@ -68,7 +68,6 @@ class EventType(str, Enum):
 
     # Task-level product events
     TASK_STARTED = "task.started"
-    TASK_PROGRESS = "task.progress"
     TASK_SUCCEEDED = "task.succeeded"
     TASK_FAILED = "task.failed"
     JOB_STARTED = "job.started"

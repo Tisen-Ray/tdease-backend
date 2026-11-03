@@ -326,19 +326,6 @@ def scan_node_catalog(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     return scan_nodes(root)
 
 
-def platform_id() -> str:
-    import sys
-
-    os_name = (
-        "win"
-        if sys.platform == "win32"
-        else "linux"
-        if sys.platform.startswith("linux")
-        else "macos"
-    )
-    return f"{os_name}-x64"
-
-
 def resolve_bindings(
     root: Path, bindings: list[Any]
 ) -> list[tuple[Any, dict[str, Any]]]:

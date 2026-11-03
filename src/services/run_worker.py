@@ -556,9 +556,7 @@ def run_loop(
         except KeyboardInterrupt:
             break
         except Exception:
-            import traceback
-
-            traceback.print_exc()
+            logger.exception("run loop iteration failed")
             time.sleep(poll_interval)
 
 

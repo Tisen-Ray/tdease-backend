@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import glob as glob_mod
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Body
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import APIRouter, Query, Body
+from fastapi.responses import PlainTextResponse
 
 from src.contracts.errors import ErrorCode, TDEaseError
 

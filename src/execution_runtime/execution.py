@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
-import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 def backend_child_env() -> dict[str, str]:
@@ -23,6 +25,7 @@ def backend_child_env() -> dict[str, str]:
 # engine_runner.main()).
 from src.execution_runtime.storage import get_storage  # noqa: E402
 from src.execution_runtime.resource_budget import RESOURCE_BUDGET  # noqa: E402
+from src.execution_runtime.process_control import kill_tree  # noqa: E402
 
 
 def _isolate_engine_process(run_id: str, task_id: str, pid: int) -> None:
@@ -86,8 +89,8 @@ def run_captured_process(
             args=(proc.pid,),
             daemon=True,
         ).start()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("workflow CPU isolation could not be applied: %s", exc)
 
     captured: list[str] = ["", ""]
 
@@ -127,32 +130,4 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     """Terminate the process group: SIGTERM, brief wait, then SIGKILL."""
     if proc is None or proc.poll() is not None:
         return
-    try:
-        if os.name == "nt":
-            # Windows: taskkill /T kills entire tree
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    proc.kill()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    kill_tree(proc.pid, graceful=True)

@@ -9,6 +9,7 @@ translation, and the engine exit result.  The child entrypoint remains in
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from src.contracts import EventType
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
@@ -345,9 +348,11 @@ class SnakemakeAdapter:
                     "started_at_unix": time.time(),
                 },
             )
-        except Exception:
-            # Reconciliation metadata is best-effort and cannot stop execution.
-            pass
+        except Exception as exc:
+            # Reconciliation metadata is best-effort and cannot stop execution,
+            # but an invisible failure here blinds kill_engine_tree (it reads
+            # this record to find the engine pid) — surface it.
+            logger.warning("engine process record could not be written: %s", exc)
 
     def _has_engine_locks(self) -> bool:
         lock_dir = self.run_root / ".tdease" / "engine" / "locks"

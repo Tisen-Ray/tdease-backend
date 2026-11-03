@@ -102,15 +102,3 @@ def _retry_later(database: Path, run_id: str, event: dict[str, Any]) -> None:
         _QUEUE.put_nowait((database, run_id, event))
     except queue.Full:
         RunIndex(database).mark_dirty()
-
-
-def wait_for_event_projection(timeout: float = 5.0) -> bool:
-    """Test/support hook: wait until the current in-process queue is empty."""
-    finished = threading.Event()
-
-    def waiter() -> None:
-        _QUEUE.join()
-        finished.set()
-
-    threading.Thread(target=waiter, daemon=True).start()
-    return finished.wait(timeout)

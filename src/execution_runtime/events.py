@@ -126,15 +126,6 @@ class EventEmitter:
             {"task_id": task_id, "step": step, "command": command},
         )
 
-    def task_progress(self, task_id: str, done: int, total: int) -> int:
-        pct = round(done / max(total, 1) * 100, 1)
-        return self._emit(
-            EventType.TASK_PROGRESS,
-            f"Task progress: {done}/{total}",
-            "info",
-            {"task_id": task_id, "done": done, "total": total, "percent": pct},
-        )
-
     def task_succeeded(
         self,
         task_id: str,
