@@ -133,6 +133,16 @@ def _dequeue() -> dict | None:
             if not data:
                 continue
             if get_storage().acquire_lease(run_id):
+                # Failure scenario (audit P0-1): the cache entry can go stale
+                # between queued_run_ids() and the claim (a cancel/fail cache
+                # write hit SQLITE_BUSY). Recheck the journal fold after the
+                # claim so a poisoned QUEUED entry cannot take the execution
+                # slot away from genuinely queued Runs.
+                projection, _snapshot = get_storage().project_run_snapshot(run_id)
+                if projection.status != RunStatus.QUEUED.value:
+                    get_storage().release_lease(run_id)
+                    index.mark_dirty()
+                    continue
                 return data
         return None
     except Exception:
@@ -153,23 +163,38 @@ def _dequeue() -> dict | None:
         rj = rd / "run.json"
         if not rj.exists():
             continue
-        data = json.loads(rj.read_text(encoding="utf-8"))
-        run_id = str(data.get("run_id", rd.name))
-        projection, _snapshot = get_storage().project_run_snapshot(run_id)
-        if projection.status != "QUEUED":
+        # Failure scenario (audit P1-2): one corrupt run.json (torn write,
+        # partial JSON) used to raise out of _dequeue entirely, stalling the
+        # whole queue forever. One unreadable candidate must only skip itself.
+        try:
+            data = json.loads(rj.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            logger.exception(
+                "Run queue fallback skipped an unreadable run.json: %s", rj
+            )
             continue
+        try:
+            run_id = str(data.get("run_id", rd.name))
+            projection, _snapshot = get_storage().project_run_snapshot(run_id)
+            if projection.status != "QUEUED":
+                continue
 
-        ticket = tickets.get(run_id)
-        if ticket is not None:
-            candidates.append((0, ticket, 0.0, run_id, data))
-        else:
-            try:
-                created_ts = datetime.fromisoformat(
-                    str(data.get("created_at"))
-                ).timestamp()
-            except (TypeError, ValueError, OSError):
-                created_ts = rj.stat().st_mtime
-            candidates.append((1, 0, created_ts, run_id, data))
+            ticket = tickets.get(run_id)
+            if ticket is not None:
+                candidates.append((0, ticket, 0.0, run_id, data))
+            else:
+                try:
+                    created_ts = datetime.fromisoformat(
+                        str(data.get("created_at"))
+                    ).timestamp()
+                except (TypeError, ValueError, OSError):
+                    created_ts = rj.stat().st_mtime
+                candidates.append((1, 0, created_ts, run_id, data))
+        except Exception:
+            logger.exception(
+                "Run queue fallback skipped an unprojectable Run: %s", rd.name
+            )
+            continue
 
     for _flag, _ticket, _created, _run_id, data in sorted(
         candidates, key=lambda item: (item[0], item[1], item[2], item[3])
@@ -203,9 +228,18 @@ def _has_queued_run() -> bool:
     for rd in runs_dir.iterdir():
         if not rd.is_dir() or not (rd / "run.json").exists():
             continue
-        projection, _snapshot = get_storage().project_run_snapshot(rd.name)
-        if projection.status == RunStatus.QUEUED.value:
-            return True
+        # Failure scenario (audit P1-2): same as _dequeue -- one corrupt or
+        # unprojectable Run must not wedge _has_queued_run (and with it the
+        # whole worker loop); skip the candidate and keep scanning.
+        try:
+            projection, _snapshot = get_storage().project_run_snapshot(rd.name)
+            if projection.status == RunStatus.QUEUED.value:
+                return True
+        except Exception:
+            logger.exception(
+                "Queued-run scan skipped an unprojectable Run: %s", rd.name
+            )
+            continue
     return False
 
 
@@ -259,6 +293,36 @@ def execute_run(run_data: dict) -> None:
             projection.status != RunStatus.QUEUED.value
             or not projection.current_revision_id
         ):
+            # Failure scenario (audit P0-1): a stale index entry said QUEUED
+            # while the journal fold said otherwise; the dequeue kept
+            # re-serving the same poisoned earliest-ticket Run and starved
+            # the whole queue at 1 Hz. Repair the cache BEFORE taking the
+            # visible failure path below, so this dispatch is the last one:
+            # point the index at the journal's truth and mark it dirty so the
+            # next reconcile rebuilds it.
+            wlog(
+                f"[q?] {run_id} is not queued (projection says "
+                f"{projection.status}); repairing the Run index"
+            )
+            logger.error(
+                "Run %s dequeued with a stale index entry (journal says %s); "
+                "repaired the cache",
+                run_id,
+                projection.status,
+            )
+            index = None
+            try:
+                from src.services.run_index import get_run_index
+
+                index = get_run_index()
+                index.update_status(run_id, projection.status)
+                index.mark_dirty()
+            except Exception:
+                if index is not None:
+                    index.mark_dirty()
+                logger.exception(
+                    "Run index repair failed for %s; index left dirty", run_id
+                )
             raise RuntimeError(
                 f"Run {run_id} is not backed by a queued Journal revision "
                 f"(projection says {projection.status})"

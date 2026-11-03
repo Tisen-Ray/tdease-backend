@@ -83,11 +83,16 @@ def _project_loop() -> None:
                     index.catch_up_run(storage, run_id)
                 except Exception:
                     index.mark_dirty()
-                    _retry_later(database, run_id, events[-1])
+                    _retry_later(database, run_id, events)
                     logger.exception("Run event projection gap repair deferred")
             except Exception:
+                # Failure scenario (audit P2-1): only the batch's LAST event
+                # was re-enqueued, so the earlier events of the group were
+                # consumed and dropped on a transient failure (SQLITE_BUSY) --
+                # the cache then trailed the journal until a full reconcile.
+                # Re-enqueue every event of the failed group.
                 index.mark_dirty()
-                _retry_later(database, run_id, events[-1])
+                _retry_later(database, run_id, events)
                 logger.exception(
                     "Run event projection deferred; filesystem truth is intact"
                 )
@@ -95,10 +100,11 @@ def _project_loop() -> None:
             _QUEUE.task_done()
 
 
-def _retry_later(database: Path, run_id: str, event: dict[str, Any]) -> None:
+def _retry_later(database: Path, run_id: str, events: list[dict[str, Any]]) -> None:
     """Retry on the projector thread; producers remain strictly non-blocking."""
     time.sleep(0.1)
-    try:
-        _QUEUE.put_nowait((database, run_id, event))
-    except queue.Full:
-        RunIndex(database).mark_dirty()
+    for event in events:
+        try:
+            _QUEUE.put_nowait((database, run_id, event))
+        except queue.Full:
+            RunIndex(database).mark_dirty()

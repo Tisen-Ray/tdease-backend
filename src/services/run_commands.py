@@ -135,7 +135,26 @@ def _cache_status_best_effort(storage: StorageLayout, run_id: str) -> None:
 
         write_status_cache(get_run_index(), storage, run_id)
     except Exception:
-        logger.debug("Run status cache write skipped for %s", run_id, exc_info=True)
+        # Failure scenario (audit P0-1): a SQLITE_BUSY/locked database here was
+        # swallowed with only a debug log, so the cache kept saying QUEUED for a
+        # Run whose journal had already moved on. The worker's dequeue kept
+        # picking that stale ticket, execute_run kept rejecting it, and the
+        # poisoned earliest-ticket Run starved the whole queue at 1 Hz. Any
+        # failed cache write MUST leave the index dirty so the next dequeue
+        # reconciles it from filesystem truth instead of trusting the lie.
+        logger.warning(
+            "Run status cache write failed for %s; marking index dirty",
+            run_id,
+            exc_info=True,
+        )
+        try:
+            from src.services.run_index import get_run_index
+
+            get_run_index().mark_dirty()
+        except Exception:
+            logger.exception(
+                "Run index could not even be marked dirty for %s", run_id
+            )
 
 
 class RunCommands:

@@ -384,9 +384,14 @@ class RunIndex:
                 ).fetchone()[0]
             )
             percent = round(done / total * 100, 1) if total else 0.0
+            # Failure scenario (audit P2-2): projected_at_seq was written
+            # unconditionally, so an out-of-order or retry projection could
+            # regress the cursor below a checkpoint earlier runs already saw
+            # (e.g. the SSE done-gate waits on it); clamp it monotonically.
             connection.execute(
                 """
-                UPDATE runs SET event_seq = MAX(event_seq, ?), projected_at_seq = ?,
+                UPDATE runs SET event_seq = MAX(event_seq, ?),
+                    projected_at_seq = MAX(projected_at_seq, ?),
                     progress_done = ?, progress_total = ?, progress_percent = ?, indexed_at = ?
                 WHERE run_id = ?
                 """,

@@ -511,7 +511,7 @@ class StorageLayout:
             ),
             ensure_ascii=False,
         )
-        for _attempt in range(3):
+        for _attempt in range(4):
             try:
                 fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except FileExistsError:
@@ -522,6 +522,16 @@ class StorageLayout:
                     and process_identity_alive(str(lease["worker_identity"]))
                 ):
                     return False
+                # Failure scenario (audit P1-5): the liveness read and the
+                # unlink were two steps. Between them another worker could
+                # steal the dead lease and create a FRESH one -- and this
+                # unlink then deleted that fresh lease, leaving two believing
+                # owners. Re-read immediately before unlinking and only delete
+                # the file when it still names the exact dead record we judged
+                # dead; the loop's O_EXCL create is the atomic "file was
+                # absent" witness that no fresh lease got deleted.
+                if self.read_lease(run_id) != lease:
+                    continue  # the lease changed hands; re-judge the new one
                 try:
                     target.unlink()
                 except FileNotFoundError:
@@ -590,7 +600,18 @@ class StorageLayout:
             fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             try:
-                if process_identity_alive(claim.read_text(encoding="ascii").strip()):
+                owner = claim.read_text(encoding="ascii").strip()
+                if process_identity_alive(owner):
+                    return False
+                # Failure scenario (audit P1-5): same steal window as
+                # acquire_lease. Between the liveness read and this unlink
+                # another process may have already stolen the dead claim and
+                # written a FRESH one; an unconditional unlink then deleted
+                # the fresh claim and two Backend processes each held "the"
+                # slot. Re-read and unlink only when the file still names the
+                # exact dead identity; the O_EXCL create below then atomically
+                # confirms the file was absent when we took it.
+                if claim.read_text(encoding="ascii").strip() != owner:
                     return False
                 claim.unlink(missing_ok=True)
                 fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -610,7 +631,10 @@ class StorageLayout:
             owner = claim.read_text(encoding="ascii").strip()
         except (FileNotFoundError, OSError):
             return
-        if owner.split(":", 1)[0] == str(os.getpid()):
+        # Failure scenario (audit P2-8): comparing only the pid let a recycled
+        # Windows pid release a slot a DIFFERENT process now owns. The claim
+        # records the full `pid:create_time` identity; compare all of it.
+        if owner == process_identity(os.getpid()):
             claim.unlink(missing_ok=True)
 
     # -- Global queue tickets (BACKEND-RUN-SERVICE §2.4) --
@@ -896,23 +920,31 @@ class StorageLayout:
         p = self.events_path(run_id)
         if not p.exists():
             return 0
-        raw = p.read_bytes()
-        if not raw:
-            return 0
-        good_lines: list[bytes] = []
-        for chunk in raw.split(b"\n"):
-            if not chunk.strip():
-                continue
-            try:
-                json.loads(chunk)
-            except json.JSONDecodeError:
-                break  # first bad/partial line ends the valid prefix
-            good_lines.append(chunk)
-        repaired = b"".join(line + b"\n" for line in good_lines)
-        if repaired == raw:
-            return 0
-        self.atomic_write(p, repaired)
-        return len(raw) - len(repaired)
+        # Failure scenario (audit P1-1): repair used to run under the caller's
+        # COMMAND lock while append_event serializes on the EVENT lock. An API
+        # append (run_action in the cancel/restore/trash routes) could be
+        # mid-append when repair read the file: repair then replaced it without
+        # the not-yet-visible line, silently dropping the event and reusing its
+        # seq -- the fold could never notice. Take the same write lock append
+        # uses so repair observes a quiescent tail.
+        with self._event_write_lock(run_id):
+            raw = p.read_bytes()
+            if not raw:
+                return 0
+            good_lines: list[bytes] = []
+            for chunk in raw.split(b"\n"):
+                if not chunk.strip():
+                    continue
+                try:
+                    json.loads(chunk)
+                except json.JSONDecodeError:
+                    break  # first bad/partial line ends the valid prefix
+                good_lines.append(chunk)
+            repaired = b"".join(line + b"\n" for line in good_lines)
+            if repaired == raw:
+                return 0
+            self.atomic_write(p, repaired)
+            return len(raw) - len(repaired)
 
     def project_run_snapshot(self, run_id: str) -> tuple[RunProjection, dict[str, Any]]:
         """Project lifecycle state from the Journal without writing a second truth."""

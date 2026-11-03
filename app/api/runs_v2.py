@@ -45,6 +45,7 @@ from src.contracts import (
 )
 from src.execution_runtime.engine_contract import WorkflowEngineRequest
 from src.execution_runtime.storage import (
+    _exclusive_lock,
     get_storage,
     get_tools_root,
 )
@@ -768,7 +769,14 @@ def _create_run(body: RunCreateRequest, request: Request):
         snake_entry = next((item for item in commit.workspace_files if item.path == "Snakefile"), None)
         if snake_entry is None:
             raise ValueError("The Run mapping does not contain its root Snakefile")
-        snake_text = _snakefile_text_from_source(commit, storage, local_run_root)
+        # Failure scenario (audit P1-4): the local path re-read the MUTABLE
+        # workspace after sealing -- an edit between seal and read produced a
+        # definition whose frozen bytes and executed text were different
+        # revisions. The local bytes were just sealed into CAS one step above
+        # (and blob_store entries were required present before that); read the
+        # frozen text back from the sealed blob so it is exactly the content
+        # the worker will materialize.
+        snake_text = _snakefile_text_from_source(commit, storage, None)
         if commit.snakefile and commit.snakefile != snake_text:
             raise TDEaseError(
                 code=ErrorCode.RUN_PLAN_STALE,
@@ -1021,44 +1029,55 @@ def rerun_run(run_id: str, body: RunRerunRequest, request: Request, data: dict =
 @router.post("/{run_id}/trash", response_model=RunTrashEntry)
 def trash_run(run_id: str, request: Request, data: dict = Depends(_owned_run)):
     storage = get_storage()
-    status = _run_status_value(run_id, storage)
-    if status not in TERMINAL_STATUSES:
-        raise TDEaseError(
-            code=ErrorCode.RUN_NOT_TERMINAL,
-            message=f"Run {run_id} is {status.value}; only a terminal Run can be moved to trash.",
-            remedy="Wait for the Run to finish, or cancel it first.",
-            retryable=False,
+    # Failure scenario (audit P1-3): the terminal check and the trash move were
+    # two unlocked steps. A submit/rerun landing between them appended a fresh
+    # run.queue_requested to the journal and then the whole directory was moved
+    # -- the queue held a Run whose journal (and run.json) had vanished midair.
+    # The per-run command lock is the same critical section submit/rerun/cancel
+    # use (via RunCommands), so the fold can no longer change under the move.
+    with _exclusive_lock(
+        storage.resolve(run_id, ".runtime", "commands.lock"),
+        purpose=f"run trash ({run_id})",
+    ):
+        status = _run_status_value(run_id, storage)
+        if status not in TERMINAL_STATUSES:
+            raise TDEaseError(
+                code=ErrorCode.RUN_NOT_TERMINAL,
+                message=f"Run {run_id} is {status.value}; only a terminal Run can be moved to trash.",
+                remedy="Wait for the Run to finish, or cancel it first.",
+                retryable=False,
+            )
+        deleted_at = datetime.now(timezone.utc)
+        deleted_by = _actor(request)
+        raw_labels = data.get("labels")
+        labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
+        from src.execution_runtime.events import EventEmitter
+
+        EventEmitter(run_id).run_action("trash", deleted_by)
+        try:
+            storage.trash_run(run_id, {
+                "schema_version": 1,
+                "run_id": run_id,
+                "previous_status": status.value,
+                "deleted_at": deleted_at.isoformat(),
+                "deleted_by": deleted_by,
+            })
+            _remove_indexed_run(run_id)
+        except FileExistsError as exc:
+            raise TDEaseError(
+                code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
+                message=f"A trash entry for {run_id} already exists.",
+                remedy="Restore or purge the existing trash entry before trashing this Run again.",
+                retryable=False,
+            ) from exc
+        return RunTrashEntry(
+            run_id=run_id,
+            name=str(labels.get("name") or run_id),
+            workspace_id=data.get("workspace_id", ""),
+            previous_status=status,
+            deleted_at=deleted_at,
+            deleted_by=deleted_by,
         )
-    deleted_at = datetime.now(timezone.utc)
-    deleted_by = _actor(request)
-    raw_labels = data.get("labels")
-    labels: dict = raw_labels if isinstance(raw_labels, dict) else {}
-    from src.execution_runtime.events import EventEmitter
-    EventEmitter(run_id).run_action("trash", deleted_by)
-    try:
-        storage.trash_run(run_id, {
-            "schema_version": 1,
-            "run_id": run_id,
-            "previous_status": status.value,
-            "deleted_at": deleted_at.isoformat(),
-            "deleted_by": deleted_by,
-        })
-        _remove_indexed_run(run_id)
-    except FileExistsError as exc:
-        raise TDEaseError(
-            code=ErrorCode.RUN_IDEMPOTENCY_CONFLICT,
-            message=f"A trash entry for {run_id} already exists.",
-            remedy="Restore or purge the existing trash entry before trashing this Run again.",
-            retryable=False,
-        ) from exc
-    return RunTrashEntry(
-        run_id=run_id,
-        name=str(labels.get("name") or run_id),
-        workspace_id=data.get("workspace_id", ""),
-        previous_status=status,
-        deleted_at=deleted_at,
-        deleted_by=deleted_by,
-    )
 
 
 @router.get("/{run_id}/results", response_model=RunResultsResponse)
@@ -1578,6 +1597,11 @@ async def get_events_sse(
                 # let `done` overtake journal bytes the snapshot has already
                 # observed; immediately drain from the current byte offset.
                 if sent_seq < projection.projected_at_seq:
+                    # Failure scenario (audit P2-6): this continue re-enters the
+                    # loop without awaiting, so a terminal appended while bytes
+                    # were still unsent spun the event loop at full CPU between
+                    # the to_thread reads. Yield once so other tasks run.
+                    await asyncio.sleep(0)
                     continue
                 payload = json.dumps(
                     {
