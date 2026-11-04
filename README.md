@@ -3,7 +3,7 @@
 TDEase Python backend — a FastAPI server providing Snakemake execution,
 Run lifecycle management, file storage, and authentication for the TDEase
 mass-spectrometry analysis platform. It is one component of
-[TDEaseNexus](https://github.com/Computational-TDMS/TDEaseNexus), the desktop
+[TDEaseNexus](https://github.com/Tisen-Ray/TDEaseNexus), the desktop
 application this backend serves.
 
 ## What this is
@@ -14,7 +14,7 @@ application this backend serves.
 | `src/` | Execution runtime: Snakemake engine, storage layer, workspace containment, backend settings |
 | `cli.py` | Public command-line entrypoint (`serve`, `worker` subcommands) |
 
-The backend consumes [tdease-ai-capability](https://github.com/Computational-TDMS/tdease-ai-capability)
+The backend consumes [tdease-ai-capability](https://github.com/Tisen-Ray/tdease-ai-capability)
 for scientific computation (Rust `tdeasenexus-toolbox` CLI + Agent Skills) but **does not
 contain** scientific algorithms itself — those live in the capability toolkit.
 
@@ -37,7 +37,7 @@ inside a minute, so a stuck Run never looks "ready but idle".
 ## Quick start
 
 ```bash
-git clone https://github.com/Computational-TDMS/tdease-backend.git
+git clone https://github.com/Tisen-Ray/tdease-backend.git
 cd tdease-backend
 uv sync
 
